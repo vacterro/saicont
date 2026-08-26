@@ -71,6 +71,11 @@ namespace SaiCont
                 return 2;
             }
 
+            if (options.Mode == "--app" || options.Mode == "--win-gui")
+            {
+                return SaiContGuiForm.RunDesktopGui(configuration, options.ConfigurationPath);
+            }
+
             if (options.Mode == "--gui")
             {
                 return TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath);
@@ -105,14 +110,21 @@ namespace SaiCont
             for (int index = 0; index < args.Length; index++)
             {
                 string argument = args[index];
-                if (argument == "--watch" || argument == "--dry-run" || argument == "--once" || argument == "--probe" || argument == "--validate-config" || argument == "--gui" || argument == "--tui" || argument == "-g")
+                if (argument == "--watch" || argument == "--dry-run" || argument == "--once" || argument == "--probe" || argument == "--validate-config" || argument == "--gui" || argument == "--tui" || argument == "-g" || argument == "--app" || argument == "--win-gui" || argument == "--window" || argument == "--desktop")
                 {
                     if (options.Mode != null)
                     {
                         error = "Choose exactly one operating mode.";
                         return false;
                     }
-                    options.Mode = (argument == "--tui" || argument == "-g") ? "--gui" : argument;
+                    if (argument == "--app" || argument == "--win-gui" || argument == "--window" || argument == "--desktop")
+                    {
+                        options.Mode = "--app";
+                    }
+                    else
+                    {
+                        options.Mode = (argument == "--tui" || argument == "-g") ? "--gui" : argument;
+                    }
                     continue;
                 }
 
@@ -2064,6 +2076,12 @@ namespace SaiCont
                 failures += AssertEqual("--gui", guiOpts.Mode, "--tui alias mode");
                 failures += AssertEqual(true, TryParseOptions(new[] { "-g" }, out guiOpts, out guiErr), "parse -g option");
                 failures += AssertEqual("--gui", guiOpts.Mode, "-g alias mode");
+                failures += AssertEqual(true, TryParseOptions(new[] { "--app" }, out guiOpts, out guiErr), "parse --app option");
+                failures += AssertEqual("--app", guiOpts.Mode, "--app option mode");
+                failures += AssertEqual(true, TryParseOptions(new[] { "--win-gui" }, out guiOpts, out guiErr), "parse --win-gui option");
+                failures += AssertEqual("--app", guiOpts.Mode, "--win-gui alias mode");
+                failures += AssertEqual(true, TryParseOptions(new[] { "--window" }, out guiOpts, out guiErr), "parse --window option");
+                failures += AssertEqual("--app", guiOpts.Mode, "--window alias mode");
 
                 // Test TUI poll result formatting
                 var samplePoll = new PollResult

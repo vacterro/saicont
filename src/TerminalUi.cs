@@ -547,13 +547,30 @@ namespace SaiCont
             Console.ForegroundColor = ConsoleColor.Black;
 
             string title = " SAICONT v1.0.0 [TERMINAL CONTINUITY DASHBOARD] ";
-            string modeStr = " [" + mode.ToString().ToUpperInvariant() + "] ";
+            string modeStr;
+            ConsoleColor modeBg;
+            switch (mode)
+            {
+                case TuiMode.Watch:
+                    modeStr = " [● ON: WATCHING (LIVE INJECTION)] ";
+                    modeBg = ConsoleColor.DarkRed;
+                    break;
+                case TuiMode.DryRun:
+                    modeStr = " [👁 ON: DRY-RUN (DISCOVERY ONLY)] ";
+                    modeBg = ConsoleColor.DarkGreen;
+                    break;
+                default:
+                    modeStr = " [⏸ PAUSED / IDLE] ";
+                    modeBg = ConsoleColor.DarkGray;
+                    break;
+            }
+
             string pollsStr = "Polls: " + pollCounter + " | " + (lastPollTime == DateTime.MinValue ? "--:--:--" : lastPollTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture)) + " UTC ";
 
             int availableSpace = Math.Max(0, (width - 1) - title.Length - modeStr.Length - pollsStr.Length);
 
             Console.Write(title);
-            Console.BackgroundColor = mode == TuiMode.Watch ? ConsoleColor.DarkRed : (mode == TuiMode.DryRun ? ConsoleColor.DarkGreen : ConsoleColor.DarkGray);
+            Console.BackgroundColor = modeBg;
             Console.ForegroundColor = ConsoleColor.White;
             Console.Write(modeStr);
 

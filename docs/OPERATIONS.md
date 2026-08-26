@@ -17,13 +17,34 @@ Run these commands from the project root:
 
 The no-argument command displays the TERMISAI landing screen. `--gui` (or `.\scripts\gui.ps1`) opens the interactive Win95 Dark Golden TUI dashboard with live session monitoring and hotkey controls. `--validate-config` performs safe read-only configuration verification. `--probe` is the safe live check: it reads Cline first, then Codex, and never sends input.
 
-For the full parser, build, self-test, config validation, input injection harness, Cline-first probe, and hidden lifecycle smoke test:
+## Interactive GUI Modes
 
+### Desktop GUI Window (Win95 Dark Golden Theme)
 ```powershell
-.\scripts\smoke.ps1
+.\SAICONT_WIN.cmd
+# or
+.\bin\SAICONT.exe --app
+# or
+.\scripts\gui_win.ps1
 ```
+Features:
+- Live multi-column sessions grid (PID, title, buffer status, prompt readiness, retry countdown).
+- Color-coded monospace log stream (INFO, WARN, ERROR, MATCH, SEND).
+- 3D raised toolbar: Probe (F5), Dry-Run (F6), Watch (F7), Stop (F8), Reload Config (Ctrl+R), Clear Log (Ctrl+L).
+- Deep session diagnostic inspector tab.
+- System tray minimization and background monitoring.
 
-The lifecycle portion uses `--dry-run`, so it cannot inject `cc`.
+### Terminal TUI Dashboard
+```powershell
+.\SAICONT_GUI.cmd
+# or
+.\bin\SAICONT.exe --gui
+# or
+.\scripts\gui.ps1
+```
+Features:
+- Pure terminal dashboard with 4 tabs: [1: Sessions], [2: Log Stream], [3: Rules], [4: Help].
+- Hotkeys: `[P]` Probe, `[D]` Dry-Run, `[W]` Watch, `[1-4]` Tabs, `[Enter]` Deep Inspector modal, `[R]` Reload, `[Q]` Quit.
 
 ## Hidden lifecycle
 

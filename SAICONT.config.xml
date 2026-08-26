@@ -26,8 +26,10 @@
         <process>codex</process>
       </processNames>
       <triggerPatterns>
-        <pattern>(?i)you.ve hit your usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again</pattern>
-        <pattern>(?i)usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again at</pattern>
+        <pattern>(?i)you.ve hit your usage limit</pattern>
+        <pattern>(?i)hit your usage limit</pattern>
+        <pattern>(?i)usage limit[^\r\n]{0,256}(?:try\s+)?again</pattern>
+        <pattern>(?i)(?:try\s+)?again\s+at\s+[A-Za-z0-9]</pattern>
       </triggerPatterns>
       <readyPatterns>
         <pattern>^\s*›\s*Ask Codex to do anything\s*$</pattern>

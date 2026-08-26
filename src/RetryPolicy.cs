@@ -590,7 +590,7 @@ namespace SaiCont
     internal static class RetryTimeParser
     {
         private static readonly Regex AtClock = new Regex(
-            @"(?i)try again at\s+(?<clock>\d{1,2}:\d{2}(?:\s*[AP]M)?)",
+            @"(?i)(?:try\s+)?again\s+at\s+(?:(?<month>[A-Za-z]+)\s+(?<day>\d{1,2})(?:st|nd|rd|th)?,?\s*(?<year>\d{4})?,?\s*)?(?<clock>\d{1,2}:\d{2}(?:\s*[AP]M)?)",
             RegexOptions.CultureInvariant,
             TargetRule.DefaultRegexTimeout);
 
@@ -663,6 +663,51 @@ namespace SaiCont
             if (!DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out parsed))
             {
                 return false;
+            }
+
+            int monthNumber = 0;
+            if (clock.Groups["month"].Success)
+            {
+                string monthStr = clock.Groups["month"].Value;
+                DateTime monthDt;
+                if (DateTime.TryParseExact(monthStr, new[] { "MMMM", "MMM" }, CultureInfo.InvariantCulture, DateTimeStyles.None, out monthDt))
+                {
+                    monthNumber = monthDt.Month;
+                }
+            }
+            int dayNumber = 0;
+            if (clock.Groups["day"].Success)
+            {
+                Int32.TryParse(clock.Groups["day"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out dayNumber);
+            }
+            int yearNumber = nowLocal.Year;
+            if (clock.Groups["year"].Success)
+            {
+                int y;
+                if (Int32.TryParse(clock.Groups["year"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out y) && y >= 2024 && y <= 2040)
+                {
+                    yearNumber = y;
+                }
+            }
+
+            if (monthNumber > 0 && dayNumber > 0)
+            {
+                try
+                {
+                    DateTime specificDate = new DateTime(yearNumber, monthNumber, dayNumber, parsed.Hour, parsed.Minute, parsed.Second, DateTimeKind.Local);
+                    if (specificDate < nowLocal.AddMinutes(-1))
+                    {
+                        dueLocal = nowLocal;
+                    }
+                    else
+                    {
+                        dueLocal = specificDate;
+                    }
+                    return true;
+                }
+                catch
+                {
+                }
             }
 
             DateTime candidate = nowLocal.Date.Add(parsed.TimeOfDay);

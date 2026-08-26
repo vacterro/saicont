@@ -1217,6 +1217,8 @@ namespace SaiCont
             failures += AssertEqual(new DateTime(2026, 8, 26, 16, 40, 0), due, "future Codex reset clock");
             failures += AssertEqual(true, RetryTimeParser.TryParseDue("try again at 4:40 PM", new DateTime(2026, 8, 26, 17, 0, 0), out due), "parse expired reset clock");
             failures += AssertEqual(new DateTime(2026, 8, 26, 17, 0, 0), due, "expired reset runs now");
+            failures += AssertEqual(true, RetryTimeParser.TryParseDue("again at Aug 27th, 2026 2:44 PM", new DateTime(2026, 8, 27, 1, 0, 0), out due), "parse full date Codex reset clock");
+            failures += AssertEqual(new DateTime(2026, 8, 27, 14, 44, 0), due, "full date Codex reset clock due time");
             failures += AssertEqual(true, RetryTimeParser.TryParseDue("Try again in 8h 57m", new DateTime(2026, 8, 26, 17, 0, 0), out due), "parse Cline compact limit duration");
             failures += AssertEqual(new DateTime(2026, 8, 27, 1, 57, 0), due, "Cline compact limit due time");
             failures += AssertEqual(false, RetryTimeParser.TryParseDue("Try again in 999999h", new DateTime(2026, 8, 26, 17, 0, 0), out due), "reject absurd retry duration");

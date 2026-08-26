@@ -43,8 +43,10 @@ namespace SaiCont
                         MaximumAttemptsPerEvent = 5,
                         TriggerPatterns = new[]
                         {
-                            @"(?i)you.ve hit your usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again",
-                            @"(?i)usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again at"
+                            @"(?i)you.ve hit your usage limit",
+                            @"(?i)hit your usage limit",
+                            @"(?i)usage limit[^\r\n]{0,256}(?:try\s+)?again",
+                            @"(?i)(?:try\s+)?again\s+at\s+[A-Za-z0-9]"
                         },
                         ReadyPatterns = new[]
                         {

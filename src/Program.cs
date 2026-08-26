@@ -56,7 +56,7 @@ namespace SaiCont
             if (!TryParseOptions(args, out options, out optionError))
             {
                 Console.Error.WriteLine(optionError);
-                Console.Error.WriteLine("Use --watch, --dry-run, --once, --probe, --validate-config, or --self-test; optional: --config PATH --pid-file PATH --stop-file PATH --state-file PATH --instance-file PATH.");
+                Console.Error.WriteLine("Use --gui, --watch, --dry-run, --once, --probe, --validate-config, or --self-test; optional: --config PATH --pid-file PATH --stop-file PATH --state-file PATH --instance-file PATH.");
                 return 2;
             }
 
@@ -69,6 +69,11 @@ namespace SaiCont
             {
                 Console.Error.WriteLine("Configuration error: " + exception.Message);
                 return 2;
+            }
+
+            if (options.Mode == "--gui")
+            {
+                return TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath);
             }
 
             if (options.Mode == "--validate-config")
@@ -100,14 +105,14 @@ namespace SaiCont
             for (int index = 0; index < args.Length; index++)
             {
                 string argument = args[index];
-                if (argument == "--watch" || argument == "--dry-run" || argument == "--once" || argument == "--probe" || argument == "--validate-config")
+                if (argument == "--watch" || argument == "--dry-run" || argument == "--once" || argument == "--probe" || argument == "--validate-config" || argument == "--gui" || argument == "--tui" || argument == "-g")
                 {
                     if (options.Mode != null)
                     {
                         error = "Choose exactly one operating mode.";
                         return false;
                     }
-                    options.Mode = argument;
+                    options.Mode = (argument == "--tui" || argument == "-g") ? "--gui" : argument;
                     continue;
                 }
 
@@ -2051,6 +2056,32 @@ namespace SaiCont
                     failures += AssertEqual(false, testLog.TryWrite("TEST", "must fail while locked"), "locked log failure is explicit and non-throwing");
                 }
                 failures += AssertEqual(true, testLog.TryWrite("TEST", "logging recovered after lock"), "changed log condition becomes visible after recovery");
+
+                // Test TUI option parsing
+                RuntimeOptions guiOpts;
+                string guiErr;
+                failures += AssertEqual(true, TryParseOptions(new[] { "--gui" }, out guiOpts, out guiErr), "parse --gui option");
+                failures += AssertEqual("--gui", guiOpts.Mode, "--gui option mode");
+                failures += AssertEqual(true, TryParseOptions(new[] { "--tui" }, out guiOpts, out guiErr), "parse --tui option");
+                failures += AssertEqual("--gui", guiOpts.Mode, "--tui alias mode");
+                failures += AssertEqual(true, TryParseOptions(new[] { "-g" }, out guiOpts, out guiErr), "parse -g option");
+                failures += AssertEqual("--gui", guiOpts.Mode, "-g alias mode");
+
+                // Test TUI poll result formatting
+                var samplePoll = new PollResult
+                {
+                    Target = "tui-test",
+                    ProcessId = 1234,
+                    AttachProcessId = 1234,
+                    Title = "Test Window",
+                    Read = true,
+                    Ready = true,
+                    Triggered = false,
+                    Reason = "prompt ready"
+                };
+                string formatted = TerminalUi.FormatPollResult(samplePoll);
+                failures += AssertEqual(true, formatted.Contains("MATCH target=tui-test"), "TUI formatted poll result contains match");
+                failures += AssertEqual(true, formatted.Contains("pid=1234"), "TUI formatted poll result contains PID");
             }
             finally
             {

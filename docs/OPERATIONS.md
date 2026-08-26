@@ -9,12 +9,13 @@ Run these commands from the project root:
 ```powershell
 .\build.ps1
 .\bin\SAICONT.exe
+.\bin\SAICONT.exe --gui
 .\bin\SAICONT.exe --self-test
 .\bin\SAICONT.exe --validate-config --config .\SAICONT.config.xml
 .\bin\SAICONT.exe --probe --config .\SAICONT.config.xml
 ```
 
-The no-argument command displays the TERMISAI landing screen. `--validate-config` performs safe read-only configuration verification. `--probe` is the safe live check: it reads Cline first, then Codex, and never sends input.
+The no-argument command displays the TERMISAI landing screen. `--gui` (or `.\scripts\gui.ps1`) opens the interactive Win95 Dark Golden TUI dashboard with live session monitoring and hotkey controls. `--validate-config` performs safe read-only configuration verification. `--probe` is the safe live check: it reads Cline first, then Codex, and never sends input.
 
 For the full parser, build, self-test, config validation, input injection harness, Cline-first probe, and hidden lifecycle smoke test:
 

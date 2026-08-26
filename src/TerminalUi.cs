@@ -490,48 +490,55 @@ namespace SaiCont
             int pollCounter,
             DateTime lastPollTime)
         {
-            int width = 80;
-            int height = 25;
             try
             {
-                width = Math.Max(70, Console.WindowWidth);
-                height = Math.Max(20, Console.WindowHeight);
-            }
-            catch
-            {
-            }
-
-            try { Console.SetCursorPosition(0, 0); } catch { }
-
-            WriteWin95Header(width, mode, pollCounter, lastPollTime);
-            WriteTabBar(width, activeTab);
-
-            int contentHeight = Math.Max(8, height - 8);
-
-            if (inspectorOpen && sessions != null && sessions.Count > 0 && selectedSessionIndex < sessions.Count)
-            {
-                RenderInspectorModal(width, contentHeight, sessions[selectedSessionIndex]);
-            }
-            else
-            {
-                switch (activeTab)
+                int width = 80;
+                int height = 25;
+                try
                 {
-                    case TuiTab.Sessions:
-                        RenderSessionsTab(width, contentHeight, sessions, selectedSessionIndex);
-                        break;
-                    case TuiTab.LogStream:
-                        RenderLogStreamTab(width, contentHeight, logs, logScrollOffset);
-                        break;
-                    case TuiTab.Rules:
-                        RenderRulesTab(width, contentHeight, configuration, configPath, selectedRuleIndex);
-                        break;
-                    case TuiTab.Help:
-                        RenderHelpTab(width, contentHeight);
-                        break;
+                    width = Math.Max(70, Console.WindowWidth);
+                    height = Math.Max(20, Console.WindowHeight);
                 }
-            }
+                catch
+                {
+                }
 
-            WriteWin95Footer(width, mode, statusMessage, confirmWatch, inspectorOpen);
+                try { Console.SetCursorPosition(0, 0); } catch { }
+
+                WriteWin95Header(width, mode, pollCounter, lastPollTime);
+                WriteTabBar(width, activeTab);
+
+                int contentHeight = Math.Max(8, height - 8);
+
+                if (inspectorOpen && sessions != null && sessions.Count > 0 && selectedSessionIndex < sessions.Count)
+                {
+                    RenderInspectorModal(width, contentHeight, sessions[selectedSessionIndex]);
+                }
+                else
+                {
+                    switch (activeTab)
+                    {
+                        case TuiTab.Sessions:
+                            RenderSessionsTab(width, contentHeight, sessions, selectedSessionIndex);
+                            break;
+                        case TuiTab.LogStream:
+                            RenderLogStreamTab(width, contentHeight, logs, logScrollOffset);
+                            break;
+                        case TuiTab.Rules:
+                            RenderRulesTab(width, contentHeight, configuration, configPath, selectedRuleIndex);
+                            break;
+                        case TuiTab.Help:
+                            RenderHelpTab(width, contentHeight);
+                            break;
+                    }
+                }
+
+                WriteWin95Footer(width, mode, statusMessage, confirmWatch, inspectorOpen);
+            }
+            catch (Exception ex)
+            {
+                AddLog(logs, "ERROR", "render", 0, ex.Message);
+            }
         }
 
         private static void WriteWin95Header(int width, TuiMode mode, int pollCounter, DateTime lastPollTime)
@@ -543,8 +550,7 @@ namespace SaiCont
             string modeStr = " [" + mode.ToString().ToUpperInvariant() + "] ";
             string pollsStr = "Polls: " + pollCounter + " | " + (lastPollTime == DateTime.MinValue ? "--:--:--" : lastPollTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture)) + " UTC ";
 
-            int availableSpace = width - title.Length - modeStr.Length - pollsStr.Length;
-            if (availableSpace < 0) availableSpace = 0;
+            int availableSpace = Math.Max(0, (width - 1) - title.Length - modeStr.Length - pollsStr.Length);
 
             Console.Write(title);
             Console.BackgroundColor = mode == TuiMode.Watch ? ConsoleColor.DarkRed : (mode == TuiMode.DryRun ? ConsoleColor.DarkGreen : ConsoleColor.DarkGray);
@@ -554,8 +560,7 @@ namespace SaiCont
             Console.BackgroundColor = ConsoleColor.DarkYellow;
             Console.ForegroundColor = ConsoleColor.Black;
             Console.Write(new string(' ', availableSpace));
-            Console.Write(pollsStr);
-            Console.WriteLine();
+            Console.WriteLine(SafeClip(pollsStr, width - 1));
         }
 
         private static void WriteTabBar(int width, TuiTab activeTab)
@@ -575,9 +580,8 @@ namespace SaiCont
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkGray;
             int used = 2 + 13 + 1 + 15 + 1 + 17 + 1 + 15;
-            int pad = Math.Max(0, width - used);
-            Console.Write(new string(' ', pad));
-            Console.WriteLine();
+            int pad = Math.Max(0, (width - 1) - used);
+            Console.WriteLine(new string(' ', pad));
         }
 
         private static void WriteTabItem(string label, bool isActive)
@@ -600,7 +604,7 @@ namespace SaiCont
         {
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine(" " + BoxLine("DISCOVERED TERMINAL SESSIONS (UP/DOWN TO SELECT, ENTER TO INSPECT)", width - 2));
+            Console.WriteLine(" " + BoxLine("DISCOVERED TERMINAL SESSIONS (UP/DOWN TO SELECT, ENTER TO INSPECT)", width - 3));
 
             Console.BackgroundColor = ConsoleColor.DarkGray;
             Console.ForegroundColor = ConsoleColor.White;
@@ -608,8 +612,8 @@ namespace SaiCont
                 CultureInfo.InvariantCulture,
                 " {0,-2} {1,-14} {2,-8} {3,-7} {4,-18} {5,-7} {6,-10} {7}",
                 "  ", "RULE", "PROCESS", "PID", "TITLE", "STATUS", "PROMPT", "DECISION / REASON");
-            if (hdr.Length < width) hdr = hdr.PadRight(width);
-            else if (hdr.Length > width) hdr = hdr.Substring(0, width);
+            if (hdr.Length > width - 1) hdr = hdr.Substring(0, width - 1);
+            else if (hdr.Length < width - 1) hdr = hdr.PadRight(width - 1);
             Console.WriteLine(hdr);
 
             int linesPrinted = 0;
@@ -633,11 +637,10 @@ namespace SaiCont
                     Console.BackgroundColor = isSelected ? ConsoleColor.DarkCyan : ConsoleColor.Black;
 
                     string cursor = isSelected ? "> " : "  ";
-                    string title = String.IsNullOrEmpty(s.Title) ? "-" : (s.Title.Length > 16 ? s.Title.Substring(0, 16) + ".." : s.Title);
+                    string title = String.IsNullOrEmpty(s.Title) ? "-" : Truncate(s.Title, 16);
                     string status = s.Read ? "READ" : "FAIL";
                     string prompt = s.Busy ? "BUSY" : (s.Ready ? "READY" : (s.Triggered ? "TRIGGER" : "IDLE"));
                     string reason = s.Reason ?? "-";
-                    if (reason.Length > width - 74) reason = reason.Substring(0, Math.Max(4, width - 77)) + "...";
 
                     ConsoleColor promptColor = isSelected ? ConsoleColor.White : (s.Busy ? ConsoleColor.DarkRed : (s.Ready ? ConsoleColor.DarkGreen : (s.Triggered ? ConsoleColor.DarkYellow : ConsoleColor.Gray)));
 
@@ -657,7 +660,8 @@ namespace SaiCont
                     Console.ForegroundColor = promptColor;
                     Console.Write(String.Format(CultureInfo.InvariantCulture, "{0,-10} ", prompt));
                     Console.ForegroundColor = isSelected ? ConsoleColor.White : ConsoleColor.Gray;
-                    Console.WriteLine(reason.PadRight(Math.Max(0, width - 72)));
+                    int padLen = Math.Max(0, (width - 1) - 72);
+                    Console.WriteLine(Truncate(reason, padLen).PadRight(padLen));
                     linesPrinted++;
                 }
             }
@@ -665,7 +669,7 @@ namespace SaiCont
             Console.BackgroundColor = ConsoleColor.Black;
             while (linesPrinted < maxLines)
             {
-                Console.WriteLine(new string(' ', width));
+                Console.WriteLine(new string(' ', Math.Max(0, width - 1)));
                 linesPrinted++;
             }
         }
@@ -675,7 +679,8 @@ namespace SaiCont
             Console.BackgroundColor = ConsoleColor.DarkYellow;
             Console.ForegroundColor = ConsoleColor.Black;
             string titleBar = " ===[ SESSION DETAIL INSPECTOR: PID " + session.ProcessId + " (" + (session.ProcessName ?? "unknown") + ") ]===";
-            if (titleBar.Length < width) titleBar = titleBar.PadRight(width);
+            if (titleBar.Length > width - 1) titleBar = titleBar.Substring(0, width - 1);
+            else titleBar = titleBar.PadRight(width - 1);
             Console.WriteLine(titleBar);
 
             Console.BackgroundColor = ConsoleColor.Black;
@@ -709,14 +714,14 @@ namespace SaiCont
                 else if (dl.Contains("return to Dashboard")) Console.ForegroundColor = ConsoleColor.DarkCyan;
                 else Console.ForegroundColor = ConsoleColor.Gray;
 
-                Console.WriteLine(dl.PadRight(width));
+                Console.WriteLine(Truncate(dl, width - 1).PadRight(Math.Max(0, width - 1)));
                 linesPrinted++;
             }
 
             Console.BackgroundColor = ConsoleColor.Black;
             while (linesPrinted < maxLines)
             {
-                Console.WriteLine(new string(' ', width));
+                Console.WriteLine(new string(' ', Math.Max(0, width - 1)));
                 linesPrinted++;
             }
         }
@@ -725,7 +730,7 @@ namespace SaiCont
         {
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkYellow;
-            string header = " " + BoxLine("REAL-TIME EVENT STREAM (PAGEUP/DOWN TO SCROLL, C TO CLEAR)", width - 2);
+            string header = " " + BoxLine("REAL-TIME EVENT STREAM (PAGEUP/DOWN TO SCROLL, C TO CLEAR)", width - 3);
             Console.WriteLine(header);
 
             int linesPrinted = 0;
@@ -757,16 +762,15 @@ namespace SaiCont
 
                     Console.ForegroundColor = ConsoleColor.Gray;
                     string msg = entry.Message ?? String.Empty;
-                    int maxMsgWidth = Math.Max(10, width - 20);
-                    if (msg.Length > maxMsgWidth) msg = msg.Substring(0, maxMsgWidth - 3) + "...";
-                    Console.WriteLine(msg.PadRight(maxMsgWidth));
+                    int maxMsgWidth = Math.Max(10, (width - 1) - 20);
+                    Console.WriteLine(Truncate(msg, maxMsgWidth).PadRight(maxMsgWidth));
                     linesPrinted++;
                 }
             }
 
             while (linesPrinted < maxLines)
             {
-                Console.WriteLine(new string(' ', width));
+                Console.WriteLine(new string(' ', Math.Max(0, width - 1)));
                 linesPrinted++;
             }
         }
@@ -775,11 +779,12 @@ namespace SaiCont
         {
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine(" " + BoxLine("ACTIVE WATCHER CONFIGURATION (" + Path.GetFileName(configPath) + ") [R TO RELOAD]", width - 2));
+            Console.WriteLine(" " + BoxLine("ACTIVE WATCHER CONFIGURATION (" + Path.GetFileName(configPath) + ") [R TO RELOAD]", width - 3));
 
             int linesPrinted = 0;
             Console.ForegroundColor = ConsoleColor.Gray;
-            Console.WriteLine("  Poll Interval: " + config.PollIntervalMilliseconds + "ms | Log File: " + config.LogFilePath);
+            string pollInfo = "  Poll Interval: " + config.PollIntervalMilliseconds + "ms | Log File: " + config.LogFilePath;
+            Console.WriteLine(Truncate(pollInfo, width - 1));
             linesPrinted++;
 
             Console.BackgroundColor = ConsoleColor.DarkGray;
@@ -788,7 +793,8 @@ namespace SaiCont
                 CultureInfo.InvariantCulture,
                 " {0,-2} {1,-18} {2,-8} {3,-16} {4,-8} {5,-12} {6}",
                 "  ", "RULE NAME", "ENABLED", "PROCESSES", "CMD", "RETRY/BACKOFF", "TRIGGERS");
-            if (hdr.Length < width) hdr = hdr.PadRight(width);
+            if (hdr.Length > width - 1) hdr = hdr.Substring(0, width - 1);
+            else if (hdr.Length < width - 1) hdr = hdr.PadRight(width - 1);
             Console.WriteLine(hdr);
             linesPrinted++;
 
@@ -814,14 +820,14 @@ namespace SaiCont
                     Truncate(rule.Command, 8),
                     Truncate(retryInfo, 12),
                     rule.TriggerPatterns.Length);
-                Console.WriteLine(line.PadRight(Math.Max(0, width - 1)));
+                Console.WriteLine(Truncate(line, width - 1).PadRight(Math.Max(0, width - 1)));
                 linesPrinted++;
             }
 
             Console.BackgroundColor = ConsoleColor.Black;
             while (linesPrinted < maxLines)
             {
-                Console.WriteLine(new string(' ', width));
+                Console.WriteLine(new string(' ', Math.Max(0, width - 1)));
                 linesPrinted++;
             }
         }
@@ -830,7 +836,7 @@ namespace SaiCont
         {
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine(" " + BoxLine("SAICONT TERMINAL GUI QUICK REFERENCE & SAFETY GUARANTEES", width - 2));
+            Console.WriteLine(" " + BoxLine("SAICONT TERMINAL GUI QUICK REFERENCE & SAFETY GUARANTEES", width - 3));
 
             string[] helpLines = new[]
             {
@@ -859,13 +865,13 @@ namespace SaiCont
             foreach (string hl in helpLines)
             {
                 if (linesPrinted >= maxLines) break;
-                Console.WriteLine(hl.PadRight(width));
+                Console.WriteLine(Truncate(hl, width - 1).PadRight(Math.Max(0, width - 1)));
                 linesPrinted++;
             }
 
             while (linesPrinted < maxLines)
             {
-                Console.WriteLine(new string(' ', width));
+                Console.WriteLine(new string(' ', Math.Max(0, width - 1)));
                 linesPrinted++;
             }
         }
@@ -875,8 +881,8 @@ namespace SaiCont
             Console.BackgroundColor = confirmWatch ? ConsoleColor.DarkRed : ConsoleColor.DarkCyan;
             Console.ForegroundColor = ConsoleColor.White;
             string status = " " + (statusMessage ?? String.Empty);
-            if (status.Length < width) status = status.PadRight(width);
-            else if (status.Length > width) status = status.Substring(0, width);
+            if (status.Length >= width) status = status.Substring(0, width - 1);
+            else status = status.PadRight(width - 1);
             Console.WriteLine(status);
 
             Console.BackgroundColor = ConsoleColor.DarkGray;
@@ -886,8 +892,8 @@ namespace SaiCont
                 ? " [Esc/Enter] Close Inspector  [Up/Down] Select Session  [Q] Quit "
                 : " [P] Probe  [D] Dry-Run  [W] Watch  [Enter] Inspect  [R] Reload  [1-4] Tabs  [Q] Quit ";
 
-            if (keyBar.Length < width) keyBar = keyBar.PadRight(width);
-            else if (keyBar.Length > width) keyBar = keyBar.Substring(0, width);
+            if (keyBar.Length >= width) keyBar = keyBar.Substring(0, width - 1);
+            else keyBar = keyBar.PadRight(width - 1);
             Console.Write(keyBar);
         }
 
@@ -915,7 +921,7 @@ namespace SaiCont
 
         private static string BoxLine(string title, int length)
         {
-            if (String.IsNullOrEmpty(title)) return new string('=', length);
+            if (String.IsNullOrEmpty(title)) return new string('=', Math.Max(0, length));
             int dashes = length - title.Length - 4;
             if (dashes < 2) return "== " + title + " ==";
             return "==[ " + title + " ]" + new string('=', dashes);
@@ -924,7 +930,17 @@ namespace SaiCont
         private static string Truncate(string val, int max)
         {
             if (String.IsNullOrEmpty(val)) return "-";
-            return val.Length <= max ? val : val.Substring(0, max - 2) + "..";
+            if (max <= 0) return String.Empty;
+            if (val.Length <= max) return val;
+            if (max <= 2) return val.Substring(0, max);
+            return val.Substring(0, max - 2) + "..";
+        }
+
+        private static string SafeClip(string val, int max)
+        {
+            if (String.IsNullOrEmpty(val)) return String.Empty;
+            if (max <= 0) return String.Empty;
+            return val.Length <= max ? val : val.Substring(0, max);
         }
 
         private static void WriteCentered(string value)

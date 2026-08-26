@@ -83,6 +83,7 @@ namespace SaiCont
                 Console.WriteLine("  START");
                 SetColor(interactive, ConsoleColor.Gray);
                 Console.WriteLine("  --gui        launch interactive Win95 Dark Golden TUI dashboard");
+                Console.WriteLine("  --terminal   open the SAICONT TERMINAL monitor and dispatcher adapter");
                 Console.WriteLine("  --probe      inspect Cline/Codex; never send input");
                 Console.WriteLine("  --dry-run    watch continuously; never send input");
                 Console.WriteLine("  --watch      run guarded continuation");
@@ -127,8 +128,22 @@ namespace SaiCont
             catch { }
 
             bool origCursorVisible = true;
+            try
+            {
+                if (!Console.IsOutputRedirected)
+                {
+                    Console.Title = "SAICONT TERMINAL";
+                }
+            }
+            catch { }
             try { origCursorVisible = Console.CursorVisible; } catch { }
 
+            bool interruptRequested = false;
+                        NativeConsole.ConsoleCtrlHandler interruptHandler = delegate(int controlType)
+            {
+                interruptRequested = true;
+                return true;
+            };
             TuiMode mode = TuiMode.Idle;
             if (String.Equals(initialModeName, "--watch", StringComparison.OrdinalIgnoreCase))
             {
@@ -168,18 +183,32 @@ namespace SaiCont
                 catch { }
                 try { Console.CursorVisible = false; } catch { }
 
-                latestSessions = new List<PollResult>(engine.PollOnce(false));
-                pollCounter++;
-                lastPollTime = DateTime.UtcNow;
-                AddLog(logs, "INFO", "system", 0, "SAICONT TUI started with " + configuration.Targets.Count + " target rules.");
-                foreach (PollResult r in latestSessions)
+                try
                 {
-                    AddLogFromPoll(logs, r);
+                    latestSessions = new List<PollResult>(engine.PollOnce(false));
+                    pollCounter++;
+                    lastPollTime = DateTime.UtcNow;
+                    AddLog(logs, "INFO", "system", 0, "SAICONT TUI started with " + configuration.Targets.Count + " target rules.");
+                    foreach (PollResult r in latestSessions)
+                    {
+                        AddLogFromPoll(logs, r);
+                    }
+                }
+                catch (Exception startupException)
+                {
+                    AddLog(logs, "ERROR", "system", 0, "Initial probe failed: " + startupException.Message);
                 }
 
                 bool running = true;
+            NativeConsole.TrySetCtrlHandler(interruptHandler);
                 while (running)
                 {
+                    if (interruptRequested)
+                    {
+                        AddLog(logs, "INFO", "system", 0, "Console interrupt received; closing terminal adapter.");
+                        break;
+                    }
+
                     DateTime now = DateTime.UtcNow;
 
                     if (mode == TuiMode.Watch || mode == TuiMode.DryRun)
@@ -188,13 +217,23 @@ namespace SaiCont
                         if ((now - lastPollTime).TotalMilliseconds >= interval)
                         {
                             bool allowInput = (mode == TuiMode.Watch);
-                            IList<PollResult> results = engine.PollOnce(allowInput);
-                            latestSessions = new List<PollResult>(results);
-                            pollCounter++;
-                            lastPollTime = now;
-                            foreach (PollResult r in results)
+                            IList<PollResult> results;
+                            try
                             {
-                                AddLogFromPoll(logs, r);
+                                results = engine.PollOnce(allowInput);
+                            }
+                            catch (Exception pollException)
+                            {
+                                AddLog(logs, "ERROR", "system", 0, "Poll failed: " + pollException.Message);
+                                results = new List<PollResult>();
+                            }
+                            latestSessions = new List<PollResult>(results);
+                            if (results.Count > 0)
+                            {
+                                foreach (PollResult r in results)
+                                {
+                                    AddLogFromPoll(logs, r);
+                                }
                             }
                         }
                     }
@@ -465,6 +504,7 @@ namespace SaiCont
             }
             finally
             {
+                NativeConsole.UnsetCtrlHandler();
                 try { Console.CursorVisible = origCursorVisible; } catch { }
                 try { Console.ForegroundColor = origFg; } catch { }
                 try { Console.BackgroundColor = origBg; } catch { }

@@ -833,6 +833,25 @@ namespace SaiCont
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            // WinForms fail-safe: a UI-thread exception must leave an auditable trace
+            // instead of silently killing the desktop adapter window.
+            try
+            {
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs eventArgs)
+                {
+                    Program.TryWriteCrashReport(
+                        "GUI thread exception: " + eventArgs.Exception.Message,
+                        eventArgs.Exception.ToString(),
+                        false);
+                    MessageBox.Show(
+                        "Recovered from an internal error; details were appended to run\\SAICONT.crash.log.",
+                        "SAICONT",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                };
+            }
+            catch { }
             Application.Run(new SaiContGuiForm(config, configurationFilePath, initialMode));
             return 0;
         }

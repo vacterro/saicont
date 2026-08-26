@@ -10,6 +10,7 @@ Run these commands from the project root:
 .\build.ps1
 .\bin\SAICONT.exe
 .\bin\SAICONT.exe --gui
+.\bin\SAICONT.exe --terminal
 .\bin\SAICONT.exe --self-test
 .\bin\SAICONT.exe --validate-config --config .\SAICONT.config.xml
 .\bin\SAICONT.exe --probe --config .\SAICONT.config.xml
@@ -41,6 +42,13 @@ Features:
 .\bin\SAICONT.exe --gui
 # or
 .\scripts\gui.ps1
+```
+
+#### SAICONT TERMINAL (branded adapter)
+```powershell
+.\SAICONT_TERMINAL.cmd
+# or
+.\bin\SAICONT.exe --terminal
 ```
 Features:
 - Pure terminal dashboard with 4 tabs: [1: Sessions], [2: Log Stream], [3: Rules], [4: Help].

@@ -13,6 +13,20 @@ namespace SaiCont
     internal static class Program
     {
         private static int _selfTestCount;
+        private static string _crashReportPathOverride;
+        private static volatile bool cancelRequested;
+
+        /// <summary>True once the operator pressed Ctrl+C; loops treat this as a graceful stop request.</summary>
+        internal static bool CancelRequested
+        {
+            get { return cancelRequested; }
+            set { cancelRequested = value; }
+        }
+
+        internal static void ResetInterruptForTests()
+        {
+            cancelRequested = false;
+        }
         private sealed class RuntimeOptions
         {
             public string Mode;
@@ -25,6 +39,7 @@ namespace SaiCont
 
         private static int Main(string[] args)
         {
+            InstallCrashGuard();
             if (args.Length == 0 || (args.Length == 1 && (args[0] == "--help" || args[0] == "-h")))
             {
                 TerminalUi.PrintLandingPage();
@@ -76,6 +91,13 @@ namespace SaiCont
                 return SaiContGuiForm.RunDesktopGui(configuration, options.ConfigurationPath);
             }
 
+            if (options.Mode == "--terminal")
+            {
+                // SAICONT TERMINAL: one console window that monitors the discovered
+                // agent sessions and dispatches guarded continuation on demand.
+                return TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath);
+            }
+
             if (options.Mode == "--gui")
             {
                 return TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath);
@@ -110,7 +132,7 @@ namespace SaiCont
             for (int index = 0; index < args.Length; index++)
             {
                 string argument = args[index];
-                if (argument == "--watch" || argument == "--dry-run" || argument == "--once" || argument == "--probe" || argument == "--validate-config" || argument == "--gui" || argument == "--tui" || argument == "-g" || argument == "--app" || argument == "--win-gui" || argument == "--window" || argument == "--desktop")
+                if (argument == "--watch" || argument == "--dry-run" || argument == "--once" || argument == "--probe" || argument == "--validate-config" || argument == "--gui" || argument == "--tui" || argument == "-g" || argument == "--terminal" || argument == "--app" || argument == "--win-gui" || argument == "--window" || argument == "--desktop")
                 {
                     if (options.Mode != null)
                     {
@@ -212,6 +234,53 @@ namespace SaiCont
             {
                 string localName = @"Local\SAICONT_" + hash.ToString("X8", System.Globalization.CultureInfo.InvariantCulture);
                 return new System.Threading.Mutex(true, localName, out createdNew);
+            }
+        }
+
+        private static void InstallCrashGuard()
+        {
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs eventArgs)
+            {
+                Exception exception = eventArgs.ExceptionObject as Exception;
+                string details = exception != null
+                    ? exception.ToString()
+                    : Convert.ToString(eventArgs.ExceptionObject, System.Globalization.CultureInfo.InvariantCulture);
+                TryWriteCrashReport("Unhandled appdomain exception", details, eventArgs.IsTerminating);
+            };
+        }
+
+        internal static void TryWriteCrashReport(string headline, string details, bool terminating)
+        {
+            try { Console.Error.WriteLine("SAICONT FATAL: " + headline); } catch { }
+            try
+            {
+                if (!String.IsNullOrEmpty(details))
+                {
+                    Console.Error.WriteLine(details);
+                }
+            }
+            catch { }
+            try
+            {
+                string path = _crashReportPathOverride;
+                if (String.IsNullOrEmpty(path))
+                {
+                    path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "run", "SAICONT.crash.log");
+                }
+                string directory = Path.GetDirectoryName(path);
+                if (!String.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                string stamp = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture);
+                File.AppendAllText(
+                    path,
+                    stamp + " terminating=" + (terminating ? "true" : "false") + " " + headline + Environment.NewLine +
+                    (details ?? String.Empty) + Environment.NewLine);
+            }
+            catch
+            {
+                // Last-gasp reporting must never throw: the failing path is already fatal.
             }
         }
 
@@ -322,6 +391,14 @@ namespace SaiCont
                 return 1;
             }
 
+            NativeConsole.ConsoleCtrlHandler interruptHandler = delegate(int controlType)
+            {
+                cancelRequested = true;
+                log.TryWrite("INFO", "console interrupt received; beginning graceful stop");
+                return true;
+            };
+            NativeConsole.TrySetCtrlHandler(interruptHandler);
+
             try
             {
                 DurableStateStore stateStore = (!String.IsNullOrEmpty(options.StateFilePath) && allowInput) ? new DurableStateStore(options.StateFilePath) : null;
@@ -338,6 +415,10 @@ namespace SaiCont
                     },
                     delegate
                     {
+                        if (cancelRequested)
+                        {
+                            return true;
+                        }
                         if (!loggingHealthy)
                         {
                             return true;
@@ -365,11 +446,19 @@ namespace SaiCont
                     Console.Error.WriteLine("Critical logging failure; watcher stopped fail-closed.");
                     return 1;
                 }
+                if (cancelRequested)
+                {
+                    log.TryWrite("INFO", "stopped by console interrupt");
+                    return 0;
+                }
                 log.TryWrite("INFO", "stopped by lifecycle request");
                 return 0;
             }
             finally
             {
+                // The native control handler is unhooked before FreeConsole to keep
+                // teardown deterministic; see NativeConsole.TrySetCtrlHandler notes.
+                NativeConsole.UnsetCtrlHandler();
                 ReleasePidFile(options.PidFilePath);
                 TryDelete(options.InstanceFilePath);
                 TryDelete(options.StopFilePath);
@@ -2084,6 +2173,8 @@ namespace SaiCont
                 failures += AssertEqual("--app", guiOpts.Mode, "--win-gui alias mode");
                 failures += AssertEqual(true, TryParseOptions(new[] { "--window" }, out guiOpts, out guiErr), "parse --window option");
                 failures += AssertEqual("--app", guiOpts.Mode, "--window alias mode");
+                failures += AssertEqual(true, TryParseOptions(new[] { "--terminal" }, out guiOpts, out guiErr), "parse --terminal option");
+                failures += AssertEqual("--terminal", guiOpts.Mode, "--terminal option mode");
 
                 // Test TUI poll result formatting
                 var samplePoll = new PollResult
@@ -2107,6 +2198,38 @@ namespace SaiCont
                 {
                     Directory.Delete(temporaryDirectory, true);
                 }
+            }
+
+            // Reliability fail-safe tests: crash report persistence and interrupt flag.
+            string crashDirectory = Path.Combine(Path.GetTempPath(), "saicont-selftest-crash-" + Guid.NewGuid().ToString("N"));
+            string crashPath = Path.Combine(crashDirectory, "crash.log");
+            _crashReportPathOverride = crashPath;
+            try
+            {
+                TryWriteCrashReport("selftest headline", "boom-marker-details", false);
+                string crashContent = File.Exists(crashPath) ? File.ReadAllText(crashPath) : String.Empty;
+                failures += AssertEqual(true, crashContent.Contains("boom-marker-details"), "crash report persists details");
+                failures += AssertEqual(true, crashContent.Contains("terminating=false"), "crash report records termination state");
+
+                ResetInterruptForTests();
+                failures += AssertEqual(false, CancelRequested, "interrupt flag defaults clear");
+                cancelRequested = true;
+                failures += AssertEqual(true, CancelRequested, "interrupt flag registers request");
+                ResetInterruptForTests();
+                failures += AssertEqual(false, CancelRequested, "interrupt flag resets clean");
+            }
+            finally
+            {
+                _crashReportPathOverride = null;
+                ResetInterruptForTests();
+                try
+                {
+                    if (Directory.Exists(crashDirectory))
+                    {
+                        Directory.Delete(crashDirectory, true);
+                    }
+                }
+                catch { }
             }
 
             if (String.Equals(Environment.GetEnvironmentVariable("SAICONT_SELF_TEST_INJECT_FAILURE"), "1", StringComparison.Ordinal))

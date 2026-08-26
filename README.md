@@ -1,6 +1,6 @@
 # SAICONT
 
-![version](https://img.shields.io/badge/version-1.0.0-darkgoldenrod)
+![version](https://img.shields.io/badge/version-1.1.0-darkgoldenrod)
 
 SAICONT is a compact, dependency-free Windows console watcher for safely resuming terminal AI agents without stealing window focus. It finds Cline and Codex through their process trees, reads recent console text, and injects `cc` only when a configured failure is recent, the target input prompt is proven empty and ready, and all retry/backoff deadlines are satisfied.
 
@@ -22,7 +22,8 @@ Run `./build.ps1` from Windows PowerShell or PowerShell 7. The script uses the 6
 
 - `.\bin\SAICONT.exe --app` (or `.\SAICONT_WIN.cmd` / `.\scripts\gui_win.ps1`) — Launch full-fledged Win95 Dark Golden Desktop GUI window (session table, live log stream, toolbar, deep inspector, system tray).
 - `.\bin\SAICONT.exe --gui` (or `.\SAICONT_GUI.cmd` / `.\scripts\gui.ps1`) — Launch interactive Dark Golden Win95 Terminal TUI dashboard.
-- `.\bin\SAICONT.exe --self-test` — 212 deterministic self-tests including Timeline Simulator and accelerated soak harness.
+- `.\bin\SAICONT.exe --terminal` (or `.\SAICONT_TERMINAL.cmd`) — SAICONT TERMINAL: the monitor + dispatcher adapter console (same dark-golden TUI, branded window title).
+- `.\bin\SAICONT.exe --self-test` — Deterministic self-test suite including Timeline Simulator and accelerated soak harness.
 - `.\bin\SAICONT.exe --validate-config --config .\SAICONT.config.xml` — Read-only preflight configuration validation.
 - `.\bin\SAICONT.exe --probe --config .\SAICONT.config.xml` — Read-only live console attachment and rule probe without input injection.
 - `.\scripts\smoke.ps1` — Complete automated smoke test suite (PowerShell parser checks, build, self-test, config validation, input harness test, live probe, dry-run multi-poll lifecycle).

@@ -438,6 +438,61 @@ namespace SaiCont
             }
         }
 
+        public delegate bool ConsoleCtrlHandler(int controlType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler handler, bool add);
+
+        private static ConsoleCtrlHandler _activeCtrlHandler;
+
+        /// <summary>
+        /// Registers a raw Win32 console control handler. Deliberately avoids
+        /// System.Console.CancelKeyPress: its internal ControlCHooker finalizer
+        /// calls Unhook after FreeConsole and aborts process exit (0xE0434352).
+        /// </summary>
+        public static bool TrySetCtrlHandler(ConsoleCtrlHandler handler)
+        {
+            lock (ConsoleLock)
+            {
+                ConsoleCtrlHandler existing = _activeCtrlHandler;
+                _activeCtrlHandler = null;
+                if (existing != null)
+                {
+                    try { SetConsoleCtrlHandler(existing, false); } catch { }
+                }
+                if (handler == null)
+                {
+                    return false;
+                }
+                try
+                {
+                    if (!SetConsoleCtrlHandler(handler, true))
+                    {
+                        return false;
+                    }
+                    _activeCtrlHandler = handler;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        public static void UnsetCtrlHandler()
+        {
+            lock (ConsoleLock)
+            {
+                ConsoleCtrlHandler handler = _activeCtrlHandler;
+                _activeCtrlHandler = null;
+                if (handler != null)
+                {
+                    try { SetConsoleCtrlHandler(handler, false); } catch { }
+                }
+            }
+        }
+
         internal static bool IsCompleteInputWrite(uint expectedRecords, uint writtenRecords)
         {
             return expectedRecords > 0 && writtenRecords == expectedRecords;

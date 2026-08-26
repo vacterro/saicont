@@ -117,14 +117,15 @@ namespace SaiCont
 
         public static int RunInteractiveTui(WatcherConfiguration configuration, string configPath, string initialModeName = null)
         {
-            if (Console.IsOutputRedirected || Console.IsInputRedirected)
+            ConsoleColor origFg = ConsoleColor.Gray;
+            ConsoleColor origBg = ConsoleColor.Black;
+            try
             {
-                Console.WriteLine("Non-interactive console environment detected; running probe instead.");
-                return PrintPollResults(new WatcherEngine(configuration).PollOnce(false));
+                origFg = Console.ForegroundColor;
+                origBg = Console.BackgroundColor;
             }
+            catch { }
 
-            ConsoleColor origFg = Console.ForegroundColor;
-            ConsoleColor origBg = Console.BackgroundColor;
             bool origCursorVisible = true;
             try { origCursorVisible = Console.CursorVisible; } catch { }
 
@@ -158,9 +159,13 @@ namespace SaiCont
 
             try
             {
-                Console.BackgroundColor = ConsoleColor.Black;
-                Console.ForegroundColor = ConsoleColor.Gray;
-                Console.Clear();
+                try
+                {
+                    Console.BackgroundColor = ConsoleColor.Black;
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    Console.Clear();
+                }
+                catch { }
                 try { Console.CursorVisible = false; } catch { }
 
                 latestSessions = new List<PollResult>(engine.PollOnce(false));
@@ -213,9 +218,13 @@ namespace SaiCont
                     int sleepRemaining = 100;
                     while (sleepRemaining > 0)
                     {
-                        if (Console.KeyAvailable)
+                        bool hasKey = false;
+                        try { hasKey = Console.KeyAvailable; } catch { }
+
+                        if (hasKey)
                         {
-                            ConsoleKeyInfo key = Console.ReadKey(true);
+                            ConsoleKeyInfo key;
+                            try { key = Console.ReadKey(true); } catch { break; }
 
                             if (inspectorOpen)
                             {
@@ -457,9 +466,9 @@ namespace SaiCont
             finally
             {
                 try { Console.CursorVisible = origCursorVisible; } catch { }
-                Console.ForegroundColor = origFg;
-                Console.BackgroundColor = origBg;
-                Console.Clear();
+                try { Console.ForegroundColor = origFg; } catch { }
+                try { Console.BackgroundColor = origBg; } catch { }
+                try { Console.Clear(); } catch { }
             }
 
             return 0;

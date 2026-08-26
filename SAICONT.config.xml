@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<saicont pollIntervalMilliseconds="2000">
+  <logging path="logs\SAICONT.log" maxBytes="1048576" retainedFiles="5" duplicateWindowSeconds="60" />
+  <targets>
+    <target name="cline-limits" enabled="true" command="cc" scanLines="180" maximumTriggerDistanceLines="150" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="true">
+      <processNames>
+        <process>cline</process>
+      </processNames>
+      <triggerPatterns>
+        <pattern>(?i)generate_stream from OpenRouter:\s*failed to invoke model(?:[^\r\n]*\r?\n){0,4}[^\r\n]*\b429\b</pattern>
+        <pattern>(?i)provider returned error[^\r\n]{0,512}\bcode\D{0,8}429\b</pattern>
+        <pattern>(?i)temporarily rate[- ]limited upstream</pattern>
+        <pattern>(?i)rate[- ]limited upstream</pattern>
+        <pattern>(?i)daily free model limit reached(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in</pattern>
+        <pattern>(?i)reached today.s free usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in</pattern>
+      </triggerPatterns>
+      <readyPatterns>
+        <pattern>^.*Ask anything\.\.\.\s*$</pattern>
+        <pattern>^.*What can I do for you\?\s*$</pattern>
+        <pattern>^\s*\?\s*$</pattern>
+      </readyPatterns>
+      <busyPatterns />
+    </target>
+    <target name="codex-usage-limit" enabled="true" command="cc" scanLines="180" maximumTriggerDistanceLines="150" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="true">
+      <processNames>
+        <process>codex</process>
+      </processNames>
+      <triggerPatterns>
+        <pattern>(?i)you.ve hit your usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again</pattern>
+        <pattern>(?i)usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again at</pattern>
+      </triggerPatterns>
+      <readyPatterns>
+        <pattern>^\s*›\s*Ask Codex to do anything\s*$</pattern>
+        <pattern>^\s*&gt;\s*$</pattern>
+      </readyPatterns>
+      <busyPatterns>
+        <pattern>(?im)^\s*[›&gt;]\s*Working\s*\(</pattern>
+      </busyPatterns>
+    </target>
+  </targets>
+</saicont>

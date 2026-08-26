@@ -1,0 +1,16 @@
+# Build and runtime output
+bin/
+logs/
+run/
+*.pdb
+*.tmp
+
+# SAIPEN state
+.saipen/*
+!.saipen/IDENTITY.md
+
+# Local credentials
+.env
+.env.*
+*.key
+*.pfx

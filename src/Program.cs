@@ -25,7 +25,7 @@ namespace SaiCont
 
         private static int Main(string[] args)
         {
-            if (args.Length == 1 && (args[0] == "--help" || args[0] == "-h"))
+            if (args.Length == 0 || (args.Length == 1 && (args[0] == "--help" || args[0] == "-h")))
             {
                 TerminalUi.PrintLandingPage();
                 return 0;
@@ -166,7 +166,8 @@ namespace SaiCont
 
             if (options.Mode == null)
             {
-                options.Mode = "--gui";
+                error = "An operating mode is required.";
+                return false;
             }
 
             if (options.Mode == "--watch" || options.Mode == "--dry-run")
@@ -2068,8 +2069,7 @@ namespace SaiCont
                 }
                 RuntimeOptions guiOpts;
                 string guiErr;
-                failures += AssertEqual(true, TryParseOptions(new string[0], out guiOpts, out guiErr), "parse empty args default to --gui");
-                failures += AssertEqual("--gui", guiOpts.Mode, "empty args default mode");
+                failures += AssertEqual(false, TryParseOptions(new string[0], out guiOpts, out guiErr), "parse empty args returns false");
                 failures += AssertEqual(true, TryParseOptions(new[] { "--gui" }, out guiOpts, out guiErr), "parse --gui option");
                 failures += AssertEqual("--gui", guiOpts.Mode, "--gui option mode");
                 failures += AssertEqual(true, TryParseOptions(new[] { "--tui" }, out guiOpts, out guiErr), "parse --tui option");

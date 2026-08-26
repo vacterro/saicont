@@ -143,8 +143,13 @@ namespace SaiCont
             }
 
             TuiTab activeTab = TuiTab.Sessions;
-            string statusMessage = "Ready. Press [P] to Probe, [D] for Dry-Run, [W] for Watch, [1-4] for Tabs, [Q] to Quit.";
+            string statusMessage = "Ready. [P] Probe  [D] Dry-Run  [W] Watch  [1-4] Tabs  [Enter] Inspect  [R] Reload  [Q] Quit";
             bool confirmWatch = false;
+            bool inspectorOpen = false;
+            int selectedSessionIndex = 0;
+            int selectedRuleIndex = 0;
+            int logScrollOffset = 0;
+
             var logs = new List<TuiLogEntry>();
             var latestSessions = new List<PollResult>();
             var engine = new WatcherEngine(configuration);
@@ -189,7 +194,21 @@ namespace SaiCont
                         }
                     }
 
-                    RenderTui(configuration, configPath, mode, activeTab, latestSessions, logs, statusMessage, confirmWatch, pollCounter, lastPollTime);
+                    RenderTui(
+                        configuration,
+                        configPath,
+                        mode,
+                        activeTab,
+                        latestSessions,
+                        logs,
+                        statusMessage,
+                        confirmWatch,
+                        inspectorOpen,
+                        selectedSessionIndex,
+                        selectedRuleIndex,
+                        logScrollOffset,
+                        pollCounter,
+                        lastPollTime);
 
                     int sleepRemaining = 100;
                     while (sleepRemaining > 0)
@@ -197,6 +216,25 @@ namespace SaiCont
                         if (Console.KeyAvailable)
                         {
                             ConsoleKeyInfo key = Console.ReadKey(true);
+
+                            if (inspectorOpen)
+                            {
+                                if (key.Key == ConsoleKey.Escape || key.Key == ConsoleKey.Enter || key.Key == ConsoleKey.Q || key.Key == ConsoleKey.Spacebar)
+                                {
+                                    inspectorOpen = false;
+                                    statusMessage = "Closed session inspector.";
+                                }
+                                else if (key.Key == ConsoleKey.UpArrow && selectedSessionIndex > 0)
+                                {
+                                    selectedSessionIndex--;
+                                }
+                                else if (key.Key == ConsoleKey.DownArrow && selectedSessionIndex < latestSessions.Count - 1)
+                                {
+                                    selectedSessionIndex++;
+                                }
+                                break;
+                            }
+
                             if (confirmWatch)
                             {
                                 if (key.Key == ConsoleKey.Y)
@@ -221,22 +259,39 @@ namespace SaiCont
                                         running = false;
                                         break;
 
+                                    case ConsoleKey.Tab:
+                                        activeTab = (TuiTab)(((int)activeTab + 1) % 4);
+                                        statusMessage = "Switched to Tab " + ((int)activeTab + 1) + ": " + activeTab;
+                                        break;
+
+                                    case ConsoleKey.LeftArrow:
+                                        if (activeTab > 0) activeTab--;
+                                        else activeTab = TuiTab.Help;
+                                        statusMessage = "Switched to Tab: " + activeTab;
+                                        break;
+
+                                    case ConsoleKey.RightArrow:
+                                        if (activeTab < TuiTab.Help) activeTab++;
+                                        else activeTab = TuiTab.Sessions;
+                                        statusMessage = "Switched to Tab: " + activeTab;
+                                        break;
+
                                     case ConsoleKey.D1:
                                     case ConsoleKey.F1:
                                         activeTab = TuiTab.Sessions;
-                                        statusMessage = "View: Live Sessions Dashboard";
+                                        statusMessage = "View: Live Sessions Dashboard [Arrow keys to select, Enter to inspect]";
                                         break;
 
                                     case ConsoleKey.D2:
                                     case ConsoleKey.F2:
                                         activeTab = TuiTab.LogStream;
-                                        statusMessage = "View: Real-Time Event & Activity Log";
+                                        statusMessage = "View: Real-Time Event & Activity Log [PageUp/Down to scroll]";
                                         break;
 
                                     case ConsoleKey.D3:
                                     case ConsoleKey.F3:
                                         activeTab = TuiTab.Rules;
-                                        statusMessage = "View: Target Rules & Configuration";
+                                        statusMessage = "View: Target Rules & Configuration [R to reload config]";
                                         break;
 
                                     case ConsoleKey.D4:
@@ -245,11 +300,69 @@ namespace SaiCont
                                         statusMessage = "View: Quick Reference & Safety Architecture";
                                         break;
 
+                                    case ConsoleKey.UpArrow:
+                                        if (activeTab == TuiTab.Sessions && selectedSessionIndex > 0)
+                                        {
+                                            selectedSessionIndex--;
+                                        }
+                                        else if (activeTab == TuiTab.Rules && selectedRuleIndex > 0)
+                                        {
+                                            selectedRuleIndex--;
+                                        }
+                                        else if (activeTab == TuiTab.LogStream)
+                                        {
+                                            logScrollOffset++;
+                                        }
+                                        break;
+
+                                    case ConsoleKey.DownArrow:
+                                        if (activeTab == TuiTab.Sessions && selectedSessionIndex < latestSessions.Count - 1)
+                                        {
+                                            selectedSessionIndex++;
+                                        }
+                                        else if (activeTab == TuiTab.Rules && selectedRuleIndex < configuration.Targets.Count - 1)
+                                        {
+                                            selectedRuleIndex++;
+                                        }
+                                        else if (activeTab == TuiTab.LogStream && logScrollOffset > 0)
+                                        {
+                                            logScrollOffset--;
+                                        }
+                                        break;
+
+                                    case ConsoleKey.PageUp:
+                                        if (activeTab == TuiTab.LogStream) logScrollOffset += 10;
+                                        break;
+
+                                    case ConsoleKey.PageDown:
+                                        if (activeTab == TuiTab.LogStream) logScrollOffset = Math.Max(0, logScrollOffset - 10);
+                                        break;
+
+                                    case ConsoleKey.Home:
+                                        if (activeTab == TuiTab.LogStream) logScrollOffset = Math.Max(0, logs.Count - 5);
+                                        else if (activeTab == TuiTab.Sessions) selectedSessionIndex = 0;
+                                        break;
+
+                                    case ConsoleKey.End:
+                                        if (activeTab == TuiTab.LogStream) logScrollOffset = 0;
+                                        else if (activeTab == TuiTab.Sessions && latestSessions.Count > 0) selectedSessionIndex = latestSessions.Count - 1;
+                                        break;
+
+                                    case ConsoleKey.Enter:
+                                    case ConsoleKey.Spacebar:
+                                        if (activeTab == TuiTab.Sessions && latestSessions.Count > 0 && selectedSessionIndex < latestSessions.Count)
+                                        {
+                                            inspectorOpen = true;
+                                            statusMessage = "Session Inspector: Press [Esc] or [Enter] to close.";
+                                        }
+                                        break;
+
                                     case ConsoleKey.P:
                                         statusMessage = "Executing single PROBE pass...";
                                         latestSessions = new List<PollResult>(engine.PollOnce(false));
                                         pollCounter++;
                                         lastPollTime = DateTime.UtcNow;
+                                        if (selectedSessionIndex >= latestSessions.Count) selectedSessionIndex = Math.Max(0, latestSessions.Count - 1);
                                         statusMessage = "Probe complete: " + latestSessions.Count + " sessions evaluated.";
                                         foreach (PollResult r in latestSessions)
                                         {
@@ -290,12 +403,46 @@ namespace SaiCont
                                         mode = TuiMode.Idle;
                                         confirmWatch = false;
                                         statusMessage = "Stopped. In IDLE mode.";
-                                        AddLog(logs, "INFO", "operator", 0, "Stopped.");
+                                        AddLog(logs, "INFO", "operator", 0, "Monitoring stopped.");
+                                        break;
+
+                                    case ConsoleKey.R:
+                                        try
+                                        {
+                                            configuration = WatcherConfiguration.Load(configPath);
+                                            engine = new WatcherEngine(configuration);
+                                            statusMessage = "Config reloaded successfully (" + configuration.Targets.Count + " targets).";
+                                            AddLog(logs, "INFO", "config", 0, "Configuration reloaded from " + Path.GetFileName(configPath));
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            statusMessage = "Config reload failed: " + ex.Message;
+                                            AddLog(logs, "ERROR", "config", 0, "Reload error: " + ex.Message);
+                                        }
+                                        break;
+
+                                    case ConsoleKey.T:
+                                        if (latestSessions.Count > 0 && selectedSessionIndex < latestSessions.Count)
+                                        {
+                                            PollResult sel = latestSessions[selectedSessionIndex];
+                                            statusMessage = "Test evaluation for PID " + sel.ProcessId + ": Ready=" + sel.Ready + ", Trigger=" + sel.Triggered + ", Busy=" + sel.Busy;
+                                            AddLog(logs, "INFO", "eval-test", sel.ProcessId, "Manual evaluation: " + (sel.Reason ?? "none"));
+                                        }
+                                        else
+                                        {
+                                            statusMessage = "No session selected to test.";
+                                        }
                                         break;
 
                                     case ConsoleKey.C:
                                         logs.Clear();
+                                        logScrollOffset = 0;
                                         statusMessage = "Log stream buffer cleared.";
+                                        break;
+
+                                    case ConsoleKey.H:
+                                        activeTab = TuiTab.Help;
+                                        statusMessage = "View: Quick Reference & Safety Architecture";
                                         break;
                                 }
                             }
@@ -327,6 +474,10 @@ namespace SaiCont
             IList<TuiLogEntry> logs,
             string statusMessage,
             bool confirmWatch,
+            bool inspectorOpen,
+            int selectedSessionIndex,
+            int selectedRuleIndex,
+            int logScrollOffset,
             int pollCounter,
             DateTime lastPollTime)
         {
@@ -347,23 +498,31 @@ namespace SaiCont
             WriteTabBar(width, activeTab);
 
             int contentHeight = Math.Max(8, height - 8);
-            switch (activeTab)
+
+            if (inspectorOpen && sessions != null && sessions.Count > 0 && selectedSessionIndex < sessions.Count)
             {
-                case TuiTab.Sessions:
-                    RenderSessionsTab(width, contentHeight, sessions);
-                    break;
-                case TuiTab.LogStream:
-                    RenderLogStreamTab(width, contentHeight, logs);
-                    break;
-                case TuiTab.Rules:
-                    RenderRulesTab(width, contentHeight, configuration, configPath);
-                    break;
-                case TuiTab.Help:
-                    RenderHelpTab(width, contentHeight);
-                    break;
+                RenderInspectorModal(width, contentHeight, sessions[selectedSessionIndex]);
+            }
+            else
+            {
+                switch (activeTab)
+                {
+                    case TuiTab.Sessions:
+                        RenderSessionsTab(width, contentHeight, sessions, selectedSessionIndex);
+                        break;
+                    case TuiTab.LogStream:
+                        RenderLogStreamTab(width, contentHeight, logs, logScrollOffset);
+                        break;
+                    case TuiTab.Rules:
+                        RenderRulesTab(width, contentHeight, configuration, configPath, selectedRuleIndex);
+                        break;
+                    case TuiTab.Help:
+                        RenderHelpTab(width, contentHeight);
+                        break;
+                }
             }
 
-            WriteWin95Footer(width, mode, statusMessage, confirmWatch);
+            WriteWin95Footer(width, mode, statusMessage, confirmWatch, inspectorOpen);
         }
 
         private static void WriteWin95Header(int width, TuiMode mode, int pollCounter, DateTime lastPollTime)
@@ -371,7 +530,7 @@ namespace SaiCont
             Console.BackgroundColor = ConsoleColor.DarkYellow;
             Console.ForegroundColor = ConsoleColor.Black;
 
-            string title = " SAICONT v1.0.0 [TERMINAL CONTINUITY] ";
+            string title = " SAICONT v1.0.0 [TERMINAL CONTINUITY DASHBOARD] ";
             string modeStr = " [" + mode.ToString().ToUpperInvariant() + "] ";
             string pollsStr = "Polls: " + pollCounter + " | " + (lastPollTime == DateTime.MinValue ? "--:--:--" : lastPollTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture)) + " UTC ";
 
@@ -428,61 +587,170 @@ namespace SaiCont
             }
         }
 
-        private static void RenderSessionsTab(int width, int maxLines, IList<PollResult> sessions)
+        private static void RenderSessionsTab(int width, int maxLines, IList<PollResult> sessions, int selectedIndex)
         {
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine(" " + BoxLine("DISCOVERED TERMINAL SESSIONS & PROMPT STATUS", width - 2));
+            Console.WriteLine(" " + BoxLine("DISCOVERED TERMINAL SESSIONS (UP/DOWN TO SELECT, ENTER TO INSPECT)", width - 2));
 
             Console.BackgroundColor = ConsoleColor.DarkGray;
             Console.ForegroundColor = ConsoleColor.White;
             string hdr = String.Format(
                 CultureInfo.InvariantCulture,
-                " {0,-14} {1,-8} {2,-7} {3,-18} {4,-7} {5,-10} {6}",
-                "RULE", "PROCESS", "PID", "TITLE", "STATUS", "PROMPT", "DECISION / REASON");
+                " {0,-2} {1,-14} {2,-8} {3,-7} {4,-18} {5,-7} {6,-10} {7}",
+                "  ", "RULE", "PROCESS", "PID", "TITLE", "STATUS", "PROMPT", "DECISION / REASON");
             if (hdr.Length < width) hdr = hdr.PadRight(width);
             else if (hdr.Length > width) hdr = hdr.Substring(0, width);
             Console.WriteLine(hdr);
 
             int linesPrinted = 0;
-            Console.BackgroundColor = ConsoleColor.Black;
 
             if (sessions == null || sessions.Count == 0)
             {
+                Console.BackgroundColor = ConsoleColor.Black;
                 Console.ForegroundColor = ConsoleColor.DarkGray;
                 Console.WriteLine("   (No matching active console sessions discovered. Press [P] to Probe)");
                 linesPrinted++;
             }
             else
             {
-                foreach (PollResult s in sessions)
+                for (int i = 0; i < sessions.Count; i++)
                 {
                     if (linesPrinted >= maxLines - 2) break;
 
-                    Console.ForegroundColor = s.Read ? ConsoleColor.Gray : ConsoleColor.DarkRed;
+                    PollResult s = sessions[i];
+                    bool isSelected = (i == selectedIndex);
+
+                    Console.BackgroundColor = isSelected ? ConsoleColor.DarkCyan : ConsoleColor.Black;
+
+                    string cursor = isSelected ? "> " : "  ";
                     string title = String.IsNullOrEmpty(s.Title) ? "-" : (s.Title.Length > 16 ? s.Title.Substring(0, 16) + ".." : s.Title);
                     string status = s.Read ? "READ" : "FAIL";
                     string prompt = s.Busy ? "BUSY" : (s.Ready ? "READY" : (s.Triggered ? "TRIGGER" : "IDLE"));
                     string reason = s.Reason ?? "-";
-                    if (reason.Length > width - 70) reason = reason.Substring(0, Math.Max(4, width - 73)) + "...";
+                    if (reason.Length > width - 74) reason = reason.Substring(0, Math.Max(4, width - 77)) + "...";
 
-                    ConsoleColor promptColor = s.Busy ? ConsoleColor.DarkRed : (s.Ready ? ConsoleColor.DarkGreen : (s.Triggered ? ConsoleColor.DarkYellow : ConsoleColor.Gray));
+                    ConsoleColor promptColor = isSelected ? ConsoleColor.White : (s.Busy ? ConsoleColor.DarkRed : (s.Ready ? ConsoleColor.DarkGreen : (s.Triggered ? ConsoleColor.DarkYellow : ConsoleColor.Gray)));
 
                     string line = String.Format(
                         CultureInfo.InvariantCulture,
-                        " {0,-14} {1,-8} {2,-7} {3,-18} ",
+                        " {0}{1,-14} {2,-8} {3,-7} {4,-18} ",
+                        cursor,
                         Truncate(s.Target, 14),
                         Truncate(s.ProcessName, 8),
                         s.ProcessId,
                         title);
 
+                    Console.ForegroundColor = isSelected ? ConsoleColor.White : ConsoleColor.Gray;
                     Console.Write(line);
-                    Console.ForegroundColor = s.Read ? ConsoleColor.Green : ConsoleColor.Red;
+                    Console.ForegroundColor = isSelected ? ConsoleColor.White : (s.Read ? ConsoleColor.Green : ConsoleColor.Red);
                     Console.Write(String.Format(CultureInfo.InvariantCulture, "{0,-7} ", status));
                     Console.ForegroundColor = promptColor;
                     Console.Write(String.Format(CultureInfo.InvariantCulture, "{0,-10} ", prompt));
+                    Console.ForegroundColor = isSelected ? ConsoleColor.White : ConsoleColor.Gray;
+                    Console.WriteLine(reason.PadRight(Math.Max(0, width - 72)));
+                    linesPrinted++;
+                }
+            }
+
+            Console.BackgroundColor = ConsoleColor.Black;
+            while (linesPrinted < maxLines)
+            {
+                Console.WriteLine(new string(' ', width));
+                linesPrinted++;
+            }
+        }
+
+        private static void RenderInspectorModal(int width, int maxLines, PollResult session)
+        {
+            Console.BackgroundColor = ConsoleColor.DarkYellow;
+            Console.ForegroundColor = ConsoleColor.Black;
+            string titleBar = " ===[ SESSION DETAIL INSPECTOR: PID " + session.ProcessId + " (" + (session.ProcessName ?? "unknown") + ") ]===";
+            if (titleBar.Length < width) titleBar = titleBar.PadRight(width);
+            Console.WriteLine(titleBar);
+
+            Console.BackgroundColor = ConsoleColor.Black;
+            Console.ForegroundColor = ConsoleColor.Gray;
+
+            string nextStr = session.NextAttemptUtc == DateTime.MinValue ? "none" : session.NextAttemptUtc.ToString("o", CultureInfo.InvariantCulture);
+
+            string[] detailLines = new[]
+            {
+                "  Target Rule:       " + (session.Target ?? "-"),
+                "  Process ID:        " + session.ProcessId + " (Name: " + (session.ProcessName ?? "-") + ")",
+                "  Attach Process ID: " + session.AttachProcessId + " | Title: \"" + (session.Title ?? "-") + "\"",
+                "  Console Read:      " + (session.Read ? "SUCCESS (READ)" : "FAILED (Unreadable)"),
+                "  Prompt Status:     " + (session.Busy ? "BUSY (Generating or typed input)" : (session.Ready ? "READY (Empty prompt, ready to submit)" : "UNKNOWN")),
+                "  Trigger State:     " + (session.Triggered ? "TRIGGERED (Active failure pattern matched)" : "NO_TRIGGER"),
+                "  Transaction Send:  WouldSend=" + session.WouldSend + " | Sent=" + session.Sent,
+                "  Retry Schedule:    NextAttempt=" + nextStr,
+                "  Decision / Reason: " + (session.Reason ?? "-"),
+                "  Error Detail:      " + (session.Error ?? "none"),
+                "",
+                "  [Esc] or [Enter] to return to Dashboard | [Up/Down] to inspect next session"
+            };
+
+            int linesPrinted = 0;
+            foreach (string dl in detailLines)
+            {
+                if (linesPrinted >= maxLines) break;
+                if (dl.Contains("SUCCESS") || dl.Contains("READY")) Console.ForegroundColor = ConsoleColor.Green;
+                else if (dl.Contains("FAILED") || dl.Contains("BUSY")) Console.ForegroundColor = ConsoleColor.Red;
+                else if (dl.Contains("TRIGGERED")) Console.ForegroundColor = ConsoleColor.Yellow;
+                else if (dl.Contains("return to Dashboard")) Console.ForegroundColor = ConsoleColor.DarkCyan;
+                else Console.ForegroundColor = ConsoleColor.Gray;
+
+                Console.WriteLine(dl.PadRight(width));
+                linesPrinted++;
+            }
+
+            Console.BackgroundColor = ConsoleColor.Black;
+            while (linesPrinted < maxLines)
+            {
+                Console.WriteLine(new string(' ', width));
+                linesPrinted++;
+            }
+        }
+
+        private static void RenderLogStreamTab(int width, int maxLines, IList<TuiLogEntry> logs, int scrollOffset)
+        {
+            Console.BackgroundColor = ConsoleColor.Black;
+            Console.ForegroundColor = ConsoleColor.DarkYellow;
+            string header = " " + BoxLine("REAL-TIME EVENT STREAM (PAGEUP/DOWN TO SCROLL, C TO CLEAR)", width - 2);
+            Console.WriteLine(header);
+
+            int linesPrinted = 0;
+            int visibleCount = maxLines - 1;
+            int totalLogs = logs.Count;
+
+            int endIdx = totalLogs - scrollOffset;
+            if (endIdx > totalLogs) endIdx = totalLogs;
+            int startIdx = Math.Max(0, endIdx - visibleCount);
+
+            if (logs.Count == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine("   (No operational log entries recorded yet)");
+                linesPrinted++;
+            }
+            else
+            {
+                for (int i = startIdx; i < endIdx && linesPrinted < visibleCount; i++)
+                {
+                    TuiLogEntry entry = logs[i];
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write(" " + entry.TimestampUtc.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + " ");
+
+                    if (entry.Level == "ERROR") Console.ForegroundColor = ConsoleColor.Red;
+                    else if (entry.Level == "WARN") Console.ForegroundColor = ConsoleColor.Yellow;
+                    else Console.ForegroundColor = ConsoleColor.DarkCyan;
+                    Console.Write(String.Format(CultureInfo.InvariantCulture, "[{0,-5}] ", entry.Level));
+
                     Console.ForegroundColor = ConsoleColor.Gray;
-                    Console.WriteLine(reason);
+                    string msg = entry.Message ?? String.Empty;
+                    int maxMsgWidth = Math.Max(10, width - 20);
+                    if (msg.Length > maxMsgWidth) msg = msg.Substring(0, maxMsgWidth - 3) + "...";
+                    Console.WriteLine(msg.PadRight(maxMsgWidth));
                     linesPrinted++;
                 }
             }
@@ -494,46 +762,11 @@ namespace SaiCont
             }
         }
 
-        private static void RenderLogStreamTab(int width, int maxLines, IList<TuiLogEntry> logs)
+        private static void RenderRulesTab(int width, int maxLines, WatcherConfiguration config, string configPath, int selectedRuleIndex)
         {
             Console.BackgroundColor = ConsoleColor.Black;
             Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine(" " + BoxLine("REAL-TIME EVENT STREAM & OPERATIONAL AUDIT", width - 2));
-
-            int linesPrinted = 0;
-            int startIndex = Math.Max(0, logs.Count - (maxLines - 1));
-
-            for (int i = startIndex; i < logs.Count && linesPrinted < maxLines - 1; i++)
-            {
-                TuiLogEntry entry = logs[i];
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.Write(" " + entry.TimestampUtc.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + " ");
-
-                if (entry.Level == "ERROR") Console.ForegroundColor = ConsoleColor.Red;
-                else if (entry.Level == "WARN") Console.ForegroundColor = ConsoleColor.Yellow;
-                else Console.ForegroundColor = ConsoleColor.DarkCyan;
-                Console.Write(String.Format(CultureInfo.InvariantCulture, "[{0,-5}] ", entry.Level));
-
-                Console.ForegroundColor = ConsoleColor.Gray;
-                string msg = entry.Message ?? String.Empty;
-                int maxMsgWidth = Math.Max(10, width - 20);
-                if (msg.Length > maxMsgWidth) msg = msg.Substring(0, maxMsgWidth - 3) + "...";
-                Console.WriteLine(msg);
-                linesPrinted++;
-            }
-
-            while (linesPrinted < maxLines)
-            {
-                Console.WriteLine(new string(' ', width));
-                linesPrinted++;
-            }
-        }
-
-        private static void RenderRulesTab(int width, int maxLines, WatcherConfiguration config, string configPath)
-        {
-            Console.BackgroundColor = ConsoleColor.Black;
-            Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine(" " + BoxLine("ACTIVE WATCHER CONFIGURATION (" + Path.GetFileName(configPath) + ")", width - 2));
+            Console.WriteLine(" " + BoxLine("ACTIVE WATCHER CONFIGURATION (" + Path.GetFileName(configPath) + ") [R TO RELOAD]", width - 2));
 
             int linesPrinted = 0;
             Console.ForegroundColor = ConsoleColor.Gray;
@@ -544,32 +777,39 @@ namespace SaiCont
             Console.ForegroundColor = ConsoleColor.White;
             string hdr = String.Format(
                 CultureInfo.InvariantCulture,
-                " {0,-18} {1,-10} {2,-16} {3,-8} {4,-12} {5}",
-                "RULE NAME", "ENABLED", "PROCESSES", "CMD", "RETRY/BACKOFF", "TRIGGERS");
+                " {0,-2} {1,-18} {2,-8} {3,-16} {4,-8} {5,-12} {6}",
+                "  ", "RULE NAME", "ENABLED", "PROCESSES", "CMD", "RETRY/BACKOFF", "TRIGGERS");
             if (hdr.Length < width) hdr = hdr.PadRight(width);
             Console.WriteLine(hdr);
             linesPrinted++;
 
-            Console.BackgroundColor = ConsoleColor.Black;
-            foreach (TargetRule rule in config.Targets)
+            for (int i = 0; i < config.Targets.Count; i++)
             {
                 if (linesPrinted >= maxLines) break;
-                Console.ForegroundColor = rule.Enabled ? ConsoleColor.Green : ConsoleColor.DarkGray;
+                TargetRule rule = config.Targets[i];
+                bool isSelected = (i == selectedRuleIndex);
+
+                Console.BackgroundColor = isSelected ? ConsoleColor.DarkCyan : ConsoleColor.Black;
+                Console.ForegroundColor = isSelected ? ConsoleColor.White : (rule.Enabled ? ConsoleColor.Green : ConsoleColor.DarkGray);
+
+                string cursor = isSelected ? "> " : "  ";
                 string procs = String.Join(",", rule.ProcessNames);
                 string retryInfo = rule.InitialDelaySeconds + "s/" + rule.BackoffMultiplier + "x (max " + rule.MaximumRetryIntervalSeconds + "s)";
                 string line = String.Format(
                     CultureInfo.InvariantCulture,
-                    " {0,-18} {1,-10} {2,-16} {3,-8} {4,-12} {5} triggers",
+                    " {0}{1,-18} {2,-8} {3,-16} {4,-8} {5,-12} {6} triggers",
+                    cursor,
                     Truncate(rule.Name, 18),
                     rule.Enabled ? "TRUE" : "FALSE",
                     Truncate(procs, 16),
                     Truncate(rule.Command, 8),
                     Truncate(retryInfo, 12),
                     rule.TriggerPatterns.Length);
-                Console.WriteLine(line);
+                Console.WriteLine(line.PadRight(Math.Max(0, width - 1)));
                 linesPrinted++;
             }
 
+            Console.BackgroundColor = ConsoleColor.Black;
             while (linesPrinted < maxLines)
             {
                 Console.WriteLine(new string(' ', width));
@@ -585,17 +825,21 @@ namespace SaiCont
 
             string[] helpLines = new[]
             {
-                " HOTKEYS:",
-                "   [P]         Single Probe      - Scan process tree and read target console buffers.",
-                "   [D]         Toggle Dry-Run    - Continuously inspect consoles without injecting input.",
-                "   [W]         Toggle Watch      - Enable live automated continuation (guarded with confirmation).",
-                "   [S]         Stop / Pause      - Stop active continuous monitoring and return to Idle.",
-                "   [1] - [4]   Switch Tabs       - [1] Sessions  [2] Logs  [3] Rules  [4] Help",
-                "   [C]         Clear Logs        - Flush the in-memory TUI log view buffer.",
-                "   [Q] / [Esc] Quit              - Safely exit the dashboard (restores console state).",
+                " NAVIGATION & CONTROLS:",
+                "   [1] - [4] / [Tab]  Switch Tabs       - [1] Sessions  [2] Logs  [3] Rules  [4] Help",
+                "   [Up] / [Down]      Navigate List     - Select terminal session or scroll log stream.",
+                "   [Enter] / [Space]  Session Inspector - Open deep diagnostic modal for selected session.",
+                "   [P]                Single Probe      - Run live discovery pass on console process tree.",
+                "   [D]                Toggle Dry-Run    - Continuously inspect consoles without injecting input.",
+                "   [W]                Toggle Watch      - Enable live automated continuation (guarded with [Y/N]).",
+                "   [S]                Stop / Pause      - Stop active continuous monitoring and return to Idle.",
+                "   [R]                Reload Config     - Hot-reload SAICONT.config.xml without restarting.",
+                "   [T]                Test Evaluation   - Inspect trigger/ready/busy logic on selected session.",
+                "   [C]                Clear Logs        - Flush the in-memory TUI log view buffer.",
+                "   [Q] / [Esc]        Quit              - Safely exit the dashboard (restores console state).",
                 "",
                 " SAFETY ARCHITECTURE:",
-                "   * Zero Focus Steal: Uses Win32 AttachConsole + WriteConsoleInputW; never steals window focus.",
+                "   * Zero Focus Steal: Uses Win32 AttachConsole + WriteConsoleInputW; never activates windows.",
                 "   * Transactional Send: Re-verifies console window and process start time right before sending.",
                 "   * Exponential Backoff: Hard caps on attempts (5) and retry intervals (up to 3600s).",
                 "   * Durable State: Retry countdowns and suppressed events persist across runs in SAICONT.state.xml."
@@ -617,7 +861,7 @@ namespace SaiCont
             }
         }
 
-        private static void WriteWin95Footer(int width, TuiMode mode, string statusMessage, bool confirmWatch)
+        private static void WriteWin95Footer(int width, TuiMode mode, string statusMessage, bool confirmWatch, bool inspectorOpen)
         {
             Console.BackgroundColor = confirmWatch ? ConsoleColor.DarkRed : ConsoleColor.DarkCyan;
             Console.ForegroundColor = ConsoleColor.White;
@@ -628,7 +872,11 @@ namespace SaiCont
 
             Console.BackgroundColor = ConsoleColor.DarkGray;
             Console.ForegroundColor = ConsoleColor.Black;
-            string keyBar = " [P] Probe  [D] Dry-Run  [W] Watch  [S] Stop  [1-4] Tabs  [C] Clear  [Q] Quit ";
+
+            string keyBar = inspectorOpen
+                ? " [Esc/Enter] Close Inspector  [Up/Down] Select Session  [Q] Quit "
+                : " [P] Probe  [D] Dry-Run  [W] Watch  [Enter] Inspect  [R] Reload  [1-4] Tabs  [Q] Quit ";
+
             if (keyBar.Length < width) keyBar = keyBar.PadRight(width);
             else if (keyBar.Length > width) keyBar = keyBar.Substring(0, width);
             Console.Write(keyBar);
@@ -760,4 +1008,5 @@ namespace SaiCont
         }
     }
 }
+
 

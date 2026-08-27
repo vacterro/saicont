@@ -49,6 +49,8 @@ Features:
 .\SAICONT_TERMINAL.cmd
 # or
 .\bin\SAICONT.exe --terminal
+# or
+.\scripts\terminal.ps1
 ```
 Features:
 - Pure terminal dashboard with 4 tabs: [1: Sessions], [2: Log Stream], [3: Rules], [4: Help].

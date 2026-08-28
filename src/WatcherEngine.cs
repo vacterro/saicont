@@ -135,6 +135,8 @@ namespace SaiCont
                 });
             }
 
+            var usedConsoles = new HashSet<string>(StringComparer.Ordinal);
+
             foreach (TargetRule rule in _configuration.Targets)
             {
                 if (!rule.Enabled)
@@ -150,7 +152,6 @@ namespace SaiCont
                 }
 
                 IList<ConsoleCandidate> candidates = ProcessDiscovery.FindCandidates(processes, targetNameSet, _sessionResolver);
-                var usedConsoles = new HashSet<string>(StringComparer.Ordinal);
 
                 foreach (ConsoleCandidate candidate in candidates)
                 {
@@ -179,6 +180,21 @@ namespace SaiCont
 
                     if (!usedConsoles.Add(resolvedConsole.StableConsoleId))
                     {
+                        results.Add(new PollResult
+                        {
+                            Target = rule.Name,
+                            ProcessId = candidate.MatchedProcessId,
+                            ParentProcessId = candidate.ParentProcessId,
+                            ProcessName = candidate.MatchedProcessName,
+                            AttachProcessId = resolvedConsole.ResolvedAttachProcessId,
+                            AttachChain = FormatChain(candidate.AttachProcessIds),
+                            ConsolePids = FormatChain(resolvedConsole.ConsoleProcessIds),
+                            ConsoleWindow = resolvedConsole.WindowHandle,
+                            Title = resolvedConsole.Snapshot != null ? resolvedConsole.Snapshot.Title : String.Empty,
+                            Read = true,
+                            Error = "console_already_attempted_this_poll",
+                            Reason = "send_blocked=console_already_attempted_this_poll"
+                        });
                         continue;
                     }
 
@@ -332,11 +348,35 @@ namespace SaiCont
                                     }
                                     else
                                     {
+                                        // CORE-004: reserve the attempt durably BEFORE the native
+                                        // write. If the pre-send persist fails, do NOT perform the
+                                        // native input. On restart, an AttemptInFlightReserved
+                                        // session is treated as a possible-successful-write and
+                                        // is not immediately re-attempted (per the audit's
+                                        // crash-recovery contract).
+                                        state.ReserveAttempt(safety.TriggerToken, rule, nowUtc);
+                                        if (_stateStore != null)
+                                        {
+                                            bool preChanged;
+                                            string preError;
+                                            List<StateRecord> preRecords = ExportAllStates(nowUtc);
+                                            if (!_stateStore.TrySave(preRecords, nowUtc, out preChanged, out preError))
+                                            {
+                                                _stateStoreHealthy = false;
+                                                result.Error = "state_write_failed: " + preError;
+                                                result.Reason = "send_blocked=state_store_unavailable";
+                                                results.Add(result);
+                                                continue;
+                                            }
+                                        }
                                         string writeError;
                                         result.Sent = _verifiedWriter(freshResolved, freshTarget.MatchedSession, rule.Command, out writeError);
                                         result.Error = writeError;
                                         result.Reason = result.Sent ? "send=command_written" : "send_blocked=" + (writeError ?? "input_write_failed");
-                                        state.RecordAttempt(result.Sent, true, safety.TriggerToken, rule, nowUtc);
+                                        // CORE-004: refine the reserved state to its terminal outcome
+                                        // AFTER the writer returns. The post-poll export at line ~355
+                                        // will durably persist the final state.
+                                        state.CommitAttempt(result.Sent, rule, nowUtc);
                                     }
                                 }
                             }

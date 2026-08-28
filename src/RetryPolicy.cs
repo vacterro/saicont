@@ -69,7 +69,14 @@ namespace SaiCont
         RecoveryExhausted,
         SessionDisappeared,
         TargetUnreadable,
-        AmbiguousFailClosed
+        AmbiguousFailClosed,
+        // CORE-004: in-flight reservation. The session has been selected for
+        // a native write and a conservative "attempt reserved" state was
+        // durably persisted BEFORE the WriteConsoleInputW call. On restart,
+        // the session is treated as a possible-successful-write (refuse
+        // immediate re-send) until the snapshot confirms the prior write
+        // either succeeded or failed.
+        AttemptInFlightReserved
     }
 
     internal sealed class RetrySessionState
@@ -310,6 +317,50 @@ namespace SaiCont
             _nextAttemptUtc = nowUtc.AddSeconds(backoffSeconds);
         }
 
+        // CORE-004: mark the session as selected for a native write BEFORE the
+        // WriteConsoleInputW call. The caller must durably persist the state
+        // immediately after this call; if the persist fails the caller must
+        // not perform the native write. On restart, an AttemptInFlightReserved
+        // session is treated as a possible-successful-write and is NOT
+        // immediately re-attempted.
+        public void ReserveAttempt(string triggerToken, TargetRule rule, DateTime nowUtc)
+        {
+            _attemptToken = triggerToken;
+            _sawBusy = false;
+            _attemptCount++;
+            _awaitingOutcome = false;
+            _state = RecoveryState.AttemptInFlightReserved;
+            int baseInterval = rule.SafeRetryIntervalSeconds;
+            double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, _attemptCount - 1));
+            int backoffSeconds = (int)Math.Min(rule.SafeMaximumRetryIntervalSeconds, Math.Max(baseInterval, baseInterval * multiplier));
+            _nextAttemptUtc = nowUtc.AddSeconds(backoffSeconds);
+            _lastWriteUtc = nowUtc;
+        }
+
+        // CORE-004: refine a reserved session to its terminal outcome AFTER
+        // the WriteConsoleInputW call returns. On restart a session still
+        // sitting in AttemptInFlightReserved must remain in that state until
+        // the next Observe cycle, which is what makes the crash window safe.
+        public void CommitAttempt(bool inputWritten, TargetRule rule, DateTime nowUtc)
+        {
+            _sawBusy = false;
+            if (inputWritten)
+            {
+                _lastWriteUtc = nowUtc;
+                _awaitingOutcome = true;
+                _state = RecoveryState.CommandWrittenAwaitingOutcome;
+            }
+            else
+            {
+                _awaitingOutcome = false;
+                _state = RecoveryState.BackoffWait;
+            }
+            int baseInterval = rule.SafeRetryIntervalSeconds;
+            double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, _attemptCount - 1));
+            int backoffSeconds = (int)Math.Min(rule.SafeMaximumRetryIntervalSeconds, Math.Max(baseInterval, baseInterval * multiplier));
+            _nextAttemptUtc = nowUtc.AddSeconds(backoffSeconds);
+        }
+
         private static DateTime SanitizeHistoricalTime(DateTime value, DateTime nowUtc)
         {
             if (value == DateTime.MinValue)
@@ -413,7 +464,6 @@ namespace SaiCont
                 // Bounded event context: inspect up to 6 lines starting from the trigger line
                 string eventContext = ExtractLinesAfterMatch(snapshot.Text, bestMatch.Index, 6);
 
-                bool parsedDue = false;
                 DateTime due = nowUtc.AddSeconds(rule.SafeInitialDelaySeconds);
                 if (rule.ParseRetryTime)
                 {
@@ -425,16 +475,19 @@ namespace SaiCont
                         {
                             due = nowUtc;
                         }
-                        parsedDue = true;
                     }
                 }
 
                 string normalizedContext = NormalizeEventContext(bestMatch.Value);
                 string token = rule.Name + ":" + bestPatternIndex + ":" + StableHash(normalizedContext).ToString("X8", CultureInfo.InvariantCulture);
-                if (parsedDue)
-                {
-                    token += ":" + due.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
-                }
+                // CORE-001: event identity is STABLE; the parsed due is carried separately
+                // via TriggerEvent.DueUtc and is anchored in RetrySessionState on first
+                // acceptance, not re-derived from every poll's nowLocal. A relative-duration
+                // event observed across polls (e.g. "Try again in 8h 57m" still scrolling)
+                // must keep one fingerprint so the same event is not treated as a new
+                // occurrence every poll. The deadline advancing with nowLocal was the
+                // bug. Byte-identical later occurrences after recovery are still
+                // distinguished by _suppressedToken at Observe (line ~178).
 
                 var triggerEvent = new TriggerEvent
                 {
@@ -666,7 +719,8 @@ namespace SaiCont
             }
 
             int monthNumber = 0;
-            if (clock.Groups["month"].Success)
+            bool monthRequested = clock.Groups["month"].Success;
+            if (monthRequested)
             {
                 string monthStr = clock.Groups["month"].Value;
                 DateTime monthDt;
@@ -674,27 +728,51 @@ namespace SaiCont
                 {
                     monthNumber = monthDt.Month;
                 }
+                else
+                {
+                    return false;
+                }
             }
             int dayNumber = 0;
-            if (clock.Groups["day"].Success)
+            bool dayRequested = clock.Groups["day"].Success;
+            if (dayRequested)
             {
-                Int32.TryParse(clock.Groups["day"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out dayNumber);
+                if (!Int32.TryParse(clock.Groups["day"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out dayNumber) || dayNumber < 1 || dayNumber > 31)
+                {
+                    return false;
+                }
             }
             int yearNumber = nowLocal.Year;
-            if (clock.Groups["year"].Success)
+            bool yearRequested = clock.Groups["year"].Success;
+            if (yearRequested)
             {
                 int y;
                 if (Int32.TryParse(clock.Groups["year"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out y) && y >= 2024 && y <= 2040)
                 {
                     yearNumber = y;
                 }
+                else
+                {
+                    return false;
+                }
             }
-
-            if (monthNumber > 0 && dayNumber > 0)
+            if (monthRequested ^ dayRequested)
             {
+                return false;
+            }
+            if (monthRequested && dayRequested)
+            {
+                DateTime specificDate;
                 try
                 {
-                    DateTime specificDate = new DateTime(yearNumber, monthNumber, dayNumber, parsed.Hour, parsed.Minute, parsed.Second, DateTimeKind.Local);
+                    specificDate = new DateTime(yearNumber, monthNumber, dayNumber, parsed.Hour, parsed.Minute, parsed.Second, DateTimeKind.Local);
+                }
+                catch
+                {
+                    return false;
+                }
+                if (yearRequested)
+                {
                     if (specificDate < nowLocal.AddMinutes(-1))
                     {
                         dueLocal = nowLocal;
@@ -705,9 +783,20 @@ namespace SaiCont
                     }
                     return true;
                 }
-                catch
+                DateTime nextYear = specificDate.AddYears(1);
+                if (specificDate >= nowLocal.AddMinutes(-1))
                 {
+                    dueLocal = specificDate;
                 }
+                else if (nextYear >= nowLocal.AddMinutes(-1))
+                {
+                    dueLocal = nextYear;
+                }
+                else
+                {
+                    dueLocal = nextYear;
+                }
+                return true;
             }
 
             DateTime candidate = nowLocal.Date.Add(parsed.TimeOfDay);

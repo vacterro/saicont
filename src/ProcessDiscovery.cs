@@ -205,17 +205,6 @@ namespace SaiCont
                 ids.Add(matched.Id);
             }
 
-            if (byId != null)
-            {
-                foreach (ProcessEntry entry in byId.Values)
-                {
-                    if (entry.ParentId == matched.Id && ids.Count < MaximumCandidateCount && seen.Add(entry.Id))
-                    {
-                        ids.Add(entry.Id);
-                    }
-                }
-            }
-
             ProcessEntry current = matched;
             var visitedAncestors = new HashSet<int> { matched.Id };
             while (current != null && ids.Count < MaximumCandidateCount)
@@ -231,6 +220,17 @@ namespace SaiCont
                     ids.Add(parent.Id);
                 }
                 current = parent;
+            }
+
+            if (byId != null)
+            {
+                foreach (ProcessEntry entry in byId.Values)
+                {
+                    if (entry.ParentId == matched.Id && ids.Count < MaximumCandidateCount && seen.Add(entry.Id))
+                    {
+                        ids.Add(entry.Id);
+                    }
+                }
             }
 
             return ids;

@@ -240,9 +240,9 @@ namespace SaiCont
             {
                 throw new FormatException("Target '" + target.Name + "' maximumTriggerDistanceLines cannot exceed scanLines.");
             }
-            if (target.BackoffMultiplier < 1.0 || target.BackoffMultiplier > 10.0)
+            if (Double.IsNaN(target.BackoffMultiplier) || Double.IsInfinity(target.BackoffMultiplier) || target.BackoffMultiplier < 1.0 || target.BackoffMultiplier > 10.0)
             {
-                throw new FormatException("Target '" + target.Name + "' backoffMultiplier must be between 1 and 10.");
+                throw new FormatException("Target '" + target.Name + "' backoffMultiplier must be a finite value between 1 and 10.");
             }
             if (target.MaximumRetryIntervalSeconds < target.RetryIntervalSeconds)
             {
@@ -342,6 +342,10 @@ namespace SaiCont
             if (!Double.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value) || value <= 0)
             {
                 throw new FormatException("'" + attributeName + "' on <" + element.Name + "> must be a positive number.");
+            }
+            if (Double.IsNaN(value) || Double.IsInfinity(value))
+            {
+                throw new FormatException("'" + attributeName + "' on <" + element.Name + "> must be a finite number.");
             }
             return value;
         }

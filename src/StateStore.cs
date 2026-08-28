@@ -275,20 +275,27 @@ namespace SaiCont
 
         private static StateRecord ParseRecord(XElement element)
         {
+            string lastWriteRaw = RequiredAttribute(element, "lastWrite");
+            string nextAllowedRaw = RequiredAttribute(element, "nextAllowed");
+            string awaitingRaw = RequiredAttribute(element, "awaitingOutcome");
+            string sawBusyRaw = RequiredAttribute(element, "sawBusy");
+            string attemptsRaw = RequiredAttribute(element, "attempts");
+            string stateRaw = RequiredAttribute(element, "state");
+
             var record = new StateRecord
             {
                 RuleName = RequiredAttribute(element, "rule"),
                 ProcessId = ParseInt(RequiredAttribute(element, "pid")),
                 ProcessStartUtc = ParseUtc(RequiredAttribute(element, "startUtc")),
-                TriggerFingerprint = (string)element.Attribute("fingerprint"),
+                TriggerFingerprint = OptionalAttribute(element, "fingerprint"),
                 LastObservedUtc = ParseUtc(RequiredAttribute(element, "lastObserved")),
-                LastWriteUtc = ParseUtc((string)element.Attribute("lastWrite")),
-                NextAllowedAttemptUtc = ParseUtc((string)element.Attribute("nextAllowed")),
-                AwaitingOutcome = ParseBool((string)element.Attribute("awaitingOutcome")),
-                SawBusyAfterWrite = ParseBool((string)element.Attribute("sawBusy")),
-                SuppressedFingerprint = (string)element.Attribute("suppressed"),
-                AttemptCount = ParseInt((string)element.Attribute("attempts"), 0),
-                RecoveryState = (string)element.Attribute("state")
+                LastWriteUtc = ParseUtcRequired(lastWriteRaw, "lastWrite"),
+                NextAllowedAttemptUtc = ParseUtcRequired(nextAllowedRaw, "nextAllowed"),
+                AwaitingOutcome = ParseBoolStrict(awaitingRaw, "awaitingOutcome"),
+                SawBusyAfterWrite = ParseBoolStrict(sawBusyRaw, "sawBusy"),
+                SuppressedFingerprint = OptionalAttribute(element, "suppressed"),
+                AttemptCount = ParseIntStrict(attemptsRaw, "attempts", 0, 50),
+                RecoveryState = ValidateRecoveryState(stateRaw)
             };
 
             if (record.ProcessId <= 0 || record.ProcessStartUtc == DateTime.MinValue)
@@ -299,8 +306,81 @@ namespace SaiCont
             {
                 throw new FormatException("state record has invalid lastObserved timestamp");
             }
-            record.AttemptCount = Math.Max(0, Math.Min(50, record.AttemptCount));
             return record;
+        }
+
+        private static string OptionalAttribute(XElement element, string name)
+        {
+            XAttribute attr = element.Attribute(name);
+            return attr == null ? String.Empty : attr.Value ?? String.Empty;
+        }
+
+        private static DateTime ParseUtcRequired(string value, string fieldName)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                throw new FormatException("state record missing required timestamp '" + fieldName + "'");
+            }
+            DateTime parsed;
+            if (!DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out parsed))
+            {
+                throw new FormatException("state record has invalid timestamp '" + fieldName + "'");
+            }
+            return parsed.ToUniversalTime();
+        }
+
+        private static bool ParseBoolStrict(string value, string fieldName)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                throw new FormatException("state record missing required boolean '" + fieldName + "'");
+            }
+            bool parsed;
+            if (!Boolean.TryParse(value, out parsed))
+            {
+                throw new FormatException("state record has invalid boolean '" + fieldName + "'");
+            }
+            return parsed;
+        }
+
+        private static int ParseIntStrict(string value, string fieldName, int min, int max)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                throw new FormatException("state record missing required integer '" + fieldName + "'");
+            }
+            int parsed;
+            if (!Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+            {
+                throw new FormatException("state record has invalid integer '" + fieldName + "'");
+            }
+            if (parsed < min || parsed > max)
+            {
+                throw new FormatException("state record '" + fieldName + "' out of range [" + min + "," + max + "]");
+            }
+            return parsed;
+        }
+
+        private static string ValidateRecoveryState(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                throw new FormatException("state record missing required 'state'");
+            }
+            switch (value)
+            {
+                case "IdleNoEvent":
+                case "EventWaitingDeadline":
+                case "BackoffWait":
+                case "EventReady":
+                case "RecoveryExhausted":
+                case "RecoveryConfirmed":
+                case "AttemptInFlightReserved":
+                case "AmbiguousFailClosed":
+                    return value;
+                default:
+                    throw new FormatException("state record has unknown RecoveryState '" + value + "'");
+            }
         }
 
         private static List<StateRecord> NormalizeRecords(IEnumerable<StateRecord> records, DateTime nowUtc)

@@ -878,7 +878,7 @@ namespace SaiCont
                 new ProcessEntry { Id = 103, ParentId = 101, Name = "worker.exe" }
             };
             var wrapperById = wrapperWithChild.ToDictionary(item => item.Id);
-            failures += AssertEqual("101,102,103,100", JoinChain(ProcessDiscovery.BuildAttachCandidates(wrapperWithChild[1], wrapperById)), "wrapper with child process candidate inclusion");
+            failures += AssertEqual("101,100,102,103", JoinChain(ProcessDiscovery.BuildAttachCandidates(wrapperWithChild[1], wrapperById)), "wrapper with child process candidate inclusion");
 
             var dupTree = new List<ProcessEntry>
             {

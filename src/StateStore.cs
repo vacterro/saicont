@@ -15,6 +15,7 @@ namespace SaiCont
         public int ProcessId;
         public DateTime ProcessStartUtc;
         public string TriggerFingerprint;
+        public string RuleSemanticFingerprint;
         public DateTime LastObservedUtc;
         public DateTime LastWriteUtc;
         public DateTime NextAllowedAttemptUtc;
@@ -41,14 +42,15 @@ namespace SaiCont
         Missing,
         Valid,
         Corrupt,
-        UnsupportedSchema
+        UnsupportedSchema,
+        Unavailable
     }
 
     internal sealed class DurableStateStore
     {
         internal const string SchemaVersion = "1";
         internal const int MaximumRecords = 128;
-        private static readonly TimeSpan DefaultRetention = TimeSpan.FromHours(24);
+        private static readonly TimeSpan DefaultRetention = TimeSpan.FromDays(RetryConstants.MaximumRetryHorizonDays + 31);
         private readonly string _filePath;
         private readonly object _ioLock = new object();
         private string _lastFingerprint;
@@ -67,8 +69,9 @@ namespace SaiCont
         {
             get
             {
-                return LastLoadDisposition == StateLoadDisposition.Corrupt ||
-                    LastLoadDisposition == StateLoadDisposition.UnsupportedSchema;
+                    return LastLoadDisposition == StateLoadDisposition.Corrupt ||
+                    LastLoadDisposition == StateLoadDisposition.UnsupportedSchema ||
+                    LastLoadDisposition == StateLoadDisposition.Unavailable;
             }
         }
 
@@ -110,14 +113,55 @@ namespace SaiCont
 
         public List<StateRecord> Load()
         {
+            return Load(DateTime.UtcNow);
+        }
+
+        public List<StateRecord> Load(DateTime nowUtc)
+        {
+            return LoadCore(nowUtc, true);
+        }
+
+        public List<StateRecord> ValidateReadOnly(DateTime nowUtc)
+        {
+            return LoadCore(nowUtc, false);
+        }
+
+        private List<StateRecord> LoadCore(DateTime nowUtc, bool quarantineInvalid)
+        {
             lock (_ioLock)
             {
                 LastError = null;
                 CleanupStaleTemps();
                 var records = new List<StateRecord>();
-                if (String.IsNullOrEmpty(_filePath) || !File.Exists(_filePath))
+                if (String.IsNullOrEmpty(_filePath))
                 {
                     LastLoadDisposition = StateLoadDisposition.Missing;
+                    _lastFingerprint = ComputeFingerprint(records);
+                    return records;
+                }
+
+                try
+                {
+                    using (var probe = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                    }
+                }
+                catch (FileNotFoundException)
+                {
+                    LastLoadDisposition = StateLoadDisposition.Missing;
+                    _lastFingerprint = ComputeFingerprint(records);
+                    return records;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    LastLoadDisposition = StateLoadDisposition.Missing;
+                    _lastFingerprint = ComputeFingerprint(records);
+                    return records;
+                }
+                catch (Exception exception)
+                {
+                    LastLoadDisposition = StateLoadDisposition.Unavailable;
+                    LastError = exception.GetType().Name + ": " + exception.Message;
                     _lastFingerprint = ComputeFingerprint(records);
                     return records;
                 }
@@ -146,7 +190,10 @@ namespace SaiCont
                     {
                         LastLoadDisposition = StateLoadDisposition.UnsupportedSchema;
                         LastError = "unsupported state schema version '" + (version ?? "") + "'";
-                        Quarantine("unsupported");
+                        if (quarantineInvalid)
+                        {
+                            Quarantine("unsupported");
+                        }
                         _lastFingerprint = ComputeFingerprint(records);
                         return records;
                     }
@@ -156,16 +203,33 @@ namespace SaiCont
                         records.Add(ParseRecord(element));
                     }
 
-                    records = NormalizeRecords(records, DateTime.UtcNow);
+                    records = NormalizeRecords(records, nowUtc);
                     LastLoadDisposition = StateLoadDisposition.Valid;
                     _lastFingerprint = ComputeFingerprint(records);
                     return records;
+                }
+                catch (UnauthorizedAccessException exception)
+                {
+                    LastLoadDisposition = StateLoadDisposition.Unavailable;
+                    LastError = exception.GetType().Name + ": " + exception.Message;
+                    _lastFingerprint = ComputeFingerprint(records);
+                    return new List<StateRecord>();
+                }
+                catch (IOException exception)
+                {
+                    LastLoadDisposition = StateLoadDisposition.Unavailable;
+                    LastError = exception.GetType().Name + ": " + exception.Message;
+                    _lastFingerprint = ComputeFingerprint(records);
+                    return new List<StateRecord>();
                 }
                 catch (Exception exception)
                 {
                     LastLoadDisposition = StateLoadDisposition.Corrupt;
                     LastError = exception.GetType().Name + ": " + exception.Message;
-                    Quarantine("corrupt");
+                    if (quarantineInvalid)
+                    {
+                        Quarantine("corrupt");
+                    }
                     _lastFingerprint = ComputeFingerprint(records);
                     return new List<StateRecord>();
                 }
@@ -203,6 +267,7 @@ namespace SaiCont
                         new XAttribute("pid", record.ProcessId),
                         new XAttribute("startUtc", FormatUtc(record.ProcessStartUtc)),
                         new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
+                        new XAttribute("ruleFingerprint", record.RuleSemanticFingerprint ?? String.Empty),
                         new XAttribute("lastObserved", FormatUtc(record.LastObservedUtc)),
                         new XAttribute("lastWrite", FormatUtc(record.LastWriteUtc)),
                         new XAttribute("nextAllowed", FormatUtc(record.NextAllowedAttemptUtc)),
@@ -210,10 +275,12 @@ namespace SaiCont
                         new XAttribute("sawBusy", record.SawBusyAfterWrite),
                         new XAttribute("suppressed", record.SuppressedFingerprint ?? String.Empty),
                         new XAttribute("attempts", record.AttemptCount),
-                        new XAttribute("state", record.RecoveryState ?? String.Empty)));
+                        new XAttribute("state", SerializeRecoveryState(record))));
                 }
 
                 var document = new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root);
+                AtomicFileCommit commit;
+                string writeError;
                 bool written = AtomicFile.TryWrite(
                     _filePath,
                     delegate(Stream stream)
@@ -229,16 +296,25 @@ namespace SaiCont
                             document.Save(writer);
                         }
                     },
-                    out error);
+                    out commit,
+                    out writeError);
                 if (!written)
                 {
-                    LastError = error;
+                    LastError = writeError;
                     return false;
                 }
 
                 changed = true;
                 SuccessfulWriteCount++;
-                LastError = null;
+                if (commit == AtomicFileCommit.CommittedWithCleanupWarning)
+                {
+                    LastError = writeError;
+                    error = writeError;
+                }
+                else
+                {
+                    LastError = null;
+                }
                 _lastFingerprint = fingerprint;
                 return true;
             }
@@ -275,8 +351,8 @@ namespace SaiCont
 
         private static StateRecord ParseRecord(XElement element)
         {
-            string lastWriteRaw = RequiredAttribute(element, "lastWrite");
-            string nextAllowedRaw = RequiredAttribute(element, "nextAllowed");
+            string lastWriteRaw = RequiredAttributeAllowEmpty(element, "lastWrite");
+            string nextAllowedRaw = RequiredAttributeAllowEmpty(element, "nextAllowed");
             string awaitingRaw = RequiredAttribute(element, "awaitingOutcome");
             string sawBusyRaw = RequiredAttribute(element, "sawBusy");
             string attemptsRaw = RequiredAttribute(element, "attempts");
@@ -288,6 +364,7 @@ namespace SaiCont
                 ProcessId = ParseInt(RequiredAttribute(element, "pid")),
                 ProcessStartUtc = ParseUtc(RequiredAttribute(element, "startUtc")),
                 TriggerFingerprint = OptionalAttribute(element, "fingerprint"),
+                RuleSemanticFingerprint = OptionalAttribute(element, "ruleFingerprint"),
                 LastObservedUtc = ParseUtc(RequiredAttribute(element, "lastObserved")),
                 LastWriteUtc = ParseUtcRequired(lastWriteRaw, "lastWrite"),
                 NextAllowedAttemptUtc = ParseUtcRequired(nextAllowedRaw, "nextAllowed"),
@@ -319,7 +396,7 @@ namespace SaiCont
         {
             if (String.IsNullOrEmpty(value))
             {
-                throw new FormatException("state record missing required timestamp '" + fieldName + "'");
+                return DateTime.MinValue;
             }
             DateTime parsed;
             if (!DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out parsed))
@@ -361,6 +438,26 @@ namespace SaiCont
             return parsed;
         }
 
+        private static string SerializeRecoveryState(StateRecord record)
+        {
+            // W2-001: Save must emit exactly the representations Load accepts.
+            // An empty/unknown state name is never serialized; it degrades to
+            // the safe idle disposition instead of producing a corrupt record.
+            string value = record == null ? null : record.RecoveryState;
+            if (!String.IsNullOrEmpty(value))
+            {
+                try
+                {
+                    Enum.Parse(typeof(RecoveryState), value, true);
+                    return value;
+                }
+                catch
+                {
+                }
+            }
+            return RecoveryState.IdleNoEvent.ToString();
+        }
+
         private static string ValidateRecoveryState(string value)
         {
             if (String.IsNullOrEmpty(value))
@@ -372,10 +469,15 @@ namespace SaiCont
                 case "IdleNoEvent":
                 case "EventWaitingDeadline":
                 case "BackoffWait":
-                case "EventReady":
+                case "EventReadyToAttempt":
                 case "RecoveryExhausted":
                 case "RecoveryConfirmed":
                 case "AttemptInFlightReserved":
+                case "CommandWrittenAwaitingOutcome":
+                case "TargetBusyOrProgressing":
+                case "EventStillPresentReady":
+                case "SessionDisappeared":
+                case "TargetUnreadable":
                 case "AmbiguousFailClosed":
                     return value;
                 default:
@@ -451,12 +553,22 @@ namespace SaiCont
 
         private static string RequiredAttribute(XElement element, string name)
         {
-            string value = (string)element.Attribute(name);
+            string value = RequiredAttributeAllowEmpty(element, name);
             if (String.IsNullOrWhiteSpace(value))
             {
                 throw new FormatException("state record is missing '" + name + "'");
             }
             return value;
+        }
+
+        private static string RequiredAttributeAllowEmpty(XElement element, string name)
+        {
+            XAttribute attribute = element.Attribute(name);
+            if (attribute == null)
+            {
+                throw new FormatException("state record is missing '" + name + "'");
+            }
+            return attribute.Value ?? String.Empty;
         }
 
         private static int ParseInt(string value, int fallback = Int32.MinValue)

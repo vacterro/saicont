@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -116,7 +117,7 @@ namespace SaiCont
             }
         }
 
-        public static int RunInteractiveTui(WatcherConfiguration configuration, string configPath, string initialModeName = null)
+        public static int RunInteractiveTui(WatcherConfiguration configuration, string configPath, string initialModeName = null, DurableStateStore stateStore = null, Func<bool> stopPredicate = null)
         {
             ConsoleColor origFg = ConsoleColor.Gray;
             ConsoleColor origBg = ConsoleColor.Black;
@@ -168,9 +169,25 @@ namespace SaiCont
 
             var logs = new List<TuiLogEntry>();
             var latestSessions = new List<PollResult>();
-            var engine = new WatcherEngine(configuration);
+            var engine = new WatcherEngine(configuration, stateStore);
             int pollCounter = 0;
             DateTime lastPollTime = DateTime.MinValue;
+            long nextPollDueTicks = Stopwatch.GetTimestamp();
+            // PERF-008: dirty-render flag. Only repaint when state has
+            // changed: poll completion, input, mode/tab/config change,
+            // inspector toggle, or initial display. Key polling continues
+            // at 20 ms for responsiveness; the expensive full-frame
+            // repaint is skipped when idle.
+            bool dirtyRender = true;
+            int lastRenderedPollCounter = -1;
+            TuiMode lastRenderedMode = TuiMode.Idle;
+            TuiTab lastRenderedTab = TuiTab.Sessions;
+            bool lastRenderedConfirmWatch = false;
+            bool lastRenderedInspectorOpen = false;
+            int lastRenderedSelectedIndex = -1;
+            int lastRenderedLogScroll = -1;
+            int lastRenderedSessionCount = -1;
+            DateTime lastFullRenderUtc = DateTime.MinValue;
 
             try
             {
@@ -188,6 +205,7 @@ namespace SaiCont
                     latestSessions = new List<PollResult>(engine.PollOnce(false));
                     pollCounter++;
                     lastPollTime = DateTime.UtcNow;
+                    nextPollDueTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * Math.Max(500, configuration.PollIntervalMilliseconds) / 1000;
                     AddLog(logs, "INFO", "system", 0, "SAICONT TUI started with " + configuration.Targets.Count + " target rules.");
                     foreach (PollResult r in latestSessions)
                     {
@@ -200,12 +218,15 @@ namespace SaiCont
                 }
 
                 bool running = true;
-            NativeConsole.TrySetCtrlHandler(interruptHandler);
+            if (!NativeConsole.TrySetCtrlHandler(interruptHandler))
+            {
+                AddLog(logs, "ERROR", "system", 0, "Console interrupt handler registration failed.");
+            }
                 while (running)
                 {
-                    if (interruptRequested)
+                    if (interruptRequested || (stopPredicate != null && stopPredicate()))
                     {
-                        AddLog(logs, "INFO", "system", 0, "Console interrupt received; closing terminal adapter.");
+                        AddLog(logs, "INFO", "system", 0, "Lifecycle stop requested; closing terminal adapter.");
                         break;
                     }
 
@@ -214,7 +235,8 @@ namespace SaiCont
                     if (mode == TuiMode.Watch || mode == TuiMode.DryRun)
                     {
                         int interval = Math.Max(500, configuration.PollIntervalMilliseconds);
-                        if ((now - lastPollTime).TotalMilliseconds >= interval)
+                        long nowTicks = Stopwatch.GetTimestamp();
+                        if (nowTicks >= nextPollDueTicks)
                         {
                             bool allowInput = (mode == TuiMode.Watch);
                             IList<PollResult> results;
@@ -228,6 +250,10 @@ namespace SaiCont
                                 results = new List<PollResult>();
                             }
                             latestSessions = new List<PollResult>(results);
+                            pollCounter++;
+                            lastPollTime = now;
+                            dirtyRender = true;
+                            nextPollDueTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * interval / 1000;
                             if (results.Count > 0)
                             {
                                 foreach (PollResult r in results)
@@ -238,21 +264,47 @@ namespace SaiCont
                         }
                     }
 
-                    RenderTui(
-                        configuration,
-                        configPath,
-                        mode,
-                        activeTab,
-                        latestSessions,
-                        logs,
-                        statusMessage,
-                        confirmWatch,
-                        inspectorOpen,
-                        selectedSessionIndex,
-                        selectedRuleIndex,
-                        logScrollOffset,
-                        pollCounter,
-                        lastPollTime);
+                    // PERF-008: only repaint when state has changed or
+                    // once per second for clock updates. Key polling at
+                    // 20ms remains responsive; the expensive full-frame
+                    // repaint is gated on dirty state.
+                    bool stateChanged = pollCounter != lastRenderedPollCounter ||
+                        mode != lastRenderedMode ||
+                        activeTab != lastRenderedTab ||
+                        confirmWatch != lastRenderedConfirmWatch ||
+                        inspectorOpen != lastRenderedInspectorOpen ||
+                        selectedSessionIndex != lastRenderedSelectedIndex ||
+                        logScrollOffset != lastRenderedLogScroll ||
+                        latestSessions.Count != lastRenderedSessionCount;
+                    bool clockDue = (now - lastFullRenderUtc).TotalSeconds >= 1.0;
+                    if (dirtyRender || stateChanged || clockDue)
+                    {
+                        RenderTui(
+                            configuration,
+                            configPath,
+                            mode,
+                            activeTab,
+                            latestSessions,
+                            logs,
+                            statusMessage,
+                            confirmWatch,
+                            inspectorOpen,
+                            selectedSessionIndex,
+                            selectedRuleIndex,
+                            logScrollOffset,
+                            pollCounter,
+                            lastPollTime);
+                        dirtyRender = false;
+                        lastRenderedPollCounter = pollCounter;
+                        lastRenderedMode = mode;
+                        lastRenderedTab = activeTab;
+                        lastRenderedConfirmWatch = confirmWatch;
+                        lastRenderedInspectorOpen = inspectorOpen;
+                        lastRenderedSelectedIndex = selectedSessionIndex;
+                        lastRenderedLogScroll = logScrollOffset;
+                        lastRenderedSessionCount = latestSessions.Count;
+                        lastFullRenderUtc = now;
+                    }
 
                     int sleepRemaining = 100;
                     while (sleepRemaining > 0)
@@ -305,50 +357,59 @@ namespace SaiCont
                                     case ConsoleKey.Q:
                                     case ConsoleKey.Escape:
                                         running = false;
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.Tab:
                                         activeTab = (TuiTab)(((int)activeTab + 1) % 4);
                                         statusMessage = "Switched to Tab " + ((int)activeTab + 1) + ": " + activeTab;
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.LeftArrow:
                                         if (activeTab > 0) activeTab--;
                                         else activeTab = TuiTab.Help;
                                         statusMessage = "Switched to Tab: " + activeTab;
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.RightArrow:
                                         if (activeTab < TuiTab.Help) activeTab++;
                                         else activeTab = TuiTab.Sessions;
                                         statusMessage = "Switched to Tab: " + activeTab;
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.D1:
                                     case ConsoleKey.F1:
                                         activeTab = TuiTab.Sessions;
                                         statusMessage = "View: Live Sessions Dashboard [Arrow keys to select, Enter to inspect]";
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.D2:
                                     case ConsoleKey.F2:
                                         activeTab = TuiTab.LogStream;
                                         statusMessage = "View: Real-Time Event & Activity Log [PageUp/Down to scroll]";
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.D3:
                                     case ConsoleKey.F3:
                                         activeTab = TuiTab.Rules;
                                         statusMessage = "View: Target Rules & Configuration [R to reload config]";
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.D4:
                                     case ConsoleKey.F4:
                                         activeTab = TuiTab.Help;
                                         statusMessage = "View: Quick Reference & Safety Architecture";
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.UpArrow:
+                                        dirtyRender = true;
                                         if (activeTab == TuiTab.Sessions && selectedSessionIndex > 0)
                                         {
                                             selectedSessionIndex--;
@@ -364,6 +425,7 @@ namespace SaiCont
                                         break;
 
                                     case ConsoleKey.DownArrow:
+                                        dirtyRender = true;
                                         if (activeTab == TuiTab.Sessions && selectedSessionIndex < latestSessions.Count - 1)
                                         {
                                             selectedSessionIndex++;
@@ -398,6 +460,7 @@ namespace SaiCont
 
                                     case ConsoleKey.Enter:
                                     case ConsoleKey.Spacebar:
+                                        dirtyRender = true;
                                         if (activeTab == TuiTab.Sessions && latestSessions.Count > 0 && selectedSessionIndex < latestSessions.Count)
                                         {
                                             inspectorOpen = true;
@@ -410,6 +473,7 @@ namespace SaiCont
                                         latestSessions = new List<PollResult>(engine.PollOnce(false));
                                         pollCounter++;
                                         lastPollTime = DateTime.UtcNow;
+                                        dirtyRender = true;
                                         if (selectedSessionIndex >= latestSessions.Count) selectedSessionIndex = Math.Max(0, latestSessions.Count - 1);
                                         statusMessage = "Probe complete: " + latestSessions.Count + " sessions evaluated.";
                                         foreach (PollResult r in latestSessions)
@@ -419,6 +483,7 @@ namespace SaiCont
                                         break;
 
                                     case ConsoleKey.D:
+                                        dirtyRender = true;
                                         if (mode == TuiMode.DryRun)
                                         {
                                             mode = TuiMode.Idle;
@@ -434,6 +499,7 @@ namespace SaiCont
                                         break;
 
                                     case ConsoleKey.W:
+                                        dirtyRender = true;
                                         if (mode == TuiMode.Watch)
                                         {
                                             mode = TuiMode.Idle;
@@ -452,13 +518,15 @@ namespace SaiCont
                                         confirmWatch = false;
                                         statusMessage = "Stopped. In IDLE mode.";
                                         AddLog(logs, "INFO", "operator", 0, "Monitoring stopped.");
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.R:
+                                        dirtyRender = true;
                                         try
                                         {
                                             configuration = WatcherConfiguration.Load(configPath);
-                                            engine = new WatcherEngine(configuration);
+                                            engine = new WatcherEngine(configuration, stateStore);
                                             statusMessage = "Config reloaded successfully (" + configuration.Targets.Count + " targets).";
                                             AddLog(logs, "INFO", "config", 0, "Configuration reloaded from " + Path.GetFileName(configPath));
                                         }
@@ -486,11 +554,13 @@ namespace SaiCont
                                         logs.Clear();
                                         logScrollOffset = 0;
                                         statusMessage = "Log stream buffer cleared.";
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.H:
                                         activeTab = TuiTab.Help;
                                         statusMessage = "View: Quick Reference & Safety Architecture";
+                                        dirtyRender = true;
                                         break;
                                 }
                             }

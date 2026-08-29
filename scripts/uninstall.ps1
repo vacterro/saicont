@@ -9,6 +9,10 @@ if (-not $PSCmdlet.ShouldProcess($taskName, 'Stop SAICONT and remove its schedul
 }
 
 & (Join-Path $PSScriptRoot 'stop.ps1')
+$stopExit = $LASTEXITCODE
+if ($stopExit -ne 0) {
+    throw "stop.ps1 failed (LASTEXITCODE=$stopExit), NOT removing task"
+}
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($null -ne $task) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false

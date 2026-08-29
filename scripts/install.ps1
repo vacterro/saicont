@@ -26,7 +26,7 @@ if ($LASTEXITCODE -ne 0) {
 $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
 $taskArguments = "//B //Nologo `"$($paths.Launcher)`""
 $action = New-ScheduledTaskAction -Execute $wscriptPath -Argument $taskArguments
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$trigger = New-ScheduledTaskTrigger -AtStartup
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $previousTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue

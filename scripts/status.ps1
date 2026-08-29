@@ -7,10 +7,15 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 $paths = Get-SaiContPaths
-$running = Get-SaiContProcess -Paths $paths
+$runtimeState = Get-SaiContProcessState -Paths $paths
+$running = $runtimeState.Process
 
+if ($runtimeState.Disposition -eq 'UNVERIFIABLE') {
+    Write-Output "UNVERIFIABLE_RUNTIME ($($runtimeState.Error))"
+    exit 2
+}
 if ($null -eq $running) {
-    if ((Test-Path -LiteralPath $paths.PidFile) -or (Test-Path -LiteralPath $paths.InstanceFile) -or (Test-Path -LiteralPath $paths.StopFile)) {
+    if ($runtimeState.Disposition -eq 'POSITIVELY_STALE' -or (Test-Path -LiteralPath $paths.StopFile)) {
         if ($Repair) {
             Remove-Item -LiteralPath $paths.PidFile -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $paths.InstanceFile -Force -ErrorAction SilentlyContinue
@@ -33,15 +38,11 @@ Write-Output "RUNNING pid=$($running.Id)$startStr$modeStr$tokenStr executable=$(
 if ($Diagnostic) {
     & $paths.Executable --validate-config --config $paths.Configuration | Out-Null
     $configStatus = if ($LASTEXITCODE -eq 0) { 'VALID' } else { 'INVALID' }
-    $stateStatus = 'MISSING'
-    if (Test-Path -LiteralPath $paths.StateFile -PathType Leaf) {
-        try {
-            [xml]$stateXml = Get-Content -Raw -Encoding UTF8 -LiteralPath $paths.StateFile
-            $stateStatus = if ($stateXml.saicontState.version -eq '1') { 'VALID_V1' } else { 'UNSUPPORTED' }
-        }
-        catch {
-            $stateStatus = 'CORRUPT'
-        }
+    $stateOutput = & $paths.Executable --validate-state --state-file $paths.StateFile 2>&1
+    $stateExit = $LASTEXITCODE
+    $stateStatus = if ($stateOutput -match '^STATE: (.+?)(?:\s|$)') { $Matches[1] } else { 'I/O_UNAVAILABLE' }
+    if ($stateExit -ne 0 -and $stateStatus -eq 'VALID_V1') {
+        $stateStatus = 'I/O_UNAVAILABLE'
     }
     $taskStatus = if (Get-ScheduledTask -TaskName 'SAICONT' -ErrorAction SilentlyContinue) { 'INSTALLED' } else { 'NOT_INSTALLED' }
     $logPath = Join-Path $paths.ProjectRoot 'logs\SAICONT.log'

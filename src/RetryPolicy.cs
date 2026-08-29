@@ -134,11 +134,12 @@ namespace SaiCont
             }
         }
 
-        public StateRecord Export(string ruleName, ProcessSessionIdentity session, DateTime nowUtc)
+        public StateRecord Export(string ruleName, TargetRule rule, ProcessSessionIdentity session, DateTime nowUtc)
         {
             return new StateRecord
             {
                 RuleName = ruleName,
+                RuleSemanticFingerprint = rule == null ? String.Empty : rule.SemanticFingerprint,
                 ProcessId = session != null ? session.ProcessId : 0,
                 ProcessStartUtc = session != null ? session.StartTimeUtc : DateTime.MinValue,
                 TriggerFingerprint = _triggerToken,
@@ -156,6 +157,56 @@ namespace SaiCont
         public RetryDecision Observe(RuleObservation observation, TargetRule rule, DateTime nowUtc)
         {
             _lastObservedUtc = nowUtc;
+
+            // W2-002: possible-successful-write (AttemptInFlightReserved restored
+            // from a crash window) and partial-write ambiguity (AmbiguousFailClosed)
+            // must NEVER be authorized by elapsed retry time. They are exclusive
+            // locked states: they may only leave through console evidence proving
+            // the previous attempt's outcome, and this branch must run before the
+            // generic trigger-token-change / send logic.
+            if (_state == RecoveryState.AttemptInFlightReserved || _state == RecoveryState.AmbiguousFailClosed)
+            {
+                if (!observation.Triggered)
+                {
+                    // Previous write consumed the trigger: recovery observed.
+                    _suppressedToken = _attemptToken;
+                    _state = RecoveryState.RecoveryConfirmed;
+                    _attemptCount = 0;
+                    _awaitingOutcome = false;
+                    _sawBusy = false;
+                    return Decision(false, "ambiguous write resolved: trigger cleared");
+                }
+
+                if (observation.Busy || !observation.Ready)
+                {
+                    _sawBusy = true;
+                    _state = RecoveryState.TargetBusyOrProgressing;
+                    return Decision(false, "ambiguous write unresolved: target busy/progressing");
+                }
+
+                if (!String.Equals(observation.TriggerToken, _triggerToken, StringComparison.Ordinal))
+                {
+                    // A NEW occurrence appeared (different trigger identity). The
+                    // old ambiguous write is superseded; the new event starts a
+                    // fresh retry lifecycle.
+                    _triggerToken = observation.TriggerToken;
+                    _attemptToken = null;
+                    _awaitingOutcome = false;
+                    _sawBusy = false;
+                    _attemptCount = 0;
+                    _nextAttemptUtc = observation.DueUtc;
+                    _state = nowUtc < _nextAttemptUtc ? RecoveryState.EventWaitingDeadline : RecoveryState.EventReadyToAttempt;
+                    if (nowUtc < _nextAttemptUtc)
+                    {
+                        return Decision(false, "new occurrence supersedes ambiguous write (waiting)");
+                    }
+                }
+                else
+                {
+                    _state = RecoveryState.AmbiguousFailClosed;
+                    return Decision(false, "ambiguous write unresolved (same trigger)");
+                }
+            }
 
             if (!observation.Triggered)
             {
@@ -325,6 +376,10 @@ namespace SaiCont
         // immediately re-attempted.
         public void ReserveAttempt(string triggerToken, TargetRule rule, DateTime nowUtc)
         {
+            if (String.IsNullOrEmpty(_triggerToken))
+            {
+                _triggerToken = triggerToken;
+            }
             _attemptToken = triggerToken;
             _sawBusy = false;
             _attemptCount++;
@@ -341,14 +396,24 @@ namespace SaiCont
         // the WriteConsoleInputW call returns. On restart a session still
         // sitting in AttemptInFlightReserved must remain in that state until
         // the next Observe cycle, which is what makes the crash window safe.
-        public void CommitAttempt(bool inputWritten, TargetRule rule, DateTime nowUtc)
+        // W2-002: a partial accepted write (AmbiguousOrPartialInput) enters a
+        // durable fail-closed state and may only leave through console evidence.
+        public void CommitAttempt(NativeWriteOutcome outcome, TargetRule rule, DateTime nowUtc)
         {
             _sawBusy = false;
-            if (inputWritten)
+            if (outcome == NativeWriteOutcome.CompleteInputCommitted)
             {
                 _lastWriteUtc = nowUtc;
                 _awaitingOutcome = true;
                 _state = RecoveryState.CommandWrittenAwaitingOutcome;
+            }
+            else if (outcome == NativeWriteOutcome.AmbiguousOrPartialInput)
+            {
+                // Do NOT advance the retry clock or permit a retry: the buffer
+                // state of the previous write is unknown.
+                _awaitingOutcome = true;
+                _state = RecoveryState.AmbiguousFailClosed;
+                return;
             }
             else
             {
@@ -384,7 +449,11 @@ namespace SaiCont
             {
                 return value;
             }
-            DateTime maximum = nowUtc.AddHours(24);
+            // W2-003: one legitimate retry horizon, shared with parser validation
+            // and durable retention. A future deadline inside that horizon keeps
+            // its exact absolute value across restart; only demonstrably corrupt
+            // out-of-contract timestamps are clamped.
+            DateTime maximum = nowUtc.AddDays(RetryConstants.MaximumRetryHorizonDays);
             return value > maximum ? maximum : value;
         }
 
@@ -428,13 +497,20 @@ namespace SaiCont
                 {
                     Regex rx = rule.CompiledTriggerPatterns[index];
                     if (rx == null) continue;
-                    MatchCollection matches = rx.Matches(snapshot.Text);
-                    if (matches.Count == 0)
+                    Match candidate = rx.Match(snapshot.Text);
+                    if (!candidate.Success)
                     {
                         continue;
                     }
-
-                    Match candidate = matches[matches.Count - 1];
+                    while (candidate.Success)
+                    {
+                        Match next = candidate.NextMatch();
+                        if (!next.Success)
+                        {
+                            break;
+                        }
+                        candidate = next;
+                    }
                     if (bestMatch == null || candidate.Index > bestMatch.Index)
                     {
                         bestMatch = candidate;
@@ -442,9 +518,9 @@ namespace SaiCont
                     }
                 }
 
-                string cursorTail = ExtractCursorTail(snapshot.Text, 5);
-                bool ready = MatchesAny(snapshot.CursorLine, rule.CompiledReadyPatterns);
-                bool busy = MatchesAny(cursorTail, rule.CompiledBusyPatterns);
+                string inputLine = String.IsNullOrWhiteSpace(snapshot.CursorLine) ? LastNonEmptyLine(snapshot.Text) : snapshot.CursorLine;
+                bool ready = MatchesAny(inputLine, rule.CompiledReadyPatterns) || ContainsTypedCommand(inputLine, rule.Command);
+                bool busy = rule.CompiledBusyPatterns != null && rule.CompiledBusyPatterns.Length > 0 && MatchesAny(ExtractCursorTail(snapshot.Text, 5), rule.CompiledBusyPatterns);
 
                 if (bestMatch == null)
                 {
@@ -534,6 +610,31 @@ namespace SaiCont
             }
         }
 
+        private static bool ContainsTypedCommand(string line, string command)
+        {
+            string value = (line ?? String.Empty).Trim();
+            string expected = (command ?? String.Empty).Trim();
+            if (expected.Length == 0)
+            {
+                return false;
+            }
+            value = value.TrimStart('>', '›', '?').Trim();
+            return String.Equals(value, expected, StringComparison.Ordinal);
+        }
+
+        private static string LastNonEmptyLine(string text)
+        {
+            string[] lines = (text ?? String.Empty).Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            for (int index = lines.Length - 1; index >= 0; index--)
+            {
+                if (!String.IsNullOrWhiteSpace(lines[index]))
+                {
+                    return lines[index];
+                }
+            }
+            return String.Empty;
+        }
+
         private static string NormalizeEventContext(string text)
         {
             if (String.IsNullOrWhiteSpace(text))
@@ -551,23 +652,25 @@ namespace SaiCont
 
         private static string ExtractCursorTail(string text, int lineCount)
         {
-            if (String.IsNullOrEmpty(text))
+            if (String.IsNullOrEmpty(text) || lineCount <= 0)
             {
                 return String.Empty;
             }
-
-            string[] lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-            if (lines.Length == 0)
+            int newlineCount = 0;
+            int start = 0;
+            for (int index = text.Length - 1; index >= 0; index--)
             {
-                return String.Empty;
+                if (text[index] == '\n')
+                {
+                    newlineCount++;
+                    if (newlineCount == lineCount)
+                    {
+                        start = index + 1;
+                        break;
+                    }
+                }
             }
-
-            int endIdx = lines.Length - 1;
-            int startIdx = Math.Max(0, endIdx - lineCount + 1);
-            int count = endIdx - startIdx + 1;
-            var tailLines = new string[count];
-            Array.Copy(lines, startIdx, tailLines, 0, count);
-            return String.Join("\n", tailLines);
+            return text.Substring(start);
         }
 
         private static string ExtractLinesAfterMatch(string text, int matchIndex, int maxLines)
@@ -638,6 +741,11 @@ namespace SaiCont
                 return hash;
             }
         }
+    }
+
+    internal static class RetryConstants
+    {
+        internal const int MaximumRetryHorizonDays = 366;
     }
 
     internal static class RetryTimeParser
@@ -824,7 +932,7 @@ namespace SaiCont
         private static bool TryAddDuration(DateTime nowLocal, long totalSeconds, out DateTime dueLocal)
         {
             dueLocal = DateTime.MinValue;
-            const long MaximumDurationSeconds = 366L * 24L * 60L * 60L;
+            const long MaximumDurationSeconds = RetryConstants.MaximumRetryHorizonDays * 24L * 60L * 60L;
             if (totalSeconds <= 0 || totalSeconds > MaximumDurationSeconds)
             {
                 return false;

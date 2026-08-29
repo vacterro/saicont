@@ -10,22 +10,23 @@ namespace SaiCont
 {
     internal enum SystemOperationalState
     {
-        OnWatch,      // ON - Live Watch (Continuous monitoring + Automated input injection)
-        OnDryRun,     // ON - Dry-Run (Continuous monitoring + Zero input injection)
-        Paused,       // PAUSED - Idle (Timer paused, manual probe only)
-        Disabled      // DISABLED - Stopped (All monitoring disabled)
+        OnWatch,
+        OnDryRun,
+        Paused,
+        Disabled
     }
 
     internal sealed class SaiContGuiForm : Form
     {
         private readonly string configPath;
+        private readonly DurableStateStore stateStore;
+        private readonly Func<bool> shouldStop;
         private WatcherConfiguration currentConfig;
         private WatcherEngine engine;
         private SystemOperationalState systemState = SystemOperationalState.Paused;
         private int pollCounter = 0;
         private DateTime lastPollTime = DateTime.MinValue;
 
-        // UI Controls
         private Panel headerPanel;
         private Label titleLabel;
         private Label stateBanner;
@@ -51,7 +52,9 @@ namespace SaiCont
         private TextBox inspectorTextBox;
         private Button btnToggleRule;
 
+        private const int MaximumGuiLogEntries = 2000;
         private RichTextBox logRichText;
+        private int guiLogEntries;
         private StatusStrip statusStrip;
         private ToolStripStatusLabel statusLabel;
         private ToolStripStatusLabel sessionCountLabel;
@@ -62,35 +65,52 @@ namespace SaiCont
         private NotifyIcon trayIcon;
         private ContextMenuStrip trayMenu;
 
-        // Colors (Win95 Dark Golden Theme)
-        private static readonly Color BgDark = Color.FromArgb(20, 17, 14);
-        private static readonly Color BgPanel = Color.FromArgb(32, 27, 22);
-        private static readonly Color BgControl = Color.FromArgb(44, 38, 30);
-        private static readonly Color BorderLight = Color.FromArgb(68, 58, 48);
-        private static readonly Color BorderDark = Color.FromArgb(12, 10, 8);
-        private static readonly Color TextGold = Color.FromArgb(212, 175, 55);
-        private static readonly Color TextGoldBright = Color.FromArgb(245, 215, 110);
-        private static readonly Color TextMuted = Color.FromArgb(168, 159, 145);
-        private static readonly Color StateGreen = Color.FromArgb(46, 204, 113);
-        private static readonly Color StateCyan = Color.FromArgb(52, 152, 219);
-        private static readonly Color StateYellow = Color.FromArgb(241, 196, 15);
-        private static readonly Color StateRed = Color.FromArgb(231, 76, 60);
-        private static readonly Color StateGray = Color.FromArgb(127, 140, 141);
+        private static readonly Color CBackground = Color.FromArgb(26, 24, 16);
+        private static readonly Color CBackgroundSoft = Color.FromArgb(35, 32, 24);
+        private static readonly Color CSurface = Color.FromArgb(51, 46, 34);
+        private static readonly Color CSurfaceRaised = Color.FromArgb(61, 55, 42);
+        private static readonly Color CSurfaceAlt = Color.FromArgb(69, 61, 48);
+
+        private static readonly Color CBorderDark = Color.FromArgb(16, 14, 8);
+        private static readonly Color CBevelLight = Color.FromArgb(117, 102, 61);
+        private static readonly Color CBorderMuted = Color.FromArgb(90, 80, 64);
+
+        private static readonly Color CTextPrimary = Color.FromArgb(212, 200, 154);
+        private static readonly Color CTextSecondary = Color.FromArgb(156, 147, 113);
+        private static readonly Color CTextMuted = Color.FromArgb(110, 103, 78);
+
+        private static readonly Color CAccentTeal = Color.FromArgb(0, 128, 128);
+        private static readonly Color CAccentTealDeep = Color.FromArgb(0, 76, 76);
+
+        private static readonly Color CSuccess = Color.FromArgb(74, 122, 32);
+        private static readonly Color CWarning = Color.FromArgb(122, 122, 32);
+        private static readonly Color CDanger = Color.FromArgb(122, 32, 32);
+        private static readonly Color CDangerText = Color.FromArgb(214, 100, 100);
+
+        private static readonly Color CCompareBack = Color.FromArgb(20, 18, 12);
+        private static readonly Color CLink = Color.FromArgb(240, 208, 96);
+
+        private static readonly Font FontTitle = new Font("Verdana", 14f, FontStyle.Bold);
+        private static readonly Font FontHeader = new Font("Verdana", 12f, FontStyle.Bold);
+        private static readonly Font FontBody = new Font("Verdana", 12f, FontStyle.Regular);
+        private static readonly Font FontSecondary = new Font("Verdana", 11f, FontStyle.Regular);
+        private static readonly Font FontSmall = new Font("Verdana", 10f, FontStyle.Regular);
 
         private readonly List<PollResult> currentPollResults = new List<PollResult>();
 
-        public SaiContGuiForm(WatcherConfiguration config, string configurationFilePath, string initialMode = null)
+        public SaiContGuiForm(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)
         {
             configPath = configurationFilePath;
+            stateStore = sharedStateStore;
+            shouldStop = stopPredicate;
             currentConfig = config;
-            engine = new WatcherEngine(currentConfig);
+            engine = new WatcherEngine(currentConfig, stateStore);
 
             if (String.Equals(initialMode, "--watch", StringComparison.OrdinalIgnoreCase)) systemState = SystemOperationalState.OnWatch;
             else if (String.Equals(initialMode, "--dry-run", StringComparison.OrdinalIgnoreCase)) systemState = SystemOperationalState.OnDryRun;
             else systemState = SystemOperationalState.Paused;
 
             InitializeGui();
-            ApplyGoldenTheme();
             ReloadRulesList();
             UpdateStateUi();
             RunProbe();
@@ -98,81 +118,101 @@ namespace SaiCont
 
         private void InitializeGui()
         {
-            this.Text = "SAICONT - Terminal Continuity Manager & Console Watcher";
-            this.Size = new Size(1060, 720);
-            this.MinimumSize = new Size(820, 520);
+            this.Text = "SAICONT";
+            this.Size = new Size(780, 520);
+            this.MinimumSize = new Size(640, 480);
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.BackColor = BgDark;
-            this.ForeColor = TextMuted;
+            this.BackColor = CBackground;
+            this.ForeColor = CTextPrimary;
             this.KeyPreview = true;
             this.KeyDown += OnFormKeyDown;
             this.FormClosing += OnFormClosing;
 
-            // 1. Header Panel
+            InitHeader();
+            InitControlBar();
+            InitMainContent();
+            InitStatusStrip();
+            InitTray();
+
+            this.Controls.Add(mainSplit);
+            this.Controls.Add(stateControlPanel);
+            this.Controls.Add(headerPanel);
+            this.Controls.Add(statusStrip);
+
+            pollTimer = new Timer { Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds) };
+            pollTimer.Tick += OnPollTimerTick;
+            pollTimer.Start();
+
+            AppendLog("INFO", "SAICONT started. Use state buttons to select mode.");
+        }
+
+        private void InitHeader()
+        {
             headerPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 50,
-                BackColor = Color.FromArgb(38, 32, 25),
-                Padding = new Padding(10, 8, 10, 8)
+                Height = 20,
+                BackColor = CSurface
             };
-            headerPanel.Paint += (s, e) => DrawWin95Bevel(e.Graphics, headerPanel.ClientRectangle, true);
+            headerPanel.Paint += (s, e) => DrawBevel(e.Graphics, headerPanel.ClientRectangle, true);
 
             titleLabel = new Label
             {
-                Text = "SAICONT v1.0.0 [TERMINAL CONTINUITY]",
-                Font = new Font("Verdana", 11f, FontStyle.Bold),
-                ForeColor = TextGoldBright,
+                Text = "SAICONT v1.1.0",
+                Font = FontSmall,
+                ForeColor = CTextPrimary,
                 AutoSize = true,
-                Location = new Point(12, 14)
+                Location = new Point(4, 2)
             };
 
             stateBanner = new Label
             {
-                Text = "  STATE: [ ⏸ PAUSED / IDLE ]  ",
-                Font = new Font("Verdana", 9.5f, FontStyle.Bold),
+                Text = "PAUSED",
+                Font = FontSmall,
                 ForeColor = Color.Black,
-                BackColor = StateYellow,
+                BackColor = CWarning,
                 AutoSize = true,
-                Location = new Point(360, 12),
-                Padding = new Padding(6, 4, 6, 4)
+                Location = new Point(180, 2),
+                Padding = new Padding(4, 1, 4, 1)
             };
 
             statsLabel = new Label
             {
-                Text = "Polls: 0 | Ready",
-                Font = new Font("Lucida Console", 9.5f, FontStyle.Regular),
-                ForeColor = TextGold,
+                Text = "Polls: 0",
+                Font = FontSmall,
+                ForeColor = CTextSecondary,
                 AutoSize = false,
                 TextAlign = ContentAlignment.MiddleRight,
                 Dock = DockStyle.Right,
-                Width = 320
+                Width = 120
             };
 
             headerPanel.Controls.Add(titleLabel);
             headerPanel.Controls.Add(stateBanner);
             headerPanel.Controls.Add(statsLabel);
+        }
 
-            // 2. State & Action Control Bar
+        private void InitControlBar()
+        {
             stateControlPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 42,
-                BackColor = BgPanel,
-                Padding = new Padding(8, 6, 8, 6)
+                Height = 26,
+                BackColor = CBackgroundSoft,
+                Padding = new Padding(4, 2, 4, 2)
             };
 
-            btnStateWatch = CreateStateButton("▶ ON: Watch Mode", StateGreen, (s, e) => SetState(SystemOperationalState.OnWatch));
-            btnStateDryRun = CreateStateButton("👁 ON: Dry-Run", StateCyan, (s, e) => SetState(SystemOperationalState.OnDryRun));
-            btnStatePause = CreateStateButton("⏸ PAUSE Monitoring", StateYellow, (s, e) => SetState(SystemOperationalState.Paused));
-            btnStateDisable = CreateStateButton("⏹ STOP / Disable", StateRed, (s, e) => SetState(SystemOperationalState.Disabled));
+            btnStateWatch = CreateRaisedButton("ON: Watch", (s, e) => SetState(SystemOperationalState.OnWatch));
+            btnStateDryRun = CreateRaisedButton("ON: DryRun", (s, e) => SetState(SystemOperationalState.OnDryRun));
+            btnStatePause = CreateRaisedButton("PAUSE", (s, e) => SetState(SystemOperationalState.Paused));
+            btnStateDisable = CreateRaisedButton("STOP", (s, e) => SetState(SystemOperationalState.Disabled));
 
-            var sep = new Panel { Dock = DockStyle.Left, Width = 12, BackColor = Color.Transparent };
+            btnProbe = CreateRaisedButton("Probe", (s, e) => RunProbe());
+            btnReload = CreateRaisedButton("Reload", (s, e) => ReloadConfig());
+            btnClearLog = CreateRaisedButton("Clear Log", (s, e) => ClearLog());
+            btnCopy = CreateRaisedButton("Copy", (s, e) => CopySelectedSessionInfo());
 
-            btnProbe = CreateActionButton("🔍 Probe (F5)", (s, e) => RunProbe());
-            btnReload = CreateActionButton("⚙ Reload Config", (s, e) => ReloadConfig());
-            btnClearLog = CreateActionButton("🧹 Clear Log", (s, e) => ClearLog());
-            btnCopy = CreateActionButton("📋 Copy Info", (s, e) => CopySelectedSessionInfo());
+            var sep = new Panel { Dock = DockStyle.Left, Width = 8, BackColor = Color.Transparent };
 
             stateControlPanel.Controls.Add(btnCopy);
             stateControlPanel.Controls.Add(btnClearLog);
@@ -183,135 +223,158 @@ namespace SaiCont
             stateControlPanel.Controls.Add(btnStatePause);
             stateControlPanel.Controls.Add(btnStateDryRun);
             stateControlPanel.Controls.Add(btnStateWatch);
+        }
 
-            // 3. Main Split Container
+        private void InitMainContent()
+        {
             mainSplit = new SplitContainer
             {
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                SplitterDistance = 320,
-                SplitterWidth = 6,
-                BackColor = BgDark
+                SplitterDistance = 220,
+                SplitterWidth = 4,
+                BackColor = CBackground
             };
 
-            // 4. Tab Control (Top Half)
             mainTabs = new TabControl
             {
                 Dock = DockStyle.Fill,
-                Font = new Font("Verdana", 9f, FontStyle.Bold)
+                Font = FontSmall
             };
+            mainTabs.BackColor = CBackground;
 
-            tabSessions = new TabPage("Live Monitored Sessions");
-            tabRules = new TabPage("Target Rules Configuration");
-            tabInspector = new TabPage("Deep Diagnostic Inspector");
+            tabSessions = new TabPage("Sessions");
+            tabRules = new TabPage("Rules");
+            tabInspector = new TabPage("Inspector");
 
-            sessionListView = new ListView
-            {
-                Dock = DockStyle.Fill,
-                View = View.Details,
-                FullRowSelect = true,
-                GridLines = true,
-                Font = new Font("Lucida Console", 9f, FontStyle.Regular),
-                BackColor = BgDark,
-                ForeColor = TextGoldBright
-            };
-            sessionListView.Columns.Add("Rule Target", 120);
-            sessionListView.Columns.Add("Process", 80);
-            sessionListView.Columns.Add("PID", 65);
-            sessionListView.Columns.Add("Attach PID", 80);
-            sessionListView.Columns.Add("Window Title", 130);
-            sessionListView.Columns.Add("Read Status", 85);
-            sessionListView.Columns.Add("Prompt Readiness", 110);
-            sessionListView.Columns.Add("Operational State", 140);
-            sessionListView.Columns.Add("Next UTC", 100);
-            sessionListView.Columns.Add("Decision / Reason", 220);
-            sessionListView.SelectedIndexChanged += (s, e) => UpdateInspectorFromSelected();
-            sessionListView.DoubleClick += (s, e) => { mainTabs.SelectedTab = tabInspector; };
-            tabSessions.Controls.Add(sessionListView);
-
-            // Rules Panel
-            var rulesPanel = new Panel { Dock = DockStyle.Fill, BackColor = BgDark };
-            rulesListView = new ListView
-            {
-                Dock = DockStyle.Fill,
-                View = View.Details,
-                FullRowSelect = true,
-                GridLines = true,
-                Font = new Font("Lucida Console", 9f, FontStyle.Regular),
-                BackColor = BgDark,
-                ForeColor = TextGoldBright
-            };
-            rulesListView.Columns.Add("Rule Name", 140);
-            rulesListView.Columns.Add("Status", 90);
-            rulesListView.Columns.Add("Processes", 120);
-            rulesListView.Columns.Add("Command", 80);
-            rulesListView.Columns.Add("Delay", 65);
-            rulesListView.Columns.Add("Retry Interval", 95);
-            rulesListView.Columns.Add("Backoff", 90);
-            rulesListView.Columns.Add("Triggers", 75);
-
-            var rulesBar = new Panel { Dock = DockStyle.Bottom, Height = 34, BackColor = BgPanel, Padding = new Padding(6, 4, 6, 4) };
-            btnToggleRule = CreateActionButton("Toggle Rule Enabled/Disabled", (s, e) => ToggleSelectedRule());
-            rulesBar.Controls.Add(btnToggleRule);
-
-            rulesPanel.Controls.Add(rulesListView);
-            rulesPanel.Controls.Add(rulesBar);
-            tabRules.Controls.Add(rulesPanel);
-
-            inspectorTextBox = new TextBox
-            {
-                Dock = DockStyle.Fill,
-                Multiline = true,
-                ReadOnly = true,
-                ScrollBars = ScrollBars.Both,
-                Font = new Font("Lucida Console", 9.5f, FontStyle.Regular),
-                BackColor = BgDark,
-                ForeColor = TextGoldBright
-            };
-            tabInspector.Controls.Add(inspectorTextBox);
+            InitSessionsTab();
+            InitRulesTab();
+            InitInspectorTab();
 
             mainTabs.TabPages.Add(tabSessions);
             mainTabs.TabPages.Add(tabRules);
             mainTabs.TabPages.Add(tabInspector);
             mainSplit.Panel1.Controls.Add(mainTabs);
 
-            // 5. Log Stream (Bottom Half)
-            var logPanel = new Panel { Dock = DockStyle.Fill, BackColor = BgDark };
+            var logPanel = new Panel { Dock = DockStyle.Fill, BackColor = CBackground };
             var logHeader = new Label
             {
                 Dock = DockStyle.Top,
-                Height = 22,
-                Text = "  REAL-TIME OPERATIONAL LOG STREAM",
-                Font = new Font("Verdana", 8.5f, FontStyle.Bold),
-                ForeColor = TextGoldBright,
-                BackColor = Color.FromArgb(28, 23, 18),
+                Height = 18,
+                Text = " LOG",
+                Font = FontSmall,
+                ForeColor = CTextSecondary,
+                BackColor = CCompareBack,
                 TextAlign = ContentAlignment.MiddleLeft
             };
 
             logRichText = new RichTextBox
             {
                 Dock = DockStyle.Fill,
+                MaxLength = MaximumGuiLogEntries * 512,
                 ReadOnly = true,
-                BackColor = Color.FromArgb(14, 12, 10),
-                ForeColor = Color.FromArgb(200, 190, 175),
-                Font = new Font("Lucida Console", 9f, FontStyle.Regular),
+                BackColor = CCompareBack,
+                ForeColor = CTextPrimary,
+                Font = FontSmall,
                 BorderStyle = BorderStyle.None,
                 HideSelection = false
             };
             logPanel.Controls.Add(logRichText);
             logPanel.Controls.Add(logHeader);
             mainSplit.Panel2.Controls.Add(logPanel);
+        }
 
-            // 6. Status Strip
+        private void InitSessionsTab()
+        {
+            sessionListView = new ListView
+            {
+                Dock = DockStyle.Fill,
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                Font = FontSmall,
+                BackColor = CCompareBack,
+                ForeColor = CTextPrimary
+            };
+            sessionListView.Columns.Add("Target", 100);
+            sessionListView.Columns.Add("Process", 70);
+            sessionListView.Columns.Add("PID", 50);
+            sessionListView.Columns.Add("Attach", 50);
+            sessionListView.Columns.Add("Status", 70);
+            sessionListView.Columns.Add("Ready", 60);
+            sessionListView.Columns.Add("State", 90);
+            sessionListView.Columns.Add("Next", 70);
+            sessionListView.Columns.Add("Reason", 160);
+            sessionListView.SelectedIndexChanged += (s, e) => UpdateInspectorFromSelected();
+            sessionListView.DoubleClick += (s, e) => { mainTabs.SelectedTab = tabInspector; };
+            tabSessions.Controls.Add(sessionListView);
+        }
+
+        private void InitRulesTab()
+        {
+            var rulesPanel = new Panel { Dock = DockStyle.Fill, BackColor = CBackground };
+            rulesListView = new ListView
+            {
+                Dock = DockStyle.Fill,
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                Font = FontSmall,
+                BackColor = CCompareBack,
+                ForeColor = CTextPrimary
+            };
+            rulesListView.Columns.Add("Name", 120);
+            rulesListView.Columns.Add("Enabled", 60);
+            rulesListView.Columns.Add("Processes", 120);
+            rulesListView.Columns.Add("Command", 60);
+            rulesListView.Columns.Add("Delay", 50);
+            rulesListView.Columns.Add("Retry", 50);
+            rulesListView.Columns.Add("Backoff", 60);
+            rulesListView.Columns.Add("Triggers", 60);
+
+            var rulesBar = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 24,
+                BackColor = CBackgroundSoft,
+                Padding = new Padding(4, 2, 4, 2)
+            };
+            btnToggleRule = CreateRaisedButton("Toggle Rule", (s, e) => ToggleSelectedRule());
+            rulesBar.Controls.Add(btnToggleRule);
+
+            rulesPanel.Controls.Add(rulesListView);
+            rulesPanel.Controls.Add(rulesBar);
+            tabRules.Controls.Add(rulesPanel);
+        }
+
+        private void InitInspectorTab()
+        {
+            inspectorTextBox = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                Font = FontSmall,
+                BackColor = CCompareBack,
+                ForeColor = CTextPrimary,
+                BorderStyle = BorderStyle.None
+            };
+            tabInspector.Controls.Add(inspectorTextBox);
+        }
+
+        private void InitStatusStrip()
+        {
             statusStrip = new StatusStrip
             {
-                BackColor = Color.FromArgb(30, 25, 20),
-                ForeColor = TextGold
+                BackColor = CBackgroundSoft,
+                ForeColor = CTextSecondary,
+                Font = FontSmall
             };
             statusLabel = new ToolStripStatusLabel("Ready.") { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-            stateIndicatorLabel = new ToolStripStatusLabel("STATE: PAUSED") { Width = 140, Font = new Font("Verdana", 8.5f, FontStyle.Bold) };
-            sessionCountLabel = new ToolStripStatusLabel("Sessions: 0") { Width = 110 };
-            pollStatsLabel = new ToolStripStatusLabel("Polls: 0") { Width = 110 };
+            stateIndicatorLabel = new ToolStripStatusLabel("PAUSED") { Width = 80 };
+            sessionCountLabel = new ToolStripStatusLabel("Sessions: 0") { Width = 90 };
+            pollStatsLabel = new ToolStripStatusLabel("Polls: 0") { Width = 80 };
 
             statusStrip.Items.Add(statusLabel);
             statusStrip.Items.Add(new ToolStripSeparator());
@@ -320,97 +383,79 @@ namespace SaiCont
             statusStrip.Items.Add(sessionCountLabel);
             statusStrip.Items.Add(new ToolStripSeparator());
             statusStrip.Items.Add(pollStatsLabel);
+        }
 
-            // 7. System Tray Icon
+        private void InitTray()
+        {
             trayMenu = new ContextMenuStrip();
-            trayMenu.Items.Add("Open Dashboard", null, (s, e) => ShowDashboard());
-            trayMenu.Items.Add("Probe Now", null, (s, e) => RunProbe());
-            trayMenu.Items.Add("Enable Watch Mode", null, (s, e) => SetState(SystemOperationalState.OnWatch));
-            trayMenu.Items.Add("Enable Dry-Run", null, (s, e) => SetState(SystemOperationalState.OnDryRun));
-            trayMenu.Items.Add("Pause Monitoring", null, (s, e) => SetState(SystemOperationalState.Paused));
-            trayMenu.Items.Add("Disable / Stop", null, (s, e) => SetState(SystemOperationalState.Disabled));
+            trayMenu.Items.Add("Open", null, (s, e) => ShowDashboard());
+            trayMenu.Items.Add("Probe", null, (s, e) => RunProbe());
+            trayMenu.Items.Add("Watch", null, (s, e) => SetState(SystemOperationalState.OnWatch));
+            trayMenu.Items.Add("DryRun", null, (s, e) => SetState(SystemOperationalState.OnDryRun));
+            trayMenu.Items.Add("Pause", null, (s, e) => SetState(SystemOperationalState.Paused));
+            trayMenu.Items.Add("Stop", null, (s, e) => SetState(SystemOperationalState.Disabled));
             trayMenu.Items.Add("-");
             trayMenu.Items.Add("Exit", null, (s, e) => { trayIcon.Visible = false; Application.Exit(); });
 
             trayIcon = new NotifyIcon
             {
-                Text = "SAICONT - Terminal Continuity Manager",
+                Text = "SAICONT",
                 Icon = SystemIcons.Application,
                 ContextMenuStrip = trayMenu,
                 Visible = true
             };
             trayIcon.DoubleClick += (s, e) => ShowDashboard();
-
-            // 8. Add Controls
-            this.Controls.Add(mainSplit);
-            this.Controls.Add(stateControlPanel);
-            this.Controls.Add(headerPanel);
-            this.Controls.Add(statusStrip);
-
-            // 9. Poll Timer
-            pollTimer = new Timer
-            {
-                Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds)
-            };
-            pollTimer.Tick += OnPollTimerTick;
-            pollTimer.Start();
-
-            AppendLog("INFO", "SAICONT Desktop Manager started. Configure mode using the state buttons above.");
         }
 
-        private Button CreateStateButton(string text, Color accentColor, EventHandler onClick)
+        private Button CreateRaisedButton(string text, EventHandler onClick)
         {
             var btn = new Button
             {
                 Text = text,
-                AutoSize = true,
-                Height = 28,
+                Font = FontSmall,
+                ForeColor = CTextPrimary,
+                BackColor = CSurfaceRaised,
+                Height = 20,
                 FlatStyle = FlatStyle.Flat,
-                BackColor = BgControl,
-                ForeColor = accentColor,
-                Font = new Font("Verdana", 8.5f, FontStyle.Bold),
-                Margin = new Padding(2, 0, 6, 0),
                 Dock = DockStyle.Left,
-                Cursor = Cursors.Hand
+                Cursor = Cursors.Hand,
+                Padding = new Padding(6, 0, 6, 0),
+                Margin = new Padding(0, 0, 4, 0)
             };
-            btn.FlatAppearance.BorderColor = BorderLight;
-            btn.FlatAppearance.BorderSize = 1;
-            btn.Click += onClick;
-            return btn;
-        }
-
-        private Button CreateActionButton(string text, EventHandler onClick)
-        {
-            var btn = new Button
+            btn.FlatAppearance.BorderSize = 0;
+            btn.Paint += (s, e) =>
             {
-                Text = text,
-                AutoSize = true,
-                Height = 28,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = BgControl,
-                ForeColor = TextGoldBright,
-                Font = new Font("Verdana", 8f, FontStyle.Regular),
-                Margin = new Padding(2, 0, 4, 0),
-                Dock = DockStyle.Left,
-                Cursor = Cursors.Hand
+                var g = e.Graphics;
+                var r = btn.ClientRectangle;
+                DrawBevel(g, r, true);
+                var ts = g.MeasureString(btn.Text, btn.Font);
+                using (var b = new SolidBrush(btn.ForeColor))
+                    g.DrawString(btn.Text, btn.Font, b, (r.Width - ts.Width) / 2, (r.Height - ts.Height) / 2);
             };
-            btn.FlatAppearance.BorderColor = BorderLight;
-            btn.FlatAppearance.BorderSize = 1;
+            btn.MouseDown += (s, e) =>
+            {
+                if (e.Button == MouseButtons.Left)
+                {
+                    btn.Parent.Refresh();
+                    using (var g = btn.CreateGraphics())
+                    {
+                        var r = btn.ClientRectangle;
+                        DrawBevel(g, r, false);
+                        var ts = g.MeasureString(btn.Text, btn.Font);
+                        using (var b = new SolidBrush(btn.ForeColor))
+                            g.DrawString(btn.Text, btn.Font, b, (r.Width - ts.Width) / 2 + 1, (r.Height - ts.Height) / 2 + 1);
+                    }
+                }
+            };
+            btn.MouseUp += (s, e) => btn.Invalidate();
             btn.Click += onClick;
             return btn;
         }
 
-        private void ApplyGoldenTheme()
+        private static void DrawBevel(Graphics g, Rectangle r, bool raised)
         {
-            this.tabSessions.BackColor = BgDark;
-            this.tabRules.BackColor = BgDark;
-            this.tabInspector.BackColor = BgDark;
-        }
-
-        private void DrawWin95Bevel(Graphics g, Rectangle r, bool raised)
-        {
-            Color light = raised ? BorderLight : BorderDark;
-            Color dark = raised ? BorderDark : BorderLight;
+            Color light = raised ? CBevelLight : CBorderDark;
+            Color dark = raised ? CBorderDark : CBevelLight;
             using (var pLight = new Pen(light))
             using (var pDark = new Pen(dark))
             {
@@ -426,14 +471,13 @@ namespace SaiCont
             if (newState == SystemOperationalState.OnWatch && systemState != SystemOperationalState.OnWatch)
             {
                 DialogResult dr = MessageBox.Show(
-                    "Activate Automated Continuation (Watch Mode)?\n\nSAICONT will actively monitor Cline/Codex and automatically inject continuation commands ('cc' or Enter) when recovery conditions are met.",
-                    "Confirm Watch Mode Activation",
+                    "Enable Watch Mode (automated input injection)?",
+                    "SAICONT",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning);
-
                 if (dr != DialogResult.Yes)
                 {
-                    statusLabel.Text = "Watch mode activation canceled by user.";
+                    statusLabel.Text = "Watch mode canceled.";
                     return;
                 }
             }
@@ -444,75 +488,64 @@ namespace SaiCont
             switch (systemState)
             {
                 case SystemOperationalState.OnWatch:
-                    statusLabel.Text = "WATCH MODE ACTIVE: Automated continuation is LIVE and monitoring.";
-                    AppendLog("WARN", "System State changed to [ON: WATCH MODE] - Live injection active.");
+                    statusLabel.Text = "Watch mode active.";
+                    AppendLog("WARN", "State: ON WATCH.");
                     RunPollCycle();
                     break;
                 case SystemOperationalState.OnDryRun:
-                    statusLabel.Text = "DRY-RUN ACTIVE: Continuous discovery monitoring (Zero injection).";
-                    AppendLog("INFO", "System State changed to [ON: DRY-RUN] - Safe continuous discovery.");
+                    statusLabel.Text = "Dry-run active.";
+                    AppendLog("INFO", "State: ON DRY-RUN.");
                     RunPollCycle();
                     break;
                 case SystemOperationalState.Paused:
-                    statusLabel.Text = "MONITORING PAUSED: In Idle state. Press Probe or start Watch/Dry-Run.";
-                    AppendLog("INFO", "System State changed to [PAUSED / IDLE].");
+                    statusLabel.Text = "Paused.";
+                    AppendLog("INFO", "State: PAUSED.");
                     break;
                 case SystemOperationalState.Disabled:
-                    statusLabel.Text = "MONITORING DISABLED: All continuous polling stopped.";
-                    AppendLog("WARN", "System State changed to [DISABLED / STOPPED].");
+                    statusLabel.Text = "Disabled.";
+                    AppendLog("WARN", "State: DISABLED.");
                     break;
             }
         }
 
         private void UpdateStateUi()
         {
+            Color bannerBg;
+            Color stateColor;
+            string bannerText;
+
             switch (systemState)
             {
                 case SystemOperationalState.OnWatch:
-                    stateBanner.Text = "  STATE: [ ● ON / WATCHING (LIVE INJECTION) ]  ";
-                    stateBanner.BackColor = StateGreen;
-                    stateBanner.ForeColor = Color.Black;
-                    stateIndicatorLabel.Text = "STATE: WATCH (ON)";
-                    stateIndicatorLabel.ForeColor = StateGreen;
-                    btnStateWatch.BackColor = Color.FromArgb(20, 60, 30);
-                    btnStateDryRun.BackColor = BgControl;
-                    btnStatePause.BackColor = BgControl;
-                    btnStateDisable.BackColor = BgControl;
+                    bannerBg = CSuccess;
+                    stateColor = CSuccess;
+                    bannerText = "ON WATCH";
+                    stateIndicatorLabel.Text = "WATCH";
                     break;
                 case SystemOperationalState.OnDryRun:
-                    stateBanner.Text = "  STATE: [ 👁 ON / DRY-RUN (DISCOVERY ONLY) ]  ";
-                    stateBanner.BackColor = StateCyan;
-                    stateBanner.ForeColor = Color.Black;
-                    stateIndicatorLabel.Text = "STATE: DRY-RUN (ON)";
-                    stateIndicatorLabel.ForeColor = StateCyan;
-                    btnStateWatch.BackColor = BgControl;
-                    btnStateDryRun.BackColor = Color.FromArgb(20, 50, 70);
-                    btnStatePause.BackColor = BgControl;
-                    btnStateDisable.BackColor = BgControl;
+                    bannerBg = CAccentTeal;
+                    stateColor = CAccentTeal;
+                    bannerText = "ON DRY-RUN";
+                    stateIndicatorLabel.Text = "DRY-RUN";
                     break;
                 case SystemOperationalState.Paused:
-                    stateBanner.Text = "  STATE: [ ⏸ PAUSED / IDLE (MANUAL PROBE ONLY) ]  ";
-                    stateBanner.BackColor = StateYellow;
-                    stateBanner.ForeColor = Color.Black;
-                    stateIndicatorLabel.Text = "STATE: PAUSED";
-                    stateIndicatorLabel.ForeColor = StateYellow;
-                    btnStateWatch.BackColor = BgControl;
-                    btnStateDryRun.BackColor = BgControl;
-                    btnStatePause.BackColor = Color.FromArgb(60, 50, 20);
-                    btnStateDisable.BackColor = BgControl;
+                    bannerBg = CWarning;
+                    stateColor = CWarning;
+                    bannerText = "PAUSED";
+                    stateIndicatorLabel.Text = "PAUSED";
                     break;
-                case SystemOperationalState.Disabled:
-                    stateBanner.Text = "  STATE: [ ⏹ STOPPED / DISABLED ]  ";
-                    stateBanner.BackColor = StateRed;
-                    stateBanner.ForeColor = Color.White;
-                    stateIndicatorLabel.Text = "STATE: DISABLED";
-                    stateIndicatorLabel.ForeColor = StateRed;
-                    btnStateWatch.BackColor = BgControl;
-                    btnStateDryRun.BackColor = BgControl;
-                    btnStatePause.BackColor = BgControl;
-                    btnStateDisable.BackColor = Color.FromArgb(70, 20, 20);
+                default:
+                    bannerBg = CDanger;
+                    stateColor = CDangerText;
+                    bannerText = "STOPPED";
+                    stateIndicatorLabel.Text = "STOPPED";
                     break;
             }
+
+            stateBanner.Text = bannerText;
+            stateBanner.BackColor = bannerBg;
+            stateBanner.ForeColor = (systemState == SystemOperationalState.Paused) ? Color.Black : Color.White;
+            stateIndicatorLabel.ForeColor = stateColor;
         }
 
         private void ReloadRulesList()
@@ -521,14 +554,14 @@ namespace SaiCont
             foreach (TargetRule rule in currentConfig.Targets)
             {
                 var item = new ListViewItem(rule.Name);
-                item.SubItems.Add(rule.Enabled ? "ENABLED" : "DISABLED");
+                item.SubItems.Add(rule.Enabled ? "ON" : "OFF");
                 item.SubItems.Add(String.Join(",", rule.ProcessNames));
                 item.SubItems.Add(rule.Command);
                 item.SubItems.Add(rule.InitialDelaySeconds + "s");
                 item.SubItems.Add(rule.RetryIntervalSeconds + "s");
-                item.SubItems.Add(rule.BackoffMultiplier + "x (max " + rule.MaximumRetryIntervalSeconds + "s)");
+                item.SubItems.Add(rule.BackoffMultiplier + "x");
                 item.SubItems.Add(rule.TriggerPatterns.Length.ToString(CultureInfo.InvariantCulture));
-                item.ForeColor = rule.Enabled ? StateGreen : StateGray;
+                item.ForeColor = rule.Enabled ? CSuccess : CTextMuted;
                 rulesListView.Items.Add(item);
             }
         }
@@ -543,19 +576,19 @@ namespace SaiCont
                     TargetRule r = currentConfig.Targets[idx];
                     r.Enabled = !r.Enabled;
                     ReloadRulesList();
-                    AppendLog("INFO", "Target rule '" + r.Name + "' state changed to: " + (r.Enabled ? "ENABLED" : "DISABLED"));
-                    statusLabel.Text = "Rule '" + r.Name + "' is now " + (r.Enabled ? "ENABLED" : "DISABLED");
+                    AppendLog("INFO", "Rule '" + r.Name + "' set to: " + (r.Enabled ? "ON" : "OFF"));
+                    statusLabel.Text = "Rule '" + r.Name + "' " + (r.Enabled ? "ON" : "OFF");
                 }
             }
             else
             {
-                statusLabel.Text = "Select a target rule to toggle.";
+                statusLabel.Text = "Select a rule to toggle.";
             }
         }
 
         private void RunProbe()
         {
-            statusLabel.Text = "Probing target console sessions...";
+            statusLabel.Text = "Probing...";
             this.Cursor = Cursors.WaitCursor;
             try
             {
@@ -564,8 +597,8 @@ namespace SaiCont
                 pollCounter++;
                 lastPollTime = DateTime.UtcNow;
                 UpdateHeaderStats();
-                statusLabel.Text = "Probe complete: " + results.Count + " sessions inspected.";
-                AppendLog("INFO", "Probe pass executed: " + results.Count + " session(s) found.");
+                statusLabel.Text = "Probed: " + results.Count + " session(s).";
+                AppendLog("INFO", "Probe: " + results.Count + " session(s).");
             }
             catch (Exception ex)
             {
@@ -583,43 +616,42 @@ namespace SaiCont
             try
             {
                 currentConfig = WatcherConfiguration.Load(configPath);
-                engine = new WatcherEngine(currentConfig);
                 ReloadRulesList();
                 pollTimer.Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds);
-                statusLabel.Text = "Configuration reloaded (" + currentConfig.Targets.Count + " rules).";
-                AppendLog("INFO", "Configuration reloaded from " + Path.GetFileName(configPath));
+                statusLabel.Text = "Config reloaded (" + currentConfig.Targets.Count + " rules).";
+                AppendLog("INFO", "Config reloaded.");
                 RunProbe();
             }
             catch (Exception ex)
             {
                 statusLabel.Text = "Reload error: " + ex.Message;
-                AppendLog("ERROR", "Failed to reload configuration: " + ex.Message);
+                AppendLog("ERROR", "Reload failed: " + ex.Message);
             }
         }
 
         private void ClearLog()
         {
             logRichText.Clear();
-            statusLabel.Text = "Log stream cleared.";
+            guiLogEntries = 0;
+            statusLabel.Text = "Log cleared.";
         }
 
         private void CopySelectedSessionInfo()
         {
             if (sessionListView.SelectedItems.Count > 0)
             {
-                ListViewItem item = sessionListView.SelectedItems[0];
-                int idx = item.Index;
+                int idx = sessionListView.SelectedItems[0].Index;
                 if (idx >= 0 && idx < currentPollResults.Count)
                 {
                     PollResult s = currentPollResults[idx];
                     string txt = TerminalUi.FormatPollResult(s);
                     Clipboard.SetText(txt);
-                    statusLabel.Text = "Copied session details for PID " + s.ProcessId;
+                    statusLabel.Text = "Copied PID " + s.ProcessId + ".";
                 }
             }
             else
             {
-                statusLabel.Text = "Select a session from the list to copy.";
+                statusLabel.Text = "Select a session to copy.";
             }
         }
 
@@ -635,6 +667,13 @@ namespace SaiCont
         {
             try
             {
+                if (shouldStop != null && shouldStop())
+                {
+                    systemState = SystemOperationalState.Disabled;
+                    pollTimer.Stop();
+                    Close();
+                    return;
+                }
                 bool allowInput = (systemState == SystemOperationalState.OnWatch);
                 IList<PollResult> results = engine.PollOnce(allowInput);
                 UpdateSessionsList(results);
@@ -646,21 +685,21 @@ namespace SaiCont
                 {
                     if (r.Sent)
                     {
-                        AppendLog("SEND", "Injected continuation command to PID " + r.ProcessId + " (" + r.Target + ")");
+                        AppendLog("SEND", "Injected to PID " + r.ProcessId + " (" + r.Target + ")");
                     }
                     else if (r.Triggered)
                     {
-                        AppendLog("MATCH", "Trigger active on PID " + r.ProcessId + ": " + r.Reason);
+                        AppendLog("MATCH", "Trigger PID " + r.ProcessId + ": " + r.Reason);
                     }
                     else if (!String.IsNullOrEmpty(r.Error))
                     {
-                        AppendLog("ERROR", "Error on PID " + r.ProcessId + ": " + r.Error);
+                        AppendLog("ERROR", "Error PID " + r.ProcessId + ": " + r.Error);
                     }
                 }
             }
             catch (Exception ex)
             {
-                AppendLog("ERROR", "Poll cycle exception: " + ex.Message);
+                AppendLog("ERROR", "Poll cycle: " + ex.Message);
             }
         }
 
@@ -678,46 +717,43 @@ namespace SaiCont
                 item.SubItems.Add(r.ProcessName ?? "-");
                 item.SubItems.Add(r.ProcessId.ToString(CultureInfo.InvariantCulture));
                 item.SubItems.Add(r.AttachProcessId.ToString(CultureInfo.InvariantCulture));
-                item.SubItems.Add(r.Title ?? "-");
-                item.SubItems.Add(r.Read ? "READ_OK" : "READ_FAIL");
-
-                string prompt = r.Busy ? "BUSY" : (r.Ready ? "READY" : "WAITING");
-                item.SubItems.Add(prompt);
+                item.SubItems.Add(r.Read ? "OK" : "FAIL");
+                item.SubItems.Add(r.Busy ? "BUSY" : (r.Ready ? "READY" : "WAIT"));
 
                 string opState;
                 Color itemColor;
                 if (!r.Read)
                 {
                     opState = "UNREADABLE";
-                    itemColor = StateRed;
+                    itemColor = CDangerText;
                 }
                 else if (r.Busy)
                 {
-                    opState = "BUSY_GENERATING";
-                    itemColor = StateYellow;
+                    opState = "BUSY";
+                    itemColor = CWarning;
                 }
                 else if (r.Sent)
                 {
-                    opState = "INJECTED_SENT";
-                    itemColor = StateGreen;
+                    opState = "INJECTED";
+                    itemColor = CSuccess;
                 }
                 else if (r.Triggered)
                 {
                     if (r.NextAttemptUtc > DateTime.UtcNow)
                     {
-                        opState = "COOLDOWN_WAIT";
-                        itemColor = StateCyan;
+                        opState = "COOLDOWN";
+                        itemColor = CAccentTeal;
                     }
                     else
                     {
-                        opState = "TRIGGER_READY";
-                        itemColor = StateGreen;
+                        opState = "READY";
+                        itemColor = CSuccess;
                     }
                 }
                 else
                 {
-                    opState = "MONITORING_IDLE";
-                    itemColor = TextGold;
+                    opState = "IDLE";
+                    itemColor = CTextPrimary;
                 }
 
                 item.SubItems.Add(opState);
@@ -732,7 +768,6 @@ namespace SaiCont
 
             sessionListView.EndUpdate();
             sessionCountLabel.Text = "Sessions: " + results.Count;
-
             UpdateInspectorFromSelected();
         }
 
@@ -745,36 +780,31 @@ namespace SaiCont
                 {
                     PollResult s = currentPollResults[idx];
                     var sb = new StringBuilder();
-                    sb.AppendLine("===============================================================================");
-                    sb.AppendLine(" SESSION DEEP DIAGNOSTIC INSPECTION: PID " + s.ProcessId + " (" + (s.ProcessName ?? "unknown") + ")");
-                    sb.AppendLine("===============================================================================");
-                    sb.AppendLine(" Target Rule:        " + (s.Target ?? "-"));
-                    sb.AppendLine(" Process ID:         " + s.ProcessId);
-                    sb.AppendLine(" Attach Process ID:  " + s.AttachProcessId);
-                    sb.AppendLine(" Window Title:       \"" + (s.Title ?? "-") + "\"");
-                    sb.AppendLine(" Console Buffer:     " + (s.Read ? "SUCCESS (READABLE)" : "FAILED (UNREADABLE)"));
-                    sb.AppendLine(" Prompt State:       " + (s.Busy ? "BUSY (Generating or User Input Present)" : (s.Ready ? "READY (Empty prompt, ready for input)" : "UNKNOWN")));
-                    sb.AppendLine(" Trigger State:      " + (s.Triggered ? "TRIGGERED (Active failure pattern matched)" : "NO_TRIGGER"));
-                    sb.AppendLine(" Transaction Status: WouldSend=" + s.WouldSend + " | Sent=" + s.Sent);
-                    sb.AppendLine(" Next Attempt UTC:   " + (s.NextAttemptUtc == DateTime.MinValue ? "none" : s.NextAttemptUtc.ToString("o", CultureInfo.InvariantCulture)));
-                    sb.AppendLine(" Decision / Reason:  " + (s.Reason ?? "-"));
+                    sb.AppendLine("SESSION INSPECTOR: PID " + s.ProcessId + " (" + (s.ProcessName ?? "-") + ")");
+                    sb.AppendLine("Target: " + (s.Target ?? "-"));
+                    sb.AppendLine("Attach PID: " + s.AttachProcessId);
+                    sb.AppendLine("Window: " + (s.Title ?? "-"));
+                    sb.AppendLine("Console: " + (s.Read ? "OK" : "FAIL"));
+                    sb.AppendLine("Prompt: " + (s.Busy ? "BUSY" : (s.Ready ? "READY" : "UNKNOWN")));
+                    sb.AppendLine("Trigger: " + (s.Triggered ? "YES" : "NO"));
+                    sb.AppendLine("Sent: " + s.Sent);
+                    sb.AppendLine("Next: " + (s.NextAttemptUtc == DateTime.MinValue ? "none" : s.NextAttemptUtc.ToString("o", CultureInfo.InvariantCulture)));
+                    sb.AppendLine("Reason: " + (s.Reason ?? "-"));
                     if (!String.IsNullOrEmpty(s.Error))
                     {
-                        sb.AppendLine(" Error Detail:       " + s.Error);
+                        sb.AppendLine("Error: " + s.Error);
                     }
-                    sb.AppendLine("===============================================================================");
                     inspectorTextBox.Text = sb.ToString();
                     return;
                 }
             }
-
-            inspectorTextBox.Text = "Select a terminal session from the list above to view deep diagnostic inspection.";
+            inspectorTextBox.Text = "Select a session above.";
         }
 
         private void UpdateHeaderStats()
         {
-            string timeStr = lastPollTime == DateTime.MinValue ? "--:--:--" : lastPollTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-            statsLabel.Text = "Polls: " + pollCounter + " | " + timeStr + " UTC";
+            string timeStr = lastPollTime == DateTime.MinValue ? "--:--" : lastPollTime.ToString("HH:mm", CultureInfo.InvariantCulture);
+            statsLabel.Text = "Polls: " + pollCounter + " | " + timeStr;
             pollStatsLabel.Text = "Polls: " + pollCounter;
         }
 
@@ -784,22 +814,44 @@ namespace SaiCont
 
             string timeStr = DateTime.UtcNow.ToString("HH:mm:ss", CultureInfo.InvariantCulture);
 
-            Color color = TextMuted;
-            if (level == "ERROR") color = StateRed;
-            else if (level == "WARN") color = StateYellow;
-            else if (level == "SEND") color = StateGreen;
-            else if (level == "MATCH") color = StateCyan;
+            Color color = CTextMuted;
+            if (level == "ERROR") color = CDangerText;
+            else if (level == "WARN") color = CWarning;
+            else if (level == "SEND") color = CSuccess;
+            else if (level == "MATCH") color = CAccentTeal;
 
             logRichText.SelectionStart = logRichText.TextLength;
             logRichText.SelectionLength = 0;
-            logRichText.SelectionColor = Color.FromArgb(120, 110, 100);
+            logRichText.SelectionColor = CTextMuted;
             logRichText.AppendText(timeStr + " ");
 
             logRichText.SelectionColor = color;
             logRichText.AppendText(String.Format(CultureInfo.InvariantCulture, "[{0,-5}] ", level));
 
-            logRichText.SelectionColor = Color.FromArgb(220, 210, 195);
+            logRichText.SelectionColor = CTextPrimary;
             logRichText.AppendText(message + "\n");
+            guiLogEntries++;
+            if (guiLogEntries > MaximumGuiLogEntries)
+            {
+                int removeEntries = Math.Min(100, guiLogEntries - MaximumGuiLogEntries + 100);
+                int removeEnd = 0;
+                for (int index = 0; index < removeEntries; index++)
+                {
+                    int newline = logRichText.Text.IndexOf('\n', removeEnd);
+                    if (newline < 0)
+                    {
+                        removeEnd = logRichText.TextLength;
+                        break;
+                    }
+                    removeEnd = newline + 1;
+                }
+                if (removeEnd > 0)
+                {
+                    logRichText.Select(0, removeEnd);
+                    logRichText.SelectedText = String.Empty;
+                    guiLogEntries -= removeEntries;
+                }
+            }
             logRichText.ScrollToCaret();
         }
 
@@ -829,12 +881,10 @@ namespace SaiCont
             }
         }
 
-        public static int RunDesktopGui(WatcherConfiguration config, string configurationFilePath, string initialMode = null)
+        public static int RunDesktopGui(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            // WinForms fail-safe: a UI-thread exception must leave an auditable trace
-            // instead of silently killing the desktop adapter window.
             try
             {
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -845,14 +895,14 @@ namespace SaiCont
                         eventArgs.Exception.ToString(),
                         false);
                     MessageBox.Show(
-                        "Recovered from an internal error; details were appended to run\\SAICONT.crash.log.",
+                        "Internal error. Details in run\\SAICONT.crash.log.",
                         "SAICONT",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
                 };
             }
             catch { }
-            Application.Run(new SaiContGuiForm(config, configurationFilePath, initialMode));
+            Application.Run(new SaiContGuiForm(config, configurationFilePath, initialMode, sharedStateStore, stopPredicate));
             return 0;
         }
     }

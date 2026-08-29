@@ -15,6 +15,33 @@ function Get-SaiContPaths {
     }
 }
 
+function Get-SaiContProcessState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Paths
+    )
+
+    $hasMetadata = (Test-Path -LiteralPath $Paths.PidFile -PathType Leaf) -or (Test-Path -LiteralPath $Paths.InstanceFile -PathType Leaf)
+    if (-not $hasMetadata) {
+        return [pscustomobject]@{ Disposition = 'STOPPED_VERIFIED'; Process = $null; Error = $null }
+    }
+
+    $pidValue = 0
+    $pidText = if (Test-Path -LiteralPath $Paths.PidFile -PathType Leaf) { (Get-Content -Raw -LiteralPath $Paths.PidFile).Trim() } else { '' }
+    if (-not [int]::TryParse($pidText, [ref]$pidValue)) {
+        return [pscustomobject]@{ Disposition = 'UNVERIFIABLE'; Process = $null; Error = 'PID metadata is malformed.' }
+    }
+    $candidate = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+    if ($null -eq $candidate -or $candidate.HasExited) {
+        return [pscustomobject]@{ Disposition = 'POSITIVELY_STALE'; Process = $null; Error = 'Recorded process is absent.' }
+    }
+    $verified = Get-SaiContProcess -Paths $Paths
+    if ($null -ne $verified) {
+        return [pscustomobject]@{ Disposition = 'RUNNING_VERIFIED'; Process = $verified; Error = $null }
+    }
+    return [pscustomobject]@{ Disposition = 'UNVERIFIABLE'; Process = $candidate; Error = 'Live process exists but identity metadata cannot be verified.' }
+}
+
 function Get-SaiContProcess {
     param(
         [Parameter(Mandatory = $true)]

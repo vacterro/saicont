@@ -3,10 +3,24 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace SaiCont
 {
+    // W2-002: the native-write transaction boundary must not be a boolean.
+    // Only "no input committed" may enter ordinary retry/backoff; a partial
+    // accepted write is ambiguous (a command prefix or Enter may already be in
+    // the target buffer) and must fail closed until console evidence resolves
+    // the outcome. A complete accepted write is committed and must never be
+    // blindly re-dispatched by elapsed time.
+    internal enum NativeWriteOutcome
+    {
+        NoInputCommitted = 0,
+        CompleteInputCommitted = 1,
+        AmbiguousOrPartialInput = 2
+    }
+
     internal enum ConsoleMembershipStatus
     {
         VerifiedPresent,
@@ -40,6 +54,8 @@ namespace SaiCont
 
     internal static class NativeConsole
     {
+        internal const int MaximumScanLines = 2000;
+
         private const uint GenericRead = 0x80000000;
         private const uint GenericWrite = 0x40000000;
         private const uint ShareRead = 0x00000001;
@@ -118,6 +134,7 @@ namespace SaiCont
                 if (!AttachConsole((uint)processId))
                 {
                     error = Win32Error("AttachConsole", processId);
+                    TryRestoreHostConsole();
                     return false;
                 }
 
@@ -197,6 +214,7 @@ namespace SaiCont
                 finally
                 {
                     FreeConsole();
+                    TryRestoreHostConsole();
                 }
             }
         }
@@ -222,6 +240,7 @@ namespace SaiCont
                 if (!AttachConsole((uint)processId))
                 {
                     error = Win32Error("AttachConsole", processId);
+                    TryRestoreHostConsole();
                     return false;
                 }
 
@@ -265,11 +284,12 @@ namespace SaiCont
                 finally
                 {
                     FreeConsole();
+                    TryRestoreHostConsole();
                 }
             }
         }
 
-        public static bool TryWriteLineVerified(
+        public static NativeWriteOutcome TryWriteLineVerified(
             ResolvedConsoleSession session,
             ProcessSessionIdentity expectedMatchedSession,
             string command,
@@ -279,41 +299,41 @@ namespace SaiCont
             if (session == null)
             {
                 error = "send_blocked=null_console_session";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
 
             if (expectedMatchedSession == null)
             {
                 error = "send_blocked=null_target_session";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
 
             if (!expectedMatchedSession.IsStrong)
             {
                 error = "send_blocked=target_identity_unavailable";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
             if (session.MatchedTargetSession == null || !session.MatchedTargetSession.Equals(expectedMatchedSession))
             {
                 error = "send_blocked=session_identity_mismatch";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
 
             if (String.IsNullOrEmpty(command))
             {
                 error = "send_blocked=empty_command";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
 
             if (command.IndexOf('\r') >= 0 || command.IndexOf('\n') >= 0)
             {
                 error = "send_blocked=multiline_command";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
             if (command.Length > 512)
             {
                 error = "send_blocked=command_too_long";
-                return false;
+                return NativeWriteOutcome.NoInputCommitted;
             }
 
             lock (ConsoleLock)
@@ -322,7 +342,8 @@ namespace SaiCont
                 if (!AttachConsole((uint)session.ResolvedAttachProcessId))
                 {
                     error = "send_blocked=" + Win32Error("AttachConsole", session.ResolvedAttachProcessId);
-                    return false;
+                    TryRestoreHostConsole();
+                    return NativeWriteOutcome.NoInputCommitted;
                 }
 
                 try
@@ -333,12 +354,12 @@ namespace SaiCont
                     if (!currentTarget.IsStrong)
                     {
                         error = "send_blocked=target_identity_unavailable";
-                        return false;
+                        return NativeWriteOutcome.NoInputCommitted;
                     }
                     if (!currentTarget.Equals(expectedMatchedSession))
                     {
                         error = "send_blocked=process_session_changed";
-                        return false;
+                        return NativeWriteOutcome.NoInputCommitted;
                     }
 
                     IList<int> attachedPids;
@@ -346,20 +367,20 @@ namespace SaiCont
                     if (!TryGetConsoleProcessList(out attachedPids, out memError))
                     {
                         error = "send_blocked=membership_unavailable: " + memError;
-                        return false;
+                        return NativeWriteOutcome.NoInputCommitted;
                     }
 
                     if (!attachedPids.Contains(expectedMatchedSession.ProcessId))
                     {
                         error = "send_blocked=target_not_in_console (PID " + expectedMatchedSession.ProcessId + " missing from attached console)";
-                        return false;
+                        return NativeWriteOutcome.NoInputCommitted;
                     }
 
                     IntPtr currentWindow = GetConsoleWindow();
                     if (session.WindowHandle != IntPtr.Zero && currentWindow != IntPtr.Zero && currentWindow != session.WindowHandle)
                     {
                         error = "send_blocked=console_changed (window 0x" + currentWindow.ToInt64().ToString("X") + " != expected 0x" + session.WindowHandle.ToInt64().ToString("X") + ")";
-                        return false;
+                        return NativeWriteOutcome.NoInputCommitted;
                     }
 
                     if (session.WindowHandle == IntPtr.Zero)
@@ -375,7 +396,7 @@ namespace SaiCont
                         if (!String.Equals(currentConsoleId, session.StableConsoleId, StringComparison.Ordinal))
                         {
                             error = "send_blocked=console_changed";
-                            return false;
+                            return NativeWriteOutcome.NoInputCommitted;
                         }
                     }
 
@@ -384,14 +405,21 @@ namespace SaiCont
                         if (input.IsInvalid)
                         {
                             error = "send_blocked=" + Win32Error("CreateFile(CONIN$)", session.ResolvedAttachProcessId);
-                            return false;
+                            return NativeWriteOutcome.NoInputCommitted;
                         }
 
                         var records = new List<InputRecord>();
-                        foreach (char character in command)
+                        bool commandAlreadyTyped = session.Snapshot != null && ContainsTypedCommand(
+                            String.IsNullOrWhiteSpace(session.Snapshot.CursorLine) ? LastNonEmptyLine(session.Snapshot.Text) : session.Snapshot.CursorLine,
+                            command);
+                        if (!commandAlreadyTyped)
                         {
-                            records.Add(CreateKeyRecord(true, character, 0));
-                            records.Add(CreateKeyRecord(false, character, 0));
+                            foreach (char character in command)
+                            {
+                                ushort virtualKey = VirtualKeyForCharacter(character);
+                                records.Add(CreateKeyRecord(true, character, virtualKey));
+                                records.Add(CreateKeyRecord(false, character, virtualKey));
+                            }
                         }
 
                         records.Add(CreateKeyRecord(true, '\r', VkReturn));
@@ -403,7 +431,7 @@ namespace SaiCont
                         if (!finalTarget.IsStrong || !finalTarget.Equals(expectedMatchedSession))
                         {
                             error = "send_blocked=process_session_changed";
-                            return false;
+                            return NativeWriteOutcome.NoInputCommitted;
                         }
 
                         uint written;
@@ -411,21 +439,29 @@ namespace SaiCont
                         if (!WriteConsoleInputW(input, recordArray, (uint)recordArray.Length, out written))
                         {
                             error = "send_blocked=" + Win32Error("WriteConsoleInput", session.ResolvedAttachProcessId);
-                            return false;
+                            return NativeWriteOutcome.NoInputCommitted;
                         }
 
                         if (!IsCompleteInputWrite((uint)recordArray.Length, written))
                         {
+                            // W2-002: a partial accepted write is ambiguous. A
+                            // command prefix or an Enter-down may already be in the
+                            // target buffer. This MUST NOT enter ordinary retry.
                             error = "send_blocked=partial_write (accepted " + written + " of " + recordArray.Length + " records)";
-                            return false;
+                            return NativeWriteOutcome.AmbiguousOrPartialInput;
                         }
 
-                        return true;
+                        // W2-002: a complete accepted write is committed. Whether
+                        // the target visibly shows "Working" within a short window
+                        // is diagnostic, not a retry condition -- re-dispatching a
+                        // committed command risks concatenation/duplication.
+                        return NativeWriteOutcome.CompleteInputCommitted;
                     }
                 }
                 finally
                 {
                     FreeConsole();
+                    TryRestoreHostConsole();
                 }
             }
         }
@@ -498,6 +534,54 @@ namespace SaiCont
             return expectedRecords > 0 && writtenRecords == expectedRecords;
         }
 
+        private static bool IsReadyPrompt(string line)
+        {
+            string value = (line ?? String.Empty).Trim();
+            return value == ">" || value == "› Ask Codex to do anything" || value.EndsWith("Ask anything...", StringComparison.Ordinal);
+        }
+
+        private static ushort VirtualKeyForCharacter(char character)
+        {
+            if (character >= 'a' && character <= 'z')
+            {
+                return (ushort)(character - 'a' + 'A');
+            }
+            if (character >= 'A' && character <= 'Z')
+            {
+                return character;
+            }
+            if (character >= '0' && character <= '9')
+            {
+                return character;
+            }
+            return 0;
+        }
+
+        private static bool ContainsWorkingMarker(string text)
+        {
+            return !String.IsNullOrEmpty(text) && text.IndexOf("Working (", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool ContainsTypedCommand(string line, string command)
+        {
+            string value = (line ?? String.Empty).Trim();
+            value = value.TrimStart('>', '›', '?').Trim();
+            return String.Equals(value, command, StringComparison.Ordinal);
+        }
+
+        private static string LastNonEmptyLine(string text)
+        {
+            string[] lines = (text ?? String.Empty).Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            for (int index = lines.Length - 1; index >= 0; index--)
+            {
+                if (!String.IsNullOrWhiteSpace(lines[index]))
+                {
+                    return lines[index];
+                }
+            }
+            return String.Empty;
+        }
+
         private static SafeFileHandle OpenConsoleDevice(string name)
         {
             return CreateFileW(name, GenericRead | GenericWrite, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
@@ -512,7 +596,7 @@ namespace SaiCont
                 KeyDown = down,
                 RepeatCount = 1,
                 VirtualKeyCode = virtualKey,
-                VirtualScanCode = 0,
+                VirtualScanCode = virtualKey == 0 ? (ushort)0 : (ushort)MapVirtualKey(virtualKey, 0),
                 UnicodeChar = character,
                 ControlKeyState = 0
             };
@@ -578,11 +662,38 @@ namespace SaiCont
             public KeyEventRecord KeyEvent;
         }
 
+        [DllImport("user32.dll")]
+        private static extern uint MapVirtualKey(uint code, uint mapType);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AttachConsole(uint processId);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool FreeConsole();
+
+        // CORE-002: ATTACH_PARENT_PROCESS sentinel. Re-attach to the parent
+        // process's console (typically the cmd that launched SAICONT, or the
+        // scheduled-task host) after each target-console operation so the
+        // TUI's rendering, keyboard input and Ctrl handler keep working.
+        private const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFFu;
+
+        // CORE-002: try to re-attach to the host console after a target-console
+        // operation. Best-effort: if the host has no console (detached scheduled
+        // task) or AttachConsole fails, the process remains console-less until
+        // the next AttachConsole call. Either state is strictly better than the
+        // previous FreeConsole-only behavior, which left the TUI's host console
+        // destroyed for every poll.
+        private static void TryRestoreHostConsole()
+        {
+            try
+            {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+            catch
+            {
+                // best-effort; never throw from a restore path
+            }
+        }
 
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetConsoleWindow();

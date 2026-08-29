@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
 
@@ -43,15 +45,17 @@ namespace SaiCont
                         MaximumAttemptsPerEvent = 5,
                         TriggerPatterns = new[]
                         {
-                            @"(?i)you.ve hit your usage limit",
-                            @"(?i)hit your usage limit",
-                            @"(?i)usage limit[^\r\n]{0,256}(?:try\s+)?again",
-                            @"(?i)(?:try\s+)?again\s+at\s+[A-Za-z0-9]"
+                             @"(?i)you.ve (?:hit|reached) your usage limit",
+                             @"(?i)hit your usage limit",
+                             @"(?i)usage limit[^\r\n]{0,256}(?:try\s+again|reset|renew)",
+                             @"(?i)(?:rate|request) limit[^\r\n]{0,256}(?:exceeded|reached|try\s+again)",
+                             @"(?i)(?:try\s+)?again\s+at\s+[A-Za-z0-9]"
                         },
                         ReadyPatterns = new[]
                         {
-                            @"^\s*›\s*Ask Codex to do anything\s*$",
-                            @"^\s*>\s*$"
+                             @"^\s*›\s*Ask Codex to do anything\s*$",
+                             @"^\s*>\s*Ask Codex to do anything\s*$",
+                             @"^\s*>\s*$"
                         },
                         BusyPatterns = new[]
                         {
@@ -178,7 +182,7 @@ namespace SaiCont
                     Name = name,
                     Enabled = ReadBoolean(targetElement, "enabled"),
                     Command = ReadString(targetElement, "command"),
-                    ScanLines = ReadInteger(targetElement, "scanLines", 10, 5000),
+                    ScanLines = ReadInteger(targetElement, "scanLines", 10, NativeConsole.MaximumScanLines),
                     MaximumTriggerDistanceLines = ReadInteger(targetElement, "maximumTriggerDistanceLines", 1, 5000),
                     InitialDelaySeconds = ReadInteger(targetElement, "initialDelaySeconds", 10, 86400),
                     RetryIntervalSeconds = ReadInteger(targetElement, "retryIntervalSeconds", 10, 86400),
@@ -278,12 +282,26 @@ namespace SaiCont
 
         private static XmlElement RequireChild(XmlElement parent, string name)
         {
-            XmlElement child = parent[name];
-            if (child == null)
+            XmlElement found = null;
+            int count = 0;
+            foreach (XmlNode node in parent.ChildNodes)
+            {
+                XmlElement child = node as XmlElement;
+                if (child != null && String.Equals(child.Name, name, StringComparison.Ordinal))
+                {
+                    found = child;
+                    count++;
+                }
+            }
+            if (count == 0)
             {
                 throw new FormatException("Missing <" + name + "> inside <" + parent.Name + ">.");
             }
-            return child;
+            if (count != 1)
+            {
+                throw new FormatException("Duplicate <" + name + "> inside <" + parent.Name + ">.");
+            }
+            return found;
         }
 
         private static string ReadString(XmlElement element, string attributeName)
@@ -442,6 +460,38 @@ namespace SaiCont
         public Regex[] CompiledReadyPatterns;
         public Regex[] CompiledBusyPatterns;
         public HashSet<string> ProcessNameSet;
+
+        public string SemanticFingerprint
+        {
+            get
+            {
+                var builder = new StringBuilder();
+                builder.Append(Name).Append('|').Append(Enabled).Append('|').Append(Command).Append('|')
+                    .Append(ScanLines).Append('|').Append(MaximumTriggerDistanceLines).Append('|')
+                    .Append(InitialDelaySeconds).Append('|').Append(RetryIntervalSeconds).Append('|')
+                    .Append(ParseRetryTime).Append('|').Append(BackoffMultiplier.ToString("R", CultureInfo.InvariantCulture)).Append('|')
+                    .Append(MaximumRetryIntervalSeconds).Append('|').Append(MaximumAttemptsPerEvent).Append('|');
+                AppendValues(builder, ProcessNames);
+                AppendValues(builder, TriggerPatterns);
+                AppendValues(builder, ReadyPatterns);
+                AppendValues(builder, BusyPatterns);
+                using (var sha = SHA256.Create())
+                {
+                    byte[] digest = sha.ComputeHash(Encoding.UTF8.GetBytes(builder.ToString()));
+                    return BitConverter.ToString(digest).Replace("-", String.Empty).ToLowerInvariant();
+                }
+            }
+        }
+
+        private static void AppendValues(StringBuilder builder, string[] values)
+        {
+            builder.Append('[');
+            foreach (string value in values ?? new string[0])
+            {
+                builder.Append(value == null ? String.Empty : value.Trim()).Append('\u001f');
+            }
+            builder.Append(']');
+        }
 
         public static readonly TimeSpan DefaultRegexTimeout = TimeSpan.FromMilliseconds(250);
 

@@ -88,7 +88,7 @@ namespace SaiCont
         }
     }
 
-    internal delegate bool ConsoleReadAttempt(int processId, out ConsoleSnapshot snapshot, out string error);
+    internal delegate bool ConsoleReadAttempt(int processId, int lineCount, out ConsoleSnapshot snapshot, out string error);
 
     internal static class ProcessDiscovery
     {
@@ -124,7 +124,8 @@ namespace SaiCont
             IntPtr snapshot = CreateToolhelp32Snapshot(SnapshotProcesses, 0);
             if (snapshot == InvalidHandleValue)
             {
-                return entries;
+                int win32Error = Marshal.GetLastWin32Error();
+                throw new InvalidOperationException("Process snapshot failed (Win32 " + win32Error + ").");
             }
 
             try
@@ -133,7 +134,12 @@ namespace SaiCont
                 native.Size = (uint)Marshal.SizeOf(typeof(ProcessEntry32));
                 if (!Process32First(snapshot, ref native))
                 {
-                    return entries;
+                    int win32Error = Marshal.GetLastWin32Error();
+                    if (win32Error == 18)
+                    {
+                        return entries;
+                    }
+                    throw new InvalidOperationException("Process enumeration start failed (Win32 " + win32Error + ").");
                 }
 
                 do
@@ -146,6 +152,12 @@ namespace SaiCont
                     });
                 }
                 while (Process32Next(snapshot, ref native));
+
+                int terminalError = Marshal.GetLastWin32Error();
+                if (terminalError != 18)
+                {
+                    throw new InvalidOperationException("Process enumeration failed (Win32 " + terminalError + ").");
+                }
             }
             finally
             {
@@ -281,6 +293,16 @@ namespace SaiCont
             out ResolvedConsoleSession session,
             out string error)
         {
+            return TryResolveConsoleSession(candidate, read, 180, out session, out error);
+        }
+
+        internal static bool TryResolveConsoleSession(
+            ConsoleCandidate candidate,
+            ConsoleReadAttempt read,
+            int lineCount,
+            out ResolvedConsoleSession session,
+            out string error)
+        {
             session = null;
             error = null;
             if (candidate == null || candidate.MatchedSession == null)
@@ -292,7 +314,7 @@ namespace SaiCont
             int selectedPid;
             ConsoleSnapshot snapshot;
             string selectError;
-            if (!TrySelectConsole(candidate.AttachProcessIds, candidate.MatchedProcessId, read, out selectedPid, out snapshot, out selectError))
+            if (!TrySelectConsole(candidate.AttachProcessIds, candidate.MatchedProcessId, read, lineCount, out selectedPid, out snapshot, out selectError))
             {
                 error = selectError;
                 return false;
@@ -320,6 +342,18 @@ namespace SaiCont
             out ConsoleSnapshot snapshot,
             out string lastError)
         {
+            return TrySelectConsole(attachPids, matchedProcessId, read, 180, out selectedPid, out snapshot, out lastError);
+        }
+
+        internal static bool TrySelectConsole(
+            IList<int> attachPids,
+            int matchedProcessId,
+            ConsoleReadAttempt read,
+            int lineCount,
+            out int selectedPid,
+            out ConsoleSnapshot snapshot,
+            out string lastError)
+        {
             selectedPid = 0;
             snapshot = null;
             lastError = null;
@@ -332,7 +366,7 @@ namespace SaiCont
             {
                 ConsoleSnapshot attemptSnapshot;
                 string attemptError;
-                if (!read(pid, out attemptSnapshot, out attemptError))
+                if (!read(pid, lineCount, out attemptSnapshot, out attemptError))
                 {
                     lastError = attemptError;
                     continue;

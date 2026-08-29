@@ -29,7 +29,7 @@ namespace SaiCont
         public DateTime NextAttemptUtc;
     }
 
-    internal delegate bool VerifiedConsoleWriter(
+    internal delegate NativeWriteOutcome VerifiedConsoleWriter(
         ResolvedConsoleSession session,
         ProcessSessionIdentity expectedTarget,
         string command,
@@ -49,6 +49,7 @@ namespace SaiCont
         private readonly DurableStateStore _stateStore;
         private bool _stateLoaded;
         private bool _stateStoreHealthy = true;
+        private bool _stateLedgerAmbiguous;
         private DateTime _stateRecoveryNotBeforeUtc = DateTime.MinValue;
 
         internal int SessionStateCount { get { return _states.Count; } }
@@ -58,7 +59,7 @@ namespace SaiCont
                 configuration,
                 ProcessDiscovery.Snapshot,
                 ProcessDiscovery.ResolveSessionIdentity,
-                delegate(int pid, out ConsoleSnapshot s, out string e) { return NativeConsole.TryRead(pid, 180, out s, out e); },
+                delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e) { return NativeConsole.TryRead(pid, lineCount, out s, out e); },
                 NativeConsole.TryWriteLineVerified,
                 delegate { return DateTime.UtcNow; },
                 stateStore)
@@ -77,7 +78,7 @@ namespace SaiCont
             _configuration = configuration;
             _snapshotProvider = snapshotProvider ?? ProcessDiscovery.Snapshot;
             _sessionResolver = sessionResolver ?? ProcessDiscovery.ResolveSessionIdentity;
-            _consoleReader = consoleReader ?? (delegate(int pid, out ConsoleSnapshot s, out string e) { return NativeConsole.TryRead(pid, 180, out s, out e); });
+            _consoleReader = consoleReader ?? (delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e) { return NativeConsole.TryRead(pid, lineCount, out s, out e); });
             _verifiedWriter = verifiedWriter ?? NativeConsole.TryWriteLineVerified;
             _clock = clock ?? (delegate { return DateTime.UtcNow; });
             _stateStore = stateStore;
@@ -87,7 +88,36 @@ namespace SaiCont
         {
             DateTime nowUtc = _clock();
             string stateDiagnostic = null;
-            PruneInactiveStates(nowUtc);
+
+            // W2-003: take one snapshot early to identify vanished sessions
+            // for lifecycle pruning, then reuse it for rule evaluation below
+            // to avoid doubling the snapshot cost.
+            ISet<int> livePids = null;
+            IList<ProcessEntry> processes = null;
+            bool snapshotSucceeded = false;
+            try
+            {
+                processes = _snapshotProvider();
+                snapshotSucceeded = true;
+                livePids = new HashSet<int>();
+                foreach (ProcessEntry entry in processes)
+                {
+                    livePids.Add(entry.Id);
+                }
+            }
+            catch
+            {
+                // If snapshot fails, prune with null (idle-only pruning).
+            }
+            PruneInactiveStates(nowUtc, livePids);
+            if (_stateStore != null && !_stateStoreHealthy)
+            {
+                // W2-006 / CORE-007: bounded, rate-limited recovery probing.
+                // Stay fail-closed while the store is unhealthy, but transition
+                // back to healthy automatically once writeability and durable
+                // authority are reconciled again -- no manual restart required.
+                TryRecoverStateStore(nowUtc, ref stateDiagnostic);
+            }
             if (!_stateLoaded && _stateStore != null)
             {
                 _stateLoaded = true;
@@ -97,10 +127,11 @@ namespace SaiCont
                 {
                     stateDiagnostic = "state_preflight_failed: " + preflightError;
                 }
-                List<StateRecord> saved = _stateStore.Load();
+                List<StateRecord> saved = _stateStore.Load(nowUtc);
                 foreach (StateRecord rec in saved)
                 {
-                    if (rec != null && !String.IsNullOrEmpty(rec.RuleName) && rec.ProcessId > 0 && rec.ProcessStartUtc != DateTime.MinValue && _states.Count < MaximumSessionStates)
+                    TargetRule savedRule = rec == null ? null : _configuration.Targets.FirstOrDefault(t => String.Equals(t.Name, rec.RuleName, StringComparison.Ordinal));
+                    if (rec != null && savedRule != null && String.Equals(rec.RuleSemanticFingerprint, savedRule.SemanticFingerprint, StringComparison.Ordinal) && rec.ProcessId > 0 && rec.ProcessStartUtc != DateTime.MinValue && _states.Count < MaximumSessionStates)
                     {
                         var s = new RetrySessionState();
                         s.RestoreFrom(rec, nowUtc);
@@ -113,8 +144,13 @@ namespace SaiCont
                         };
                     }
                 }
+                if (_stateStore.LastLoadDisposition == StateLoadDisposition.Unavailable)
+                {
+                    _stateStoreHealthy = false;
+                }
                 if (_stateStore.RequiresConservativeRecovery)
                 {
+                    _stateLedgerAmbiguous = true;
                     int delaySeconds = _configuration.Targets.Count == 0
                         ? 60
                         : _configuration.Targets.Max(t => t.SafeInitialDelaySeconds);
@@ -123,8 +159,17 @@ namespace SaiCont
                 }
             }
 
-            IList<ProcessEntry> processes = _snapshotProvider();
             var results = new List<PollResult>();
+            if (!snapshotSucceeded)
+            {
+                results.Add(new PollResult
+                {
+                    Target = "runtime",
+                    Error = "process_discovery_unavailable",
+                    Reason = "send_blocked=process_discovery_unavailable"
+                });
+                return results;
+            }
             if (!String.IsNullOrEmpty(stateDiagnostic))
             {
                 results.Add(new PollResult
@@ -135,10 +180,15 @@ namespace SaiCont
                 });
             }
 
-            var usedConsoles = new HashSet<string>(StringComparer.Ordinal);
+            var reservedConsoles = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (TargetRule rule in _configuration.Targets)
             {
+                if (shouldStop != null && shouldStop())
+                {
+                    results.Add(new PollResult { Target = "runtime", Error = "stop_requested", Reason = "send_blocked=stop_requested" });
+                    break;
+                }
                 if (!rule.Enabled)
                 {
                     continue;
@@ -153,11 +203,28 @@ namespace SaiCont
 
                 IList<ConsoleCandidate> candidates = ProcessDiscovery.FindCandidates(processes, targetNameSet, _sessionResolver);
 
+                // PERF-007: share one refreshed snapshot across all candidates
+                // that fail the initial read, instead of each candidate taking
+                // an independent snapshot.  Only one refresh is performed per
+                // rule even when many candidates fail.
+                IList<ProcessEntry> sharedRefreshedProcesses = null;
+                bool sharedRefreshTaken = false;
+
                 foreach (ConsoleCandidate candidate in candidates)
                 {
+                    if (shouldStop != null && shouldStop())
+                    {
+                        results.Add(new PollResult
+                        {
+                            Target = "runtime",
+                            Error = "stop_requested",
+                            Reason = "send_blocked=stop_requested"
+                        });
+                        break;
+                    }
                     ResolvedConsoleSession resolvedConsole;
                     string readError;
-                    if (!TryReadTarget(rule, candidate, out resolvedConsole, out readError))
+                    if (!TryReadTarget(rule, candidate, shouldStop, out resolvedConsole, out readError, ref sharedRefreshedProcesses, ref sharedRefreshTaken))
                     {
                         if (IsNonConsoleDiscoveryFailure(readError))
                         {
@@ -178,7 +245,13 @@ namespace SaiCont
                         continue;
                     }
 
-                    if (!usedConsoles.Add(resolvedConsole.StableConsoleId))
+                    RuleObservation observation = RuleMatcher.Inspect(rule, resolvedConsole.Snapshot, nowUtc);
+                    // CORE-005: an evaluation failure (regex timeout / rule
+                    // evaluation error) must NEVER mutate semantic safety state.
+                    // Short-circuit before any Observe/capacity transition so a
+                    // transient failure cannot erase deadlines, attempts,
+                    // suppression or an in-flight reservation.
+                    if (!String.IsNullOrEmpty(observation.EvaluationError))
                     {
                         results.Add(new PollResult
                         {
@@ -192,13 +265,12 @@ namespace SaiCont
                             ConsoleWindow = resolvedConsole.WindowHandle,
                             Title = resolvedConsole.Snapshot != null ? resolvedConsole.Snapshot.Title : String.Empty,
                             Read = true,
-                            Error = "console_already_attempted_this_poll",
-                            Reason = "send_blocked=console_already_attempted_this_poll"
+                            Error = "rule_evaluation_failed=" + observation.EvaluationError,
+                            Reason = "send_blocked=rule_evaluation_failed"
                         });
                         continue;
                     }
 
-                    RuleObservation observation = RuleMatcher.Inspect(rule, resolvedConsole.Snapshot, nowUtc);
                     string stateKey = rule.Name + ":" + candidate.MatchedSession.ProcessId + ":" + (candidate.MatchedSession.StartTimeUtc == DateTime.MinValue ? "0" : candidate.MatchedSession.StartTimeUtc.ToString("o", CultureInfo.InvariantCulture));
                     RetrySessionState state;
                     if (!_states.TryGetValue(stateKey, out state))
@@ -230,7 +302,14 @@ namespace SaiCont
                         _stateIdentities[stateKey] = candidate.MatchedSession;
                     }
 
+                    RecoveryState stateBeforeObservation = state.State;
                     RetryDecision decision = state.Observe(observation, rule, nowUtc);
+                    if (_stateLedgerAmbiguous &&
+                        (stateBeforeObservation == RecoveryState.AttemptInFlightReserved || stateBeforeObservation == RecoveryState.AmbiguousFailClosed || stateBeforeObservation == RecoveryState.IdleNoEvent) &&
+                        !observation.Triggered)
+                    {
+                        _stateLedgerAmbiguous = false;
+                    }
                     var result = new PollResult
                     {
                         Target = rule.Name,
@@ -260,11 +339,10 @@ namespace SaiCont
 
                     if (decision.Send && allowInput)
                     {
-                        if (_stateStore != null && !_stateStoreHealthy)
+                        if (_stateStore != null && (!_stateStoreHealthy || _stateLedgerAmbiguous))
                         {
-                            result.Error = "state_store_unavailable";
-                            result.Reason = "send_blocked=state_store_unavailable";
-                            state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
+                            result.Error = _stateLedgerAmbiguous ? "state_ledger_ambiguous" : "state_store_unavailable";
+                            result.Reason = _stateLedgerAmbiguous ? "send_blocked=state_ledger_ambiguous" : "send_blocked=state_store_unavailable";
                         }
                         else if (_stateRecoveryNotBeforeUtc != DateTime.MinValue && nowUtc < _stateRecoveryNotBeforeUtc)
                         {
@@ -301,7 +379,9 @@ namespace SaiCont
                             {
                                 ResolvedConsoleSession freshResolved;
                                 string freshError;
-                                if (!TryReadTarget(rule, freshTarget, out freshResolved, out freshError))
+                                IList<ProcessEntry> preSendRefreshed = null;
+                                bool preSendRefreshTaken = false;
+                                if (!TryReadTarget(rule, freshTarget, shouldStop, out freshResolved, out freshError, ref preSendRefreshed, ref preSendRefreshTaken))
                                 {
                                     result.Error = freshError;
                                     result.Reason = "send_blocked=re-resolution_failed: " + freshError;
@@ -322,9 +402,11 @@ namespace SaiCont
                                     RuleObservation safety = RuleMatcher.Inspect(rule, freshResolved.Snapshot, nowUtc);
                                     if (!String.IsNullOrEmpty(safety.EvaluationError))
                                     {
+                                        // CORE-005: do not RecordAttempt (which mutates
+                                        // attempts/deadline/state) on evaluation failure;
+                                        // preserve all authorization/recovery fields.
                                         result.Error = "rule_evaluation_failed=" + safety.EvaluationError;
                                         result.Reason = "send_blocked=rule_evaluation_failed";
-                                        state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
                                     }
                                     else if (!safety.Triggered || !String.Equals(safety.TriggerToken, decision.TriggerToken, StringComparison.Ordinal))
                                     {
@@ -348,6 +430,13 @@ namespace SaiCont
                                     }
                                     else
                                     {
+                                        if (reservedConsoles.Contains(resolvedConsole.StableConsoleId))
+                                        {
+                                            result.Reason = "send_blocked=console_already_attempted_this_poll";
+                                            results.Add(result);
+                                            continue;
+                                        }
+                                        reservedConsoles.Add(resolvedConsole.StableConsoleId);
                                         // CORE-004: reserve the attempt durably BEFORE the native
                                         // write. If the pre-send persist fails, do NOT perform the
                                         // native input. On restart, an AttemptInFlightReserved
@@ -370,13 +459,25 @@ namespace SaiCont
                                             }
                                         }
                                         string writeError;
-                                        result.Sent = _verifiedWriter(freshResolved, freshTarget.MatchedSession, rule.Command, out writeError);
+                                        NativeWriteOutcome writeOutcome = _verifiedWriter(freshResolved, freshTarget.MatchedSession, rule.Command, out writeError);
+                                        result.Sent = writeOutcome == NativeWriteOutcome.CompleteInputCommitted;
                                         result.Error = writeError;
-                                        result.Reason = result.Sent ? "send=command_written" : "send_blocked=" + (writeError ?? "input_write_failed");
+                                        if (writeOutcome == NativeWriteOutcome.CompleteInputCommitted)
+                                        {
+                                            result.Reason = "send=command_written";
+                                        }
+                                        else if (writeOutcome == NativeWriteOutcome.AmbiguousOrPartialInput)
+                                        {
+                                            result.Reason = "send_blocked=ambiguous_partial_write: " + writeError;
+                                        }
+                                        else
+                                        {
+                                            result.Reason = writeError ?? "send_blocked=input_write_failed";
+                                        }
                                         // CORE-004: refine the reserved state to its terminal outcome
                                         // AFTER the writer returns. The post-poll export at line ~355
                                         // will durably persist the final state.
-                                        state.CommitAttempt(result.Sent, rule, nowUtc);
+                                        state.CommitAttempt(writeOutcome, rule, nowUtc);
                                     }
                                 }
                             }
@@ -414,27 +515,110 @@ namespace SaiCont
                 error.EndsWith("(6)", StringComparison.Ordinal);
         }
 
+        private bool TryRecoverStateStore(DateTime nowUtc, ref string stateDiagnostic)
+        {
+            if (_stateStore == null || _stateStoreHealthy)
+            {
+                return true;
+            }
+
+            if (nowUtc < _stateRecoveryNotBeforeUtc)
+            {
+                stateDiagnostic = "state_store_unavailable (recovery probe rate-limited)";
+                return false;
+            }
+
+            string preflightError;
+            if (!_stateStore.TryPreflight(out preflightError))
+            {
+                // Persistent failure: stay fail-closed, reprobe later.
+                _stateRecoveryNotBeforeUtc = nowUtc.AddSeconds(30);
+                stateDiagnostic = "state_preflight_failed: " + preflightError;
+                return false;
+            }
+
+            // Reconcile durable authority: reload what survived on disk and
+            // restore those records so cooldown/suppression authority is not
+            // lost across the outage.
+            List<StateRecord> saved = _stateStore.Load(nowUtc);
+            if (_stateStore.LastLoadDisposition == StateLoadDisposition.Unavailable)
+            {
+                _stateRecoveryNotBeforeUtc = nowUtc.AddSeconds(30);
+                stateDiagnostic = "state_unavailable: " + _stateStore.LastError;
+                return false;
+            }
+            if (_stateStore.LastLoadDisposition == StateLoadDisposition.Corrupt || _stateStore.LastLoadDisposition == StateLoadDisposition.UnsupportedSchema)
+            {
+                _stateLedgerAmbiguous = true;
+            }
+            foreach (StateRecord rec in saved)
+            {
+                if (rec != null && !String.IsNullOrEmpty(rec.RuleName) && rec.ProcessId > 0 && rec.ProcessStartUtc != DateTime.MinValue && _states.Count < MaximumSessionStates)
+                {
+                    TargetRule savedRule = _configuration.Targets.FirstOrDefault(t => String.Equals(t.Name, rec.RuleName, StringComparison.Ordinal));
+                    if (savedRule == null || !String.Equals(rec.RuleSemanticFingerprint, savedRule.SemanticFingerprint, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    RetrySessionState existing;
+                    if (_states.TryGetValue(rec.CompositeKey, out existing))
+                    {
+                        continue;
+                    }
+                    var restored = new RetrySessionState();
+                    restored.RestoreFrom(rec, nowUtc);
+                    _states[rec.CompositeKey] = restored;
+                    _stateIdentities[rec.CompositeKey] = new ProcessSessionIdentity
+                    {
+                        ProcessId = rec.ProcessId,
+                        ProcessName = String.Empty,
+                        StartTimeUtc = rec.ProcessStartUtc
+                    };
+                }
+            }
+
+            _stateStoreHealthy = true;
+            _stateRecoveryNotBeforeUtc = DateTime.MinValue;
+            return true;
+        }
+
         private bool TryReadTarget(
             TargetRule rule,
             ConsoleCandidate candidate,
+            Func<bool> shouldStop,
             out ResolvedConsoleSession session,
-            out string error)
+            out string error,
+            ref IList<ProcessEntry> sharedRefreshedProcesses,
+            ref bool sharedRefreshTaken)
         {
             session = null;
             error = null;
-            ConsoleReadAttempt readAttempt = delegate(int pid, out ConsoleSnapshot s, out string e)
+            ConsoleReadAttempt readAttempt = delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e)
             {
-                return _consoleReader(pid, out s, out e);
+                return _consoleReader(pid, lineCount, out s, out e);
             };
 
-            if (ProcessDiscovery.TryResolveConsoleSession(candidate, readAttempt, out session, out error))
+            if (ProcessDiscovery.TryResolveConsoleSession(candidate, readAttempt, rule.ScanLines, out session, out error))
             {
                 return true;
             }
 
             string firstError = error;
+            if (shouldStop != null && shouldStop())
+            {
+                error = "send_blocked=stop_requested";
+                return false;
+            }
 
-            IList<ProcessEntry> fresh = _snapshotProvider();
+            // PERF-007: reuse one shared refreshed snapshot across all
+            // candidates that fail the initial read, rather than each
+            // candidate independently calling _snapshotProvider().
+            if (!sharedRefreshTaken)
+            {
+                sharedRefreshedProcesses = _snapshotProvider();
+                sharedRefreshTaken = true;
+            }
+            IList<ProcessEntry> fresh = sharedRefreshedProcesses;
             var freshById = new Dictionary<int, ProcessEntry>();
             foreach (ProcessEntry entry in fresh)
             {
@@ -463,7 +647,7 @@ namespace SaiCont
                 AttachProcessIds = freshIds
             };
 
-            if (ProcessDiscovery.TryResolveConsoleSession(freshCandidate, readAttempt, out session, out error))
+            if (ProcessDiscovery.TryResolveConsoleSession(freshCandidate, readAttempt, rule.ScanLines, out session, out error))
             {
                 return true;
             }
@@ -487,7 +671,12 @@ namespace SaiCont
             return String.Join(",", parts);
         }
 
-        private void PruneInactiveStates(DateTime nowUtc)
+        // W2-003: session lifecycle management. Retire sessions whose
+        // process has vanished from the snapshot after a conservative grace
+        // period. IdleNoEvent records older than 24h are always retired.
+        // Active/error records for vanished sessions get a shorter grace to
+        // prevent permanent capacity exhaustion.
+        private void PruneInactiveStates(DateTime nowUtc, ISet<int> livePids = null)
         {
             if (_states.Count < 100)
             {
@@ -496,11 +685,39 @@ namespace SaiCont
 
             var expiredKeys = new List<string>();
             TimeSpan maxAge = TimeSpan.FromHours(24);
+            TimeSpan vanishedGrace = TimeSpan.FromMinutes(30);
             foreach (var pair in _states)
             {
-                if (pair.Value != null && pair.Value.State == RecoveryState.IdleNoEvent && nowUtc - pair.Value.LastObservedUtc > maxAge)
+                if (pair.Value == null) continue;
+
+                // Always prune stale IdleNoEvent entries.
+                if (pair.Value.State == RecoveryState.IdleNoEvent && nowUtc - pair.Value.LastObservedUtc > maxAge)
                 {
                     expiredKeys.Add(pair.Key);
+                    continue;
+                }
+
+                // W2-003: if the session's PID has vanished from the live
+                // snapshot, retire it conservatively. Ambiguous/post-write
+                // states keep a longer grace; idle/backoff states retire sooner
+                // to free capacity for new sessions.
+                if (livePids != null)
+                {
+                    ProcessSessionIdentity identity;
+                    if (_stateIdentities.TryGetValue(pair.Key, out identity) && identity != null && identity.IsStrong)
+                    {
+                        if (!livePids.Contains(identity.ProcessId))
+                        {
+                            bool isCritical = pair.Value.State == RecoveryState.AttemptInFlightReserved ||
+                                pair.Value.State == RecoveryState.AmbiguousFailClosed ||
+                                pair.Value.State == RecoveryState.CommandWrittenAwaitingOutcome;
+                            TimeSpan grace = isCritical ? vanishedGrace : TimeSpan.FromMinutes(15);
+                            if (nowUtc - pair.Value.LastObservedUtc > grace)
+                            {
+                                expiredKeys.Add(pair.Key);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -511,6 +728,10 @@ namespace SaiCont
             }
         }
 
+        // W2-004: only evict states that are truly safe to discard.
+        // RecoveryConfirmed states carry _suppressedToken for anti-replay;
+        // states in AmbiguousFailClosed or AttemptInFlightReserved must not
+        // be evicted because discarding them can authorize a duplicate write.
         private bool TryMakeStateCapacity()
         {
             if (_states.Count < MaximumSessionStates)
@@ -522,7 +743,14 @@ namespace SaiCont
             DateTime oldestSeen = DateTime.MaxValue;
             foreach (var pair in _states)
             {
-                if (pair.Value != null && !pair.Value.Active && pair.Value.LastObservedUtc < oldestSeen)
+                if (pair.Value == null) continue;
+                if (pair.Value.Active) continue;
+                // W2-004: states with unresolved suppression or post-write
+                // ambiguity are not safe to evict.
+                if (!String.IsNullOrEmpty(pair.Value.SuppressedToken)) continue;
+                if (pair.Value.State == RecoveryState.AmbiguousFailClosed) continue;
+                if (pair.Value.State == RecoveryState.AttemptInFlightReserved) continue;
+                if (pair.Value.LastObservedUtc < oldestSeen)
                 {
                     oldestKey = pair.Key;
                     oldestSeen = pair.Value.LastObservedUtc;
@@ -550,7 +778,8 @@ namespace SaiCont
 
                 int separator = pair.Key.IndexOf(':');
                 string ruleName = separator > 0 ? pair.Key.Substring(0, separator) : String.Empty;
-                records.Add(pair.Value.Export(ruleName, identity, nowUtc));
+                TargetRule rule = _configuration.Targets.FirstOrDefault(t => String.Equals(t.Name, ruleName, StringComparison.Ordinal));
+                records.Add(pair.Value.Export(ruleName, rule, identity, nowUtc));
             }
             return records;
         }

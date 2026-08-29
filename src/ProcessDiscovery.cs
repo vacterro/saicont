@@ -90,6 +90,40 @@ namespace SaiCont
 
     internal delegate bool ConsoleReadAttempt(int processId, int lineCount, out ConsoleSnapshot snapshot, out string error);
 
+    // PERF-004: cheap membership-only check delegate. Performs AttachConsole +
+    // GetConsoleProcessList without reading screen content.
+    internal delegate bool ConsoleMembershipCheck(int processId, out IList<int> processIds, out string error);
+
+    // PERF-006: immutable index over one process snapshot, built once per
+    // poll and reused for every rule. Contains ById and normalized ByName
+    // buckets. BuildAttachCandidates already handles child discovery via
+    // ById traversal, so ChildrenByParentId is omitted.
+    internal sealed class ProcessSnapshotIndex
+    {
+        public readonly Dictionary<int, ProcessEntry> ById;
+        public readonly Dictionary<string, List<ProcessEntry>> ByName;
+
+        public ProcessSnapshotIndex(IList<ProcessEntry> processes)
+        {
+            ById = new Dictionary<int, ProcessEntry>();
+            ByName = new Dictionary<string, List<ProcessEntry>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (ProcessEntry process in processes)
+            {
+                ById[process.Id] = process;
+
+                string normalizedName = ProcessDiscovery.NormalizeName(process.Name);
+                List<ProcessEntry> nameGroup;
+                if (!ByName.TryGetValue(normalizedName, out nameGroup))
+                {
+                    nameGroup = new List<ProcessEntry>();
+                    ByName[normalizedName] = nameGroup;
+                }
+                nameGroup.Add(process);
+            }
+        }
+    }
+
     internal static class ProcessDiscovery
     {
         private const uint SnapshotProcesses = 0x00000002;
@@ -203,6 +237,43 @@ namespace SaiCont
             return candidates;
         }
 
+        // PERF-006: overload that accepts a pre-built index, eliminating
+        // redundant per-rule dictionary rebuild. The index is created once
+        // per snapshot in PollOnce and reused for every enabled rule.
+        public static IList<ConsoleCandidate> FindCandidates(
+            ProcessSnapshotIndex index,
+            ISet<string> targetNames,
+            Func<int, string, ProcessSessionIdentity> sessionResolver = null)
+        {
+            if (sessionResolver == null)
+            {
+                sessionResolver = ResolveSessionIdentity;
+            }
+
+            var candidates = new List<ConsoleCandidate>();
+            foreach (string targetName in targetNames)
+            {
+                List<ProcessEntry> matched;
+                if (!index.ByName.TryGetValue(targetName, out matched))
+                {
+                    continue;
+                }
+
+                foreach (ProcessEntry process in matched)
+                {
+                    ProcessSessionIdentity session = sessionResolver(process.Id, process.Name);
+                    candidates.Add(new ConsoleCandidate
+                    {
+                        MatchedSession = session,
+                        ParentProcessId = process.ParentId,
+                        AttachProcessIds = BuildAttachCandidates(process, index.ById)
+                    });
+                }
+            }
+
+            return candidates;
+        }
+
         public static IList<int> BuildAttachCandidates(ProcessEntry matched, IDictionary<int, ProcessEntry> byId)
         {
             var ids = new List<int>();
@@ -293,13 +364,26 @@ namespace SaiCont
             out ResolvedConsoleSession session,
             out string error)
         {
-            return TryResolveConsoleSession(candidate, read, 180, out session, out error);
+            return TryResolveConsoleSession(candidate, read, 180, null, out session, out error);
         }
 
         internal static bool TryResolveConsoleSession(
             ConsoleCandidate candidate,
             ConsoleReadAttempt read,
             int lineCount,
+            out ResolvedConsoleSession session,
+            out string error)
+        {
+            return TryResolveConsoleSession(candidate, read, lineCount, null, out session, out error);
+        }
+
+        // PERF-004: overload that accepts an optional membership checker for
+        // cheap pre-read rejection of wrong-console candidates.
+        internal static bool TryResolveConsoleSession(
+            ConsoleCandidate candidate,
+            ConsoleReadAttempt read,
+            int lineCount,
+            ConsoleMembershipCheck membershipChecker,
             out ResolvedConsoleSession session,
             out string error)
         {
@@ -314,7 +398,7 @@ namespace SaiCont
             int selectedPid;
             ConsoleSnapshot snapshot;
             string selectError;
-            if (!TrySelectConsole(candidate.AttachProcessIds, candidate.MatchedProcessId, read, lineCount, out selectedPid, out snapshot, out selectError))
+            if (!TrySelectConsole(candidate.AttachProcessIds, candidate.MatchedProcessId, read, membershipChecker, lineCount, out selectedPid, out snapshot, out selectError))
             {
                 error = selectError;
                 return false;
@@ -354,6 +438,24 @@ namespace SaiCont
             out ConsoleSnapshot snapshot,
             out string lastError)
         {
+            return TrySelectConsole(attachPids, matchedProcessId, read, null, lineCount, out selectedPid, out snapshot, out lastError);
+        }
+
+        // PERF-004: membership-first overload. When a membershipChecker is
+        // provided, wrong-console candidates are rejected via a cheap
+        // AttachConsole + GetConsoleProcessList check before the expensive
+        // per-row screen extraction. The accepted candidate still pays the
+        // full read cost.
+        internal static bool TrySelectConsole(
+            IList<int> attachPids,
+            int matchedProcessId,
+            ConsoleReadAttempt read,
+            ConsoleMembershipCheck membershipChecker,
+            int lineCount,
+            out int selectedPid,
+            out ConsoleSnapshot snapshot,
+            out string lastError)
+        {
             selectedPid = 0;
             snapshot = null;
             lastError = null;
@@ -364,6 +466,26 @@ namespace SaiCont
 
             foreach (int pid in attachPids)
             {
+                // PERF-004: when a membership checker is available, verify
+                // console membership BEFORE the expensive screen-content read.
+                // Wrong-console candidates pay zero screen-buffer I/O.
+                if (membershipChecker != null)
+                {
+                    IList<int> membershipPids;
+                    string membershipError;
+                    if (!membershipChecker(pid, out membershipPids, out membershipError))
+                    {
+                        lastError = membershipError;
+                        continue;
+                    }
+
+                    if (!ConsoleServesMatchedProcess(membershipPids, matchedProcessId))
+                    {
+                        lastError = "attached console (PID " + pid + ") does not contain matched process " + matchedProcessId;
+                        continue;
+                    }
+                }
+
                 ConsoleSnapshot attemptSnapshot;
                 string attemptError;
                 if (!read(pid, lineCount, out attemptSnapshot, out attemptError))

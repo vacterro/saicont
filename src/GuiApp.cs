@@ -4,7 +4,8 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Text;
-using System.Windows.Forms;
+using System.Windows.Forms;
+using System.Threading;
 
 namespace SaiCont
 {
@@ -96,7 +97,15 @@ namespace SaiCont
         private static readonly Font FontSecondary = new Font("Verdana", 11f, FontStyle.Regular);
         private static readonly Font FontSmall = new Font("Verdana", 10f, FontStyle.Regular);
 
-        private readonly List<PollResult> currentPollResults = new List<PollResult>();
+        private readonly List<PollResult> currentPollResults = new List<PollResult>();
+
+        // PERF-002: background polling thread.
+        private Thread _pollThread;
+        private volatile bool _pollRunning;
+        private readonly object _pollLock = new object();
+        private readonly object _resultsLock = new object();
+        private IList<PollResult> _pendingResults;
+        private volatile bool _pendingResultsReady;
 
         public SaiContGuiForm(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)
         {
@@ -490,20 +499,22 @@ namespace SaiCont
                 case SystemOperationalState.OnWatch:
                     statusLabel.Text = "Watch mode active.";
                     AppendLog("WARN", "State: ON WATCH.");
-                    RunPollCycle();
+                    StartBackgroundPoll();
                     break;
                 case SystemOperationalState.OnDryRun:
                     statusLabel.Text = "Dry-run active.";
                     AppendLog("INFO", "State: ON DRY-RUN.");
-                    RunPollCycle();
+                    StartBackgroundPoll();
                     break;
                 case SystemOperationalState.Paused:
                     statusLabel.Text = "Paused.";
                     AppendLog("INFO", "State: PAUSED.");
+                    StopBackgroundPoll();
                     break;
                 case SystemOperationalState.Disabled:
                     statusLabel.Text = "Disabled.";
                     AppendLog("WARN", "State: DISABLED.");
+                    StopBackgroundPoll();
                     break;
             }
         }
@@ -592,7 +603,22 @@ namespace SaiCont
             this.Cursor = Cursors.WaitCursor;
             try
             {
-                IList<PollResult> results = engine.PollOnce(false);
+                // PERF-002: non-blocking probe. If the background poll thread
+                // holds _pollLock, skip instead of freezing the UI thread.
+                if (!System.Threading.Monitor.TryEnter(_pollLock, 0))
+                {
+                    statusLabel.Text = "Probing skipped (poll in progress).";
+                    return;
+                }
+                IList<PollResult> results;
+                try
+                {
+                    results = engine.PollOnce(false);
+                }
+                finally
+                {
+                    System.Threading.Monitor.Exit(_pollLock);
+                }
                 UpdateSessionsList(results);
                 pollCounter++;
                 lastPollTime = DateTime.UtcNow;
@@ -655,51 +681,125 @@ namespace SaiCont
             }
         }
 
+        // PERF-002: UI timer now only drains results from the background
+        // poll thread instead of calling PollOnce() directly on the UI thread.
         private void OnPollTimerTick(object sender, EventArgs e)
         {
-            if (systemState == SystemOperationalState.OnWatch || systemState == SystemOperationalState.OnDryRun)
+            if (!_pendingResultsReady)
             {
-                RunPollCycle();
+                return;
+            }
+
+            IList<PollResult> results;
+            lock (_resultsLock)
+            {
+                results = _pendingResults;
+                _pendingResults = null;
+                _pendingResultsReady = false;
+            }
+
+            if (results == null)
+            {
+                return;
+            }
+
+            UpdateSessionsList(results);
+            pollCounter++;
+            lastPollTime = DateTime.UtcNow;
+            UpdateHeaderStats();
+
+            foreach (PollResult r in results)
+            {
+                if (r.Sent)
+                {
+                    AppendLog("SEND", "Injected to PID " + r.ProcessId + " (" + r.Target + ")");
+                }
+                else if (r.Triggered)
+                {
+                    AppendLog("MATCH", "Trigger PID " + r.ProcessId + ": " + r.Reason);
+                }
+                else if (!String.IsNullOrEmpty(r.Error))
+                {
+                    AppendLog("ERROR", "Error PID " + r.ProcessId + ": " + r.Error);
+                }
             }
         }
 
-        private void RunPollCycle()
+        // PERF-002: background poll loop runs on a dedicated thread so
+        // PollOnce() never blocks the WinForms UI thread. Results are
+        // handed to OnPollTimerTick via a lock-protected handoff.
+        private void BackgroundPollLoop()
         {
-            try
+            while (_pollRunning)
             {
-                if (shouldStop != null && shouldStop())
+                try
                 {
-                    systemState = SystemOperationalState.Disabled;
-                    pollTimer.Stop();
-                    Close();
-                    return;
-                }
-                bool allowInput = (systemState == SystemOperationalState.OnWatch);
-                IList<PollResult> results = engine.PollOnce(allowInput);
-                UpdateSessionsList(results);
-                pollCounter++;
-                lastPollTime = DateTime.UtcNow;
-                UpdateHeaderStats();
+                    if (shouldStop != null && shouldStop())
+                    {
+                        _pollRunning = false;
+                        try
+                        {
+                            this.BeginInvoke(new Action(() =>
+                            {
+                                systemState = SystemOperationalState.Disabled;
+                                pollTimer.Stop();
+                                Close();
+                            }));
+                        }
+                        catch { }
+                        return;
+                    }
 
-                foreach (PollResult r in results)
-                {
-                    if (r.Sent)
+                    bool allowInput = (systemState == SystemOperationalState.OnWatch);
+                    IList<PollResult> results;
+                    lock (_pollLock)
                     {
-                        AppendLog("SEND", "Injected to PID " + r.ProcessId + " (" + r.Target + ")");
+                        results = engine.PollOnce(allowInput);
                     }
-                    else if (r.Triggered)
+
+                    lock (_resultsLock)
                     {
-                        AppendLog("MATCH", "Trigger PID " + r.ProcessId + ": " + r.Reason);
-                    }
-                    else if (!String.IsNullOrEmpty(r.Error))
-                    {
-                        AppendLog("ERROR", "Error PID " + r.ProcessId + ": " + r.Error);
+                        _pendingResults = results;
+                        _pendingResultsReady = true;
                     }
                 }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        this.BeginInvoke(new Action(() =>
+                        {
+                            AppendLog("ERROR", "Background poll: " + ex.Message);
+                        }));
+                    }
+                    catch { }
+                }
+
+                int interval = Math.Max(500, currentConfig.PollIntervalMilliseconds);
+                Thread.Sleep(interval);
             }
-            catch (Exception ex)
+        }
+
+        private void StartBackgroundPoll()
+        {
+            if (_pollThread != null && _pollThread.IsAlive)
             {
-                AppendLog("ERROR", "Poll cycle: " + ex.Message);
+                return;
+            }
+            _pollRunning = true;
+            _pollThread = new Thread(BackgroundPollLoop);
+            _pollThread.IsBackground = true;
+            _pollThread.Name = "SAICONT-PollWorker";
+            _pollThread.Start();
+        }
+
+        private void StopBackgroundPoll()
+        {
+            _pollRunning = false;
+            if (_pollThread != null)
+            {
+                _pollThread.Join(3000);
+                _pollThread = null;
             }
         }
 
@@ -874,6 +974,7 @@ namespace SaiCont
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
+            StopBackgroundPoll();
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;

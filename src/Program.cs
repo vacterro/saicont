@@ -1758,6 +1758,51 @@ namespace SaiCont
             failures += AssertEqual(false, disappearedResult, "unreadable candidate correctly reports failure");
             failures += AssertEqual(true, disappearedError != null && disappearedError.IndexOf("The handle is invalid (6)", StringComparison.Ordinal) >= 0, "unreadable candidate error retained");
 
+            // PERF-006: ProcessSnapshotIndex reuses one index across rules.
+            var idxProcesses = new List<ProcessEntry>
+            {
+                new ProcessEntry { Id = 200, ParentId = 1, Name = "powershell.exe" },
+                new ProcessEntry { Id = 201, ParentId = 200, Name = "node.exe" },
+                new ProcessEntry { Id = 202, ParentId = 201, Name = "cline.exe" }
+            };
+            var snapshotIndex = new ProcessSnapshotIndex(idxProcesses);
+            failures += AssertEqual(3, snapshotIndex.ById.Count, "index ById contains all processes");
+            failures += AssertEqual(true, snapshotIndex.ByName.ContainsKey("powershell"), "index ByName has powershell");
+            failures += AssertEqual(true, snapshotIndex.ByName.ContainsKey("cline"), "index ByName has cline");
+            failures += AssertEqual(1, snapshotIndex.ByName["cline"].Count, "index ByName cline has one entry");
+            var idxTargetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "cline" };
+            var idxCandidates = ProcessDiscovery.FindCandidates(snapshotIndex, idxTargetNames);
+            failures += AssertEqual(1, idxCandidates.Count, "index FindCandidates finds one cline");
+            failures += AssertEqual(202, idxCandidates[0].MatchedProcessId, "index FindCandidates matched PID 202");
+            failures += AssertEqual(true, idxCandidates[0].AttachProcessIds.Count >= 2, "index FindCandidates has attach chain");
+
+            OK            // PERF-004: membership-first path. Wrong-console candidates are
+            // rejected via cheap AttachConsole+GetConsoleProcessList before
+            // the expensive per-row screen extraction.
+            int mfReadCount = 0;
+            int mfPid;
+            ConsoleSnapshot mfSnap;
+            string mfErr;
+            bool mfOk = ProcessDiscovery.TrySelectConsole(attachList, 62,
+                delegate(int pid, int lc, out ConsoleSnapshot s, out string e)
+                {
+                    mfReadCount++;
+                    s = new ConsoleSnapshot { ConsoleProcessIds = new[] { 62 } };
+                    e = null;
+                    return true;
+                },
+                delegate(int pid, out IList<int> pids, out string err)
+                {
+                    if (pid == 70) { pids = new[] { 63 }; err = null; return true; }
+                    pids = new[] { 62 };
+                    err = null;
+                    return true;
+                },
+                180, out mfPid, out mfSnap, out mfErr);
+            failures += AssertEqual(true, mfOk, "membership-first accepts correct candidate");
+            failures += AssertEqual(1, mfReadCount, "membership-first reads only accepted candidate");
+            failures += AssertEqual(71, mfPid, "membership-first selects PID 71");
+
             var emptyReads = new List<PollResult>();
             int probeReadable;
             int probeUnreadable;
@@ -2620,6 +2665,175 @@ namespace SaiCont
             failures += AssertEqual(true, soakEngine.SessionStateCount <= 1, "accelerated soak keeps watcher session state bounded");
             failures += AssertEqual(true, memoryAfterSoak - memoryBeforeSoak < 16L * 1024L * 1024L, "accelerated soak managed-memory growth stays below 16 MiB");
             Console.WriteLine("MEASURE: soak polls=" + SoakPolls + " elapsed_ms=" + soakTimer.ElapsedMilliseconds + " managed_delta_bytes=" + (memoryAfterSoak - memoryBeforeSoak));
+            // PERF-010: Enhanced performance gates — controlled scenario budgets.
+
+            // Gate 1: Poll-cycle timing. A single idle poll (no target found)
+            // must complete well within the 2-second production cadence.
+            {
+                var perfConfig = new WatcherConfiguration
+                {
+                    PollIntervalMilliseconds = 2000,
+                    Targets = new List<TargetRule>
+                    {
+                        new TargetRule
+                        {
+                            Name = "perf-idle",
+                            Enabled = true,
+                            ProcessNames = new[] { "saicont-no-such-process" },
+                            Command = "cc",
+                            ScanLines = 180,
+                            MaximumTriggerDistanceLines = 150,
+                            InitialDelaySeconds = 60,
+                            RetryIntervalSeconds = 60,
+                            ParseRetryTime = false,
+                            TriggerPatterns = new[] { @"(?i)never-match" },
+                            ReadyPatterns = new[] { @"^ready$" },
+                            BusyPatterns = new string[0]
+                        }
+                    }
+                };
+                var perfEngine = new WatcherEngine(
+                    perfConfig,
+                    delegate { return new List<ProcessEntry>(); },
+                    delegate(int pid, string name) { return new ProcessSessionIdentity { ProcessId = pid, ProcessName = name, StartTimeUtc = DateTime.MinValue }; },
+                    delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e) { s = null; e = "no real console"; return false; },
+                    delegate(ResolvedConsoleSession sess, ProcessSessionIdentity exp, string cmd, out string e) { e = null; return NativeWriteOutcome.NoInputCommitted; },
+                    delegate { return DateTime.UtcNow; });
+
+                const int PerfPolls = 1000;
+                Stopwatch perfTimer = Stopwatch.StartNew();
+                for (int i = 0; i < PerfPolls; i++)
+                {
+                    perfEngine.PollOnce(false);
+                }
+                perfTimer.Stop();
+                double avgPollMs = (double)perfTimer.ElapsedMilliseconds / PerfPolls;
+                failures += AssertEqual(true, avgPollMs < 50.0, "PERF-010: average idle poll < 50ms (actual=" + avgPollMs.ToString("F2") + "ms)");
+                Console.WriteLine("MEASURE: perf_poll avg_ms=" + avgPollMs.ToString("F2") + " total_ms=" + perfTimer.ElapsedMilliseconds);
+            }
+
+            // Gate 2: Multi-rule scaling. Five rules targeting the same process
+            // must produce exactly five writes and keep state bounded.
+            {
+                var multiRuleTargets = new List<TargetRule>();
+                for (int r = 0; r < 5; r++)
+                {
+                    multiRuleTargets.Add(new TargetRule
+                    {
+                        Name = "multi-" + r,
+                        Enabled = true,
+                        ProcessNames = new[] { "codex" },
+                        Command = "cc",
+                        ScanLines = 180,
+                        MaximumTriggerDistanceLines = 150,
+                        InitialDelaySeconds = 5,
+                        RetryIntervalSeconds = 10,
+                        ParseRetryTime = false,
+                        TriggerPatterns = new[] { @"(?i)rate limited" },
+                        ReadyPatterns = new[] { @"^.*Ask.*$" },
+                        BusyPatterns = new[] { @"(?i)working" }
+                    });
+                }
+                var multiConfig = new WatcherConfiguration
+                {
+                    PollIntervalMilliseconds = 2000,
+                    Targets = multiRuleTargets
+                };
+
+                int multiWriteCount = 0;
+                DateTime multiClock = new DateTime(2026, 8, 26, 10, 0, 0, DateTimeKind.Utc);
+                var multiEngine = new WatcherEngine(
+                    multiConfig,
+                    delegate { return new[] { new ProcessEntry { Id = 9001, ParentId = 100, Name = "codex" } }; },
+                    delegate(int pid, string name) { return new ProcessSessionIdentity { ProcessId = pid, ProcessName = name, StartTimeUtc = new DateTime(2026, 8, 26, 9, 0, 0, DateTimeKind.Utc) }; },
+                    delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e)
+                    {
+                        s = new ConsoleSnapshot
+                        {
+                            ProcessId = pid,
+                            Text = "Rate limited\nAsk anything",
+                            CursorLine = "Ask anything",
+                            ConsoleProcessIds = new[] { pid },
+                            StartRow = 0,
+                            CursorRow = 1,
+                            MembershipStatus = ConsoleMembershipStatus.VerifiedPresent
+                        };
+                        e = null;
+                        return true;
+                    },
+                    delegate(ResolvedConsoleSession sess, ProcessSessionIdentity exp, string cmd, out string e)
+                    {
+                        multiWriteCount++;
+                        e = null;
+                        return NativeWriteOutcome.CompleteInputCommitted;
+                    },
+                    delegate { return multiClock; });
+
+                // First poll: triggers detected, initial delay starts.
+                multiEngine.PollOnce(true);
+                // Second poll: delay elapsed, sends fire.
+                multiClock = multiClock.AddSeconds(10);
+                multiEngine.PollOnce(true);
+
+                failures += AssertEqual(5, multiWriteCount, "PERF-010: five rules produce exactly five writes");
+                failures += AssertEqual(true, multiEngine.SessionStateCount <= 5, "PERF-010: multi-rule state bounded by rule count");
+                Console.WriteLine("MEASURE: perf_multi rules=5 writes=" + multiWriteCount + " states=" + multiEngine.SessionStateCount);
+            }
+
+            // Gate 3: Memory scaling. A 10,000-poll idle run with a larger
+            // process snapshot must not leak managed memory.
+            {
+                var bigSnapshot = new List<ProcessEntry>();
+                for (int p = 0; p < 500; p++)
+                {
+                    bigSnapshot.Add(new ProcessEntry { Id = 10000 + p, ParentId = 1, Name = "process-" + p + ".exe" });
+                }
+                var memConfig = new WatcherConfiguration
+                {
+                    PollIntervalMilliseconds = 2000,
+                    Targets = new List<TargetRule>
+                    {
+                        new TargetRule
+                        {
+                            Name = "mem-idle",
+                            Enabled = true,
+                            ProcessNames = new[] { "saicont-no-such-process" },
+                            Command = "cc",
+                            ScanLines = 180,
+                            MaximumTriggerDistanceLines = 150,
+                            InitialDelaySeconds = 60,
+                            RetryIntervalSeconds = 60,
+                            ParseRetryTime = false,
+                            TriggerPatterns = new[] { @"(?i)never-match" },
+                            ReadyPatterns = new[] { @"^ready$" },
+                            BusyPatterns = new string[0]
+                        }
+                    }
+                };
+                var memEngine = new WatcherEngine(
+                    memConfig,
+                    delegate { return bigSnapshot; },
+                    delegate(int pid, string name) { return new ProcessSessionIdentity { ProcessId = pid, ProcessName = name, StartTimeUtc = DateTime.MinValue }; },
+                    delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e) { s = null; e = "no real console"; return false; },
+                    delegate(ResolvedConsoleSession sess, ProcessSessionIdentity exp, string cmd, out string e) { e = null; return NativeWriteOutcome.NoInputCommitted; },
+                    delegate { return DateTime.UtcNow; });
+
+                const int MemPolls = 10000;
+                GC.Collect();
+                long memBefore = GC.GetTotalMemory(true);
+                Stopwatch memTimer = Stopwatch.StartNew();
+                for (int i = 0; i < MemPolls; i++)
+                {
+                    memEngine.PollOnce(false);
+                }
+                memTimer.Stop();
+                GC.Collect();
+                long memAfter = GC.GetTotalMemory(true);
+                long memDelta = memAfter - memBefore;
+                failures += AssertEqual(true, memDelta < 8L * 1024L * 1024L, "PERF-010: 10K-poll memory growth < 8 MiB (actual=" + memDelta + " bytes)");
+                Console.WriteLine("MEASURE: perf_mem polls=" + MemPolls + " elapsed_ms=" + memTimer.ElapsedMilliseconds + " managed_delta_bytes=" + memDelta);
+            }
+
 
             // Wave 7: XML Parser DTD Prohibited Security Test
             string dtdTestDir = Path.Combine(Path.GetTempPath(), "SAICONT-dtd-test-" + Guid.NewGuid().ToString("N"));

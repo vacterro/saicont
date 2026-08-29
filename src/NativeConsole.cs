@@ -529,6 +529,46 @@ namespace SaiCont
             }
         }
 
+        // PERF-004: cheap membership-only check. Performs AttachConsole +
+        // GetConsoleProcessList without reading screen content. Used by
+        // TrySelectConsole to reject wrong-console candidates before the
+        // expensive per-row screen extraction.
+        public static bool TryCheckMembership(int processId, out IList<int> processIds, out string error)
+        {
+            processIds = null;
+            error = null;
+
+            lock (ConsoleLock)
+            {
+                FreeConsole();
+                if (!AttachConsole((uint)processId))
+                {
+                    error = Win32Error("AttachConsole", processId);
+                    TryRestoreHostConsole();
+                    return false;
+                }
+
+                try
+                {
+                    IList<int> clients;
+                    string membershipError;
+                    if (!TryGetConsoleProcessList(out clients, out membershipError))
+                    {
+                        error = membershipError;
+                        return false;
+                    }
+
+                    processIds = clients;
+                    return true;
+                }
+                finally
+                {
+                    FreeConsole();
+                    TryRestoreHostConsole();
+                }
+            }
+        }
+
         internal static bool IsCompleteInputWrite(uint expectedRecords, uint writtenRecords)
         {
             return expectedRecords > 0 && writtenRecords == expectedRecords;

@@ -27,9 +27,7 @@ namespace SaiCont
         public string Error;
         public string TriggerToken;
         public DateTime NextAttemptUtc;
-    }
-
-    internal delegate NativeWriteOutcome VerifiedConsoleWriter(
+    }        internal delegate NativeWriteOutcome VerifiedConsoleWriter(
         ResolvedConsoleSession session,
         ProcessSessionIdentity expectedTarget,
         string command,
@@ -47,6 +45,7 @@ namespace SaiCont
         private readonly VerifiedConsoleWriter _verifiedWriter;
         private readonly Func<DateTime> _clock;
         private readonly DurableStateStore _stateStore;
+        private readonly ConsoleMembershipCheck _membershipChecker;
         private bool _stateLoaded;
         private bool _stateStoreHealthy = true;
         private bool _stateLedgerAmbiguous;
@@ -60,6 +59,7 @@ namespace SaiCont
                 ProcessDiscovery.Snapshot,
                 ProcessDiscovery.ResolveSessionIdentity,
                 delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e) { return NativeConsole.TryRead(pid, lineCount, out s, out e); },
+                delegate(int pid, out IList<int> pids, out string err) { return NativeConsole.TryCheckMembership(pid, out pids, out err); },
                 NativeConsole.TryWriteLineVerified,
                 delegate { return DateTime.UtcNow; },
                 stateStore)
@@ -74,11 +74,25 @@ namespace SaiCont
             VerifiedConsoleWriter verifiedWriter,
             Func<DateTime> clock,
             DurableStateStore stateStore = null)
+            : this(configuration, snapshotProvider, sessionResolver, consoleReader, null, verifiedWriter, clock, stateStore)
+        {
+        }
+
+        public WatcherEngine(
+            WatcherConfiguration configuration,
+            Func<IList<ProcessEntry>> snapshotProvider,
+            Func<int, string, ProcessSessionIdentity> sessionResolver,
+            ConsoleReadAttempt consoleReader,
+            ConsoleMembershipCheck membershipChecker,
+            VerifiedConsoleWriter verifiedWriter,
+            Func<DateTime> clock,
+            DurableStateStore stateStore = null)
         {
             _configuration = configuration;
             _snapshotProvider = snapshotProvider ?? ProcessDiscovery.Snapshot;
             _sessionResolver = sessionResolver ?? ProcessDiscovery.ResolveSessionIdentity;
             _consoleReader = consoleReader ?? (delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e) { return NativeConsole.TryRead(pid, lineCount, out s, out e); });
+            _membershipChecker = membershipChecker;
             _verifiedWriter = verifiedWriter ?? NativeConsole.TryWriteLineVerified;
             _clock = clock ?? (delegate { return DateTime.UtcNow; });
             _stateStore = stateStore;
@@ -182,6 +196,11 @@ namespace SaiCont
 
             var reservedConsoles = new HashSet<string>(StringComparer.Ordinal);
 
+            // PERF-006: build one immutable index over the process snapshot
+            // and reuse it for every enabled rule, avoiding redundant per-rule
+            // dictionary reconstruction.
+            ProcessSnapshotIndex snapshotIndex = processes != null ? new ProcessSnapshotIndex(processes) : null;
+
             foreach (TargetRule rule in _configuration.Targets)
             {
                 if (shouldStop != null && shouldStop())
@@ -201,7 +220,11 @@ namespace SaiCont
                     targetNameSet = rule.ProcessNameSet;
                 }
 
-                IList<ConsoleCandidate> candidates = ProcessDiscovery.FindCandidates(processes, targetNameSet, _sessionResolver);
+                // PERF-006: use the pre-built index when available; fall back
+                // to per-call construction only when the snapshot failed.
+                IList<ConsoleCandidate> candidates = snapshotIndex != null
+                    ? ProcessDiscovery.FindCandidates(snapshotIndex, targetNameSet, _sessionResolver)
+                    : ProcessDiscovery.FindCandidates(processes, targetNameSet, _sessionResolver);
 
                 // PERF-007: share one refreshed snapshot across all candidates
                 // that fail the initial read, instead of each candidate taking
@@ -358,7 +381,8 @@ namespace SaiCont
                         {
                             // Transactional pre-send re-resolution
                             IList<ProcessEntry> freshProcesses = _snapshotProvider();
-                            IList<ConsoleCandidate> freshCandidates = ProcessDiscovery.FindCandidates(freshProcesses, targetNameSet, _sessionResolver);
+                            ProcessSnapshotIndex freshIndex = new ProcessSnapshotIndex(freshProcesses);
+                            IList<ConsoleCandidate> freshCandidates = ProcessDiscovery.FindCandidates(freshIndex, targetNameSet, _sessionResolver);
                             ConsoleCandidate freshTarget = null;
                             foreach (ConsoleCandidate fc in freshCandidates)
                             {
@@ -598,7 +622,7 @@ namespace SaiCont
                 return _consoleReader(pid, lineCount, out s, out e);
             };
 
-            if (ProcessDiscovery.TryResolveConsoleSession(candidate, readAttempt, rule.ScanLines, out session, out error))
+            if (ProcessDiscovery.TryResolveConsoleSession(candidate, readAttempt, rule.ScanLines, _membershipChecker, out session, out error))
             {
                 return true;
             }
@@ -647,7 +671,7 @@ namespace SaiCont
                 AttachProcessIds = freshIds
             };
 
-            if (ProcessDiscovery.TryResolveConsoleSession(freshCandidate, readAttempt, rule.ScanLines, out session, out error))
+            if (ProcessDiscovery.TryResolveConsoleSession(freshCandidate, readAttempt, rule.ScanLines, _membershipChecker, out session, out error))
             {
                 return true;
             }

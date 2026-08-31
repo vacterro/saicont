@@ -140,6 +140,7 @@ namespace SaiCont
             try { origCursorVisible = Console.CursorVisible; } catch { }
 
             bool interruptRequested = false;
+            bool ctrlHandlerOk = false;
                         NativeConsole.ConsoleCtrlHandler interruptHandler = delegate(int controlType)
             {
                 interruptRequested = true;
@@ -169,7 +170,11 @@ namespace SaiCont
 
             var logs = new List<TuiLogEntry>();
             var latestSessions = new List<PollResult>();
-            var engine = new WatcherEngine(configuration, stateStore);
+            WatcherEngine engine = new WatcherEngine(configuration, stateStore);
+            object pollSync = new object();
+            bool pollInFlight = false;
+            IList<PollResult> pendingPollResults = null;
+            int pollGeneration = 0;
             int pollCounter = 0;
             DateTime lastPollTime = DateTime.MinValue;
             long nextPollDueTicks = Stopwatch.GetTimestamp();
@@ -188,6 +193,38 @@ namespace SaiCont
             int lastRenderedLogScroll = -1;
             int lastRenderedSessionCount = -1;
             DateTime lastFullRenderUtc = DateTime.MinValue;
+            Thread livePollWorker = null;
+            Action<bool> requestPoll = delegate(bool allowInput)
+            {
+                lock (pollSync)
+                {
+                    if (pollInFlight) return;
+                    pollInFlight = true;
+                    int generation = pollGeneration;
+                    WatcherEngine pollEngine = engine;
+                    Thread worker = new Thread((ThreadStart)delegate
+                    {
+                        IList<PollResult> results;
+                        try
+                        {
+                            results = pollEngine.PollOnce(allowInput, delegate { return interruptRequested || (stopPredicate != null && stopPredicate()) || generation != pollGeneration; });
+                        }
+                        catch (Exception pollException)
+                        {
+                            results = new List<PollResult> { new PollResult { Target = "runtime", Error = pollException.Message, Reason = "poll failed" } };
+                        }
+                        lock (pollSync)
+                        {
+                            if (generation == pollGeneration) pendingPollResults = results;
+                            pollInFlight = false;
+                            livePollWorker = null;
+                        }
+                    });
+                    worker.IsBackground = true;
+                    livePollWorker = worker;
+                    worker.Start();
+                }
+            };
 
             try
             {
@@ -202,8 +239,7 @@ namespace SaiCont
 
                 try
                 {
-                    latestSessions = new List<PollResult>(engine.PollOnce(false));
-                    pollCounter++;
+                    requestPoll(false);
                     lastPollTime = DateTime.UtcNow;
                     nextPollDueTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * Math.Max(500, configuration.PollIntervalMilliseconds) / 1000;
                     AddLog(logs, "INFO", "system", 0, "SAICONT TUI started with " + configuration.Targets.Count + " target rules.");
@@ -218,11 +254,12 @@ namespace SaiCont
                 }
 
                 bool running = true;
-            if (!NativeConsole.TrySetCtrlHandler(interruptHandler))
-            {
-                AddLog(logs, "ERROR", "system", 0, "Console interrupt handler registration failed.");
-            }
-                while (running)
+                ctrlHandlerOk = NativeConsole.TrySetCtrlHandler(interruptHandler);
+                if (!ctrlHandlerOk)
+                {
+                    AddLog(logs, "ERROR", "system", 0, "Console interrupt handler registration failed; refusing live TUI without deterministic Ctrl+C shutdown.");
+                }
+                while (running && ctrlHandlerOk)
                 {
                     if (interruptRequested || (stopPredicate != null && stopPredicate()))
                     {
@@ -231,6 +268,20 @@ namespace SaiCont
                     }
 
                     DateTime now = DateTime.UtcNow;
+                    IList<PollResult> completedPoll = null;
+                    lock (pollSync)
+                    {
+                        completedPoll = pendingPollResults;
+                        pendingPollResults = null;
+                    }
+                    if (completedPoll != null)
+                    {
+                        latestSessions = new List<PollResult>(completedPoll);
+                        pollCounter++;
+                        lastPollTime = now;
+                        dirtyRender = true;
+                        foreach (PollResult r in completedPoll) AddLogFromPoll(logs, r);
+                    }
 
                     if (mode == TuiMode.Watch || mode == TuiMode.DryRun)
                     {
@@ -239,28 +290,8 @@ namespace SaiCont
                         if (nowTicks >= nextPollDueTicks)
                         {
                             bool allowInput = (mode == TuiMode.Watch);
-                            IList<PollResult> results;
-                            try
-                            {
-                                results = engine.PollOnce(allowInput);
-                            }
-                            catch (Exception pollException)
-                            {
-                                AddLog(logs, "ERROR", "system", 0, "Poll failed: " + pollException.Message);
-                                results = new List<PollResult>();
-                            }
-                            latestSessions = new List<PollResult>(results);
-                            pollCounter++;
-                            lastPollTime = now;
-                            dirtyRender = true;
+                            requestPoll(allowInput);
                             nextPollDueTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * interval / 1000;
-                            if (results.Count > 0)
-                            {
-                                foreach (PollResult r in results)
-                                {
-                                    AddLogFromPoll(logs, r);
-                                }
-                            }
                         }
                     }
 
@@ -357,6 +388,7 @@ namespace SaiCont
                                     case ConsoleKey.Q:
                                     case ConsoleKey.Escape:
                                         running = false;
+                                        Interlocked.Increment(ref pollGeneration);
                                         dirtyRender = true;
                                         break;
 
@@ -469,11 +501,9 @@ namespace SaiCont
                                         break;
 
                                     case ConsoleKey.P:
-                                        statusMessage = "Executing single PROBE pass...";
-                                        latestSessions = new List<PollResult>(engine.PollOnce(false));
-                                        pollCounter++;
-                                        lastPollTime = DateTime.UtcNow;
-                                        dirtyRender = true;
+                                         statusMessage = "Executing single PROBE pass...";
+                                         requestPoll(false);
+                                         dirtyRender = true;
                                         if (selectedSessionIndex >= latestSessions.Count) selectedSessionIndex = Math.Max(0, latestSessions.Count - 1);
                                         statusMessage = "Probe complete: " + latestSessions.Count + " sessions evaluated.";
                                         foreach (PollResult r in latestSessions)
@@ -486,8 +516,9 @@ namespace SaiCont
                                         dirtyRender = true;
                                         if (mode == TuiMode.DryRun)
                                         {
-                                            mode = TuiMode.Idle;
-                                            statusMessage = "Dry-run stopped. In IDLE mode.";
+                                             mode = TuiMode.Idle;
+                                             Interlocked.Increment(ref pollGeneration);
+                                             statusMessage = "Dry-run stopped. In IDLE mode.";
                                             AddLog(logs, "INFO", "operator", 0, "Dry-run stopped.");
                                         }
                                         else
@@ -502,8 +533,9 @@ namespace SaiCont
                                         dirtyRender = true;
                                         if (mode == TuiMode.Watch)
                                         {
-                                            mode = TuiMode.Idle;
-                                            statusMessage = "Watch mode paused. In IDLE mode.";
+                                             mode = TuiMode.Idle;
+                                             Interlocked.Increment(ref pollGeneration);
+                                             statusMessage = "Watch mode paused. In IDLE mode.";
                                             AddLog(logs, "INFO", "operator", 0, "Watch mode stopped.");
                                         }
                                         else
@@ -513,8 +545,9 @@ namespace SaiCont
                                         }
                                         break;
 
-                                    case ConsoleKey.S:
-                                        mode = TuiMode.Idle;
+                                     case ConsoleKey.S:
+                                         mode = TuiMode.Idle;
+                                         Interlocked.Increment(ref pollGeneration);
                                         confirmWatch = false;
                                         statusMessage = "Stopped. In IDLE mode.";
                                         AddLog(logs, "INFO", "operator", 0, "Monitoring stopped.");
@@ -525,8 +558,9 @@ namespace SaiCont
                                         dirtyRender = true;
                                         try
                                         {
-                                            configuration = WatcherConfiguration.Load(configPath);
-                                            engine = new WatcherEngine(configuration, stateStore);
+                                             configuration = WatcherConfiguration.Load(configPath);
+                                             Interlocked.Increment(ref pollGeneration);
+                                             engine = new WatcherEngine(configuration, stateStore);
                                             statusMessage = "Config reloaded successfully (" + configuration.Targets.Count + " targets).";
                                             AddLog(logs, "INFO", "config", 0, "Configuration reloaded from " + Path.GetFileName(configPath));
                                         }
@@ -574,6 +608,15 @@ namespace SaiCont
             }
             finally
             {
+                // W2-001: invalidate any in-flight poll and join the worker
+                // before the lifecycle owner releases the mutex/instance.
+                Interlocked.Increment(ref pollGeneration);
+                Thread joiner;
+                lock (pollSync) { joiner = livePollWorker; }
+                if (joiner != null)
+                {
+                    try { joiner.Join(5000); } catch { }
+                }
                 NativeConsole.UnsetCtrlHandler();
                 try { Console.CursorVisible = origCursorVisible; } catch { }
                 try { Console.ForegroundColor = origFg; } catch { }
@@ -581,7 +624,7 @@ namespace SaiCont
                 try { Console.Clear(); } catch { }
             }
 
-            return 0;
+            return ctrlHandlerOk ? 0 : 4;
         }
 
         private static void RenderTui(

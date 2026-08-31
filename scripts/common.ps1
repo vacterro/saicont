@@ -42,6 +42,38 @@ function Get-SaiContProcessState {
     return [pscustomobject]@{ Disposition = 'UNVERIFIABLE'; Process = $candidate; Error = 'Live process exists but identity metadata cannot be verified.' }
 }
 
+function Enter-SaiContLifecycleLock {
+    $mutex = New-Object System.Threading.Mutex($false, 'Global\SAICONT_LifecycleOperations')
+    if (-not $mutex.WaitOne(10000)) {
+        $mutex.Dispose()
+        throw 'Could not acquire SAICONT lifecycle operation lock.'
+    }
+    return $mutex
+}
+
+function Exit-SaiContLifecycleLock {
+    param([Parameter(Mandatory = $true)][System.Threading.Mutex]$Mutex)
+    try { $Mutex.ReleaseMutex() } catch { }
+    $Mutex.Dispose()
+}
+
+function Remove-SaiContArtifactsIfOwned {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Paths,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][DateTime]$ProcessStartUtc,
+        [Parameter(Mandatory = $true)][string]$InstanceToken
+    )
+    $current = Get-SaiContProcess -Paths $Paths
+    if ($null -eq $current -or $current.Id -ne $ProcessId -or
+        $current.InstanceStartUtc -ne $ProcessStartUtc -or
+        -not [String]::Equals([string]$current.InstanceToken, $InstanceToken, [StringComparison]::Ordinal)) {
+        return $false
+    }
+    Remove-Item -LiteralPath $Paths.PidFile,$Paths.InstanceFile,$Paths.StopFile -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
 function Get-SaiContProcess {
     param(
         [Parameter(Mandatory = $true)]
@@ -97,7 +129,7 @@ function Get-SaiContProcess {
         if ($recordedPid -ne $candidate.Id -or
             [String]::IsNullOrWhiteSpace($instanceToken) -or
             -not [String]::Equals($expectedPath, $recordedPath, [StringComparison]::OrdinalIgnoreCase) -or
-            [Math]::Abs(($actualStart - $expectedStart).TotalMilliseconds) -gt 1000) {
+            $actualStart.Ticks -ne $expectedStart.Ticks) {
             return $null
         }
     }

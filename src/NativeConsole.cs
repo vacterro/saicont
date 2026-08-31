@@ -161,23 +161,32 @@ namespace SaiCont
                         int startRow = Math.Max(0, endRow - cappedLines + 1);
                         var lines = new List<string>(endRow - startRow + 1);
                         string cursorLine = String.Empty;
-                        var rowBuffer = new StringBuilder(width);
+                        const int rowsPerRead = 64;
 
-                        for (int row = startRow; row <= endRow; row++)
+                        for (int blockStart = startRow; blockStart <= endRow; blockStart += rowsPerRead)
                         {
-                            rowBuffer.Length = 0;
+                            int blockRows = Math.Min(rowsPerRead, endRow - blockStart + 1);
+                            int blockCharacters = blockRows * width;
+                            var blockBuffer = new StringBuilder(blockCharacters);
                             uint charsRead;
-                            if (!ReadConsoleOutputCharacterW(output, rowBuffer, (uint)width, new Coord(0, (short)row), out charsRead))
+                            if (!ReadConsoleOutputCharacterW(output, blockBuffer, (uint)blockCharacters, new Coord(0, (short)blockStart), out charsRead))
                             {
                                 error = Win32Error("ReadConsoleOutputCharacter", processId);
                                 return false;
                             }
 
-                            string line = rowBuffer.ToString(0, (int)charsRead).TrimEnd('\0', ' ');
-                            lines.Add(line);
-                            if (row == endRow)
+                            int available = Math.Min((int)charsRead, blockCharacters);
+                            for (int rowOffset = 0; rowOffset < blockRows; rowOffset++)
                             {
-                                cursorLine = line;
+                                int rowStart = rowOffset * width;
+                                int rowLength = Math.Max(0, Math.Min(width, available - rowStart));
+                                string line = rowLength == 0 ? String.Empty : blockBuffer.ToString(rowStart, rowLength).TrimEnd('\0', ' ');
+                                int row = blockStart + rowOffset;
+                                lines.Add(line);
+                                if (row == endRow)
+                                {
+                                    cursorLine = line;
+                                }
                             }
                         }
 
@@ -392,7 +401,8 @@ namespace SaiCont
                         };
                         string currentConsoleId = ProcessDiscovery.ComputeStableConsoleId(
                             currentIdentitySnapshot,
-                            session.ResolvedAttachProcessId);
+                            session.ResolvedAttachProcessId,
+                            expectedMatchedSession.ProcessId);
                         if (!String.Equals(currentConsoleId, session.StableConsoleId, StringComparison.Ordinal))
                         {
                             error = "send_blocked=console_changed";
@@ -723,15 +733,23 @@ namespace SaiCont
         // the next AttachConsole call. Either state is strictly better than the
         // previous FreeConsole-only behavior, which left the TUI's host console
         // destroyed for every poll.
-        private static void TryRestoreHostConsole()
+        private static bool TryRestoreHostConsole()
         {
             try
             {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                if (!AttachConsole(ATTACH_PARENT_PROCESS) && Marshal.GetLastWin32Error() != 5)
+                {
+                    return false;
+                }
+                if (_activeCtrlHandler != null && !SetConsoleCtrlHandler(_activeCtrlHandler, true))
+                {
+                    return false;
+                }
+                return true;
             }
             catch
             {
-                // best-effort; never throw from a restore path
+                return false;
             }
         }
 

@@ -50,6 +50,14 @@ namespace SaiCont
         private bool _stateStoreHealthy = true;
         private bool _stateLedgerAmbiguous;
         private DateTime _stateRecoveryNotBeforeUtc = DateTime.MinValue;
+        // PERF-004: track durable-state mutations per RetrySessionState
+        // (IsDurableDirty) to skip full rebuild when no safety-relevant
+        // change happened, while keeping a bounded checkpoint cadence for
+        // LastObservedUtc retention semantics.
+        private DateTime _lastDurableCheckpointUtc = DateTime.MinValue;
+        private Dictionary<string, TargetRule> _ruleByName;
+        private bool _ruleByNameValid;
+        private const int DurableCheckpointIntervalSeconds = 60;
 
         internal int SessionStateCount { get { return _states.Count; } }
 
@@ -142,9 +150,10 @@ namespace SaiCont
                     stateDiagnostic = "state_preflight_failed: " + preflightError;
                 }
                 List<StateRecord> saved = _stateStore.Load(nowUtc);
+                InvalidateRuleCache();
                 foreach (StateRecord rec in saved)
                 {
-                    TargetRule savedRule = rec == null ? null : _configuration.Targets.FirstOrDefault(t => String.Equals(t.Name, rec.RuleName, StringComparison.Ordinal));
+                    TargetRule savedRule = rec == null ? null : LookupRule(rec.RuleName);
                     if (rec != null && savedRule != null && String.Equals(rec.RuleSemanticFingerprint, savedRule.SemanticFingerprint, StringComparison.Ordinal) && rec.ProcessId > 0 && rec.ProcessStartUtc != DateTime.MinValue && _states.Count < MaximumSessionStates)
                     {
                         var s = new RetrySessionState();
@@ -230,8 +239,9 @@ namespace SaiCont
                 // that fail the initial read, instead of each candidate taking
                 // an independent snapshot.  Only one refresh is performed per
                 // rule even when many candidates fail.
-                IList<ProcessEntry> sharedRefreshedProcesses = null;
-                bool sharedRefreshTaken = false;
+                 IList<ProcessEntry> sharedRefreshedProcesses = null;
+                 ProcessSnapshotIndex sharedRefreshedIndex = null;
+                 bool sharedRefreshTaken = false;
 
                 foreach (ConsoleCandidate candidate in candidates)
                 {
@@ -247,7 +257,7 @@ namespace SaiCont
                     }
                     ResolvedConsoleSession resolvedConsole;
                     string readError;
-                    if (!TryReadTarget(rule, candidate, shouldStop, out resolvedConsole, out readError, ref sharedRefreshedProcesses, ref sharedRefreshTaken))
+                    if (!TryReadTarget(rule, candidate, shouldStop, out resolvedConsole, out readError, ref sharedRefreshedProcesses, ref sharedRefreshedIndex, ref sharedRefreshTaken))
                     {
                         if (IsNonConsoleDiscoveryFailure(readError))
                         {
@@ -325,14 +335,7 @@ namespace SaiCont
                         _stateIdentities[stateKey] = candidate.MatchedSession;
                     }
 
-                    RecoveryState stateBeforeObservation = state.State;
                     RetryDecision decision = state.Observe(observation, rule, nowUtc);
-                    if (_stateLedgerAmbiguous &&
-                        (stateBeforeObservation == RecoveryState.AttemptInFlightReserved || stateBeforeObservation == RecoveryState.AmbiguousFailClosed || stateBeforeObservation == RecoveryState.IdleNoEvent) &&
-                        !observation.Triggered)
-                    {
-                        _stateLedgerAmbiguous = false;
-                    }
                     var result = new PollResult
                     {
                         Target = rule.Name,
@@ -403,9 +406,10 @@ namespace SaiCont
                             {
                                 ResolvedConsoleSession freshResolved;
                                 string freshError;
-                                IList<ProcessEntry> preSendRefreshed = null;
-                                bool preSendRefreshTaken = false;
-                                if (!TryReadTarget(rule, freshTarget, shouldStop, out freshResolved, out freshError, ref preSendRefreshed, ref preSendRefreshTaken))
+                                 IList<ProcessEntry> preSendRefreshed = null;
+                                 ProcessSnapshotIndex preSendRefreshedIndex = null;
+                                 bool preSendRefreshTaken = false;
+                                 if (!TryReadTarget(rule, freshTarget, shouldStop, out freshResolved, out freshError, ref preSendRefreshed, ref preSendRefreshedIndex, ref preSendRefreshTaken))
                                 {
                                     result.Error = freshError;
                                     result.Reason = "send_blocked=re-resolution_failed: " + freshError;
@@ -461,12 +465,7 @@ namespace SaiCont
                                             continue;
                                         }
                                         reservedConsoles.Add(resolvedConsole.StableConsoleId);
-                                        // CORE-004: reserve the attempt durably BEFORE the native
-                                        // write. If the pre-send persist fails, do NOT perform the
-                                        // native input. On restart, an AttemptInFlightReserved
-                                        // session is treated as a possible-successful-write and
-                                        // is not immediately re-attempted (per the audit's
-                                        // crash-recovery contract).
+                                        RetrySessionState preReservationSnapshot = state.Clone();
                                         state.ReserveAttempt(safety.TriggerToken, rule, nowUtc);
                                         if (_stateStore != null)
                                         {
@@ -475,6 +474,7 @@ namespace SaiCont
                                             List<StateRecord> preRecords = ExportAllStates(nowUtc);
                                             if (!_stateStore.TrySave(preRecords, nowUtc, out preChanged, out preError))
                                             {
+                                                state.RestoreFromClone(preReservationSnapshot);
                                                 _stateStoreHealthy = false;
                                                 result.Error = "state_write_failed: " + preError;
                                                 result.Reason = "send_blocked=state_store_unavailable";
@@ -514,18 +514,47 @@ namespace SaiCont
 
             if (allowInput && _stateStore != null && _stateStoreHealthy)
             {
-                List<StateRecord> exportedRecords = ExportAllStates(nowUtc);
-                bool changed;
-                string saveError;
-                if (!_stateStore.TrySave(exportedRecords, nowUtc, out changed, out saveError))
+                // PERF-004: only export and persist when at least one session
+                // reports a safety-relevant mutation since the last successful
+                // save, or when the bounded checkpoint interval for
+                // LastObservedUtc retention has elapsed.
+                bool anyDirty = false;
+                foreach (var pair in _states)
                 {
-                    _stateStoreHealthy = false;
-                    results.Add(new PollResult
+                    if (pair.Value != null && pair.Value.IsDurableDirty)
                     {
-                        Target = "runtime",
-                        Error = "state_write_failed: " + saveError,
-                        Reason = "send_blocked=state_store_unavailable"
-                    });
+                        anyDirty = true;
+                        break;
+                    }
+                }
+                bool checkpointDue = _lastDurableCheckpointUtc == DateTime.MinValue
+                    || (nowUtc - _lastDurableCheckpointUtc).TotalSeconds >= DurableCheckpointIntervalSeconds;
+                if (anyDirty || checkpointDue)
+                {
+                    List<StateRecord> exportedRecords = ExportAllStates(nowUtc);
+                    bool changed;
+                    string saveError;
+                    if (!_stateStore.TrySave(exportedRecords, nowUtc, out changed, out saveError))
+                    {
+                        _stateStoreHealthy = false;
+                        results.Add(new PollResult
+                        {
+                            Target = "runtime",
+                            Error = "state_write_failed: " + saveError,
+                            Reason = "send_blocked=state_store_unavailable"
+                        });
+                    }
+                    else
+                    {
+                        if (changed)
+                        {
+                            _lastDurableCheckpointUtc = nowUtc;
+                        }
+                        foreach (var pair in _states)
+                        {
+                            if (pair.Value != null) pair.Value.ClearDurableDirty();
+                        }
+                    }
                 }
             }
 
@@ -612,8 +641,9 @@ namespace SaiCont
             Func<bool> shouldStop,
             out ResolvedConsoleSession session,
             out string error,
-            ref IList<ProcessEntry> sharedRefreshedProcesses,
-            ref bool sharedRefreshTaken)
+             ref IList<ProcessEntry> sharedRefreshedProcesses,
+             ref ProcessSnapshotIndex sharedRefreshedIndex,
+             ref bool sharedRefreshTaken)
         {
             session = null;
             error = null;
@@ -640,14 +670,11 @@ namespace SaiCont
             if (!sharedRefreshTaken)
             {
                 sharedRefreshedProcesses = _snapshotProvider();
+                sharedRefreshedIndex = new ProcessSnapshotIndex(sharedRefreshedProcesses);
                 sharedRefreshTaken = true;
             }
-            IList<ProcessEntry> fresh = sharedRefreshedProcesses;
-            var freshById = new Dictionary<int, ProcessEntry>();
-            foreach (ProcessEntry entry in fresh)
-            {
-                freshById[entry.Id] = entry;
-            }
+            ProcessSnapshotIndex freshIndex = sharedRefreshedIndex;
+            IDictionary<int, ProcessEntry> freshById = freshIndex.ById;
 
             ProcessEntry freshMatched;
             if (!freshById.TryGetValue(candidate.MatchedProcessId, out freshMatched))
@@ -656,19 +683,23 @@ namespace SaiCont
                 return false;
             }
 
-            ProcessSessionIdentity freshSession = _sessionResolver(freshMatched.Id, freshMatched.Name);
+            ProcessSessionIdentity freshSession;
+            if (!freshIndex.SessionIdentities.TryGetValue(freshMatched.Id, out freshSession))
+            {
+                freshSession = _sessionResolver(freshMatched.Id, freshMatched.Name);
+                freshIndex.SessionIdentities[freshMatched.Id] = freshSession;
+            }
             if (!freshSession.Equals(candidate.MatchedSession))
             {
                 error = "process session changed for PID " + candidate.MatchedProcessId;
                 return false;
             }
 
-            IList<int> freshIds = ProcessDiscovery.BuildAttachCandidates(freshMatched, freshById);
             var freshCandidate = new ConsoleCandidate
             {
                 MatchedSession = freshSession,
                 ParentProcessId = freshMatched.ParentId,
-                AttachProcessIds = freshIds
+                AttachProcessIds = ProcessDiscovery.BuildAttachCandidates(freshMatched, freshById, freshIndex.ChildrenByParentId)
             };
 
             if (ProcessDiscovery.TryResolveConsoleSession(freshCandidate, readAttempt, rule.ScanLines, _membershipChecker, out session, out error))
@@ -802,15 +833,36 @@ namespace SaiCont
 
                 int separator = pair.Key.IndexOf(':');
                 string ruleName = separator > 0 ? pair.Key.Substring(0, separator) : String.Empty;
-                TargetRule rule = _configuration.Targets.FirstOrDefault(t => String.Equals(t.Name, ruleName, StringComparison.Ordinal));
+                TargetRule rule = LookupRule(ruleName);
                 records.Add(pair.Value.Export(ruleName, rule, identity, nowUtc));
             }
             return records;
         }
 
+        private TargetRule LookupRule(string ruleName)
+        {
+            if (String.IsNullOrEmpty(ruleName)) return null;
+            if (_ruleByName == null || !_ruleByNameValid)
+            {
+                _ruleByName = new Dictionary<string, TargetRule>(StringComparer.Ordinal);
+                if (_configuration != null && _configuration.Targets != null)
+                {
+                    foreach (TargetRule rule in _configuration.Targets)
+                    {
+                        if (rule == null || String.IsNullOrEmpty(rule.Name)) continue;
+                        _ruleByName[rule.Name] = rule;
+                    }
+                }
+                _ruleByNameValid = true;
+            }
+            TargetRule found;
+            return _ruleByName.TryGetValue(ruleName, out found) ? found : null;
+        }
+
+        private void InvalidateRuleCache() { _ruleByNameValid = false; }
+
         public void Run(bool allowInput, Action<PollResult> onResult, Func<bool> shouldStop)
         {
-            NativeConsole.Detach();
             while (shouldStop == null || !shouldStop())
             {
                 IList<PollResult> results;

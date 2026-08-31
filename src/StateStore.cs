@@ -15,6 +15,7 @@ namespace SaiCont
         public int ProcessId;
         public DateTime ProcessStartUtc;
         public string TriggerFingerprint;
+        public int TriggerMatchStart;
         public string RuleSemanticFingerprint;
         public DateTime LastObservedUtc;
         public DateTime LastWriteUtc;
@@ -22,6 +23,8 @@ namespace SaiCont
         public bool AwaitingOutcome;
         public bool SawBusyAfterWrite;
         public string SuppressedFingerprint;
+        public int SuppressedTriggerRow;
+        public int Occurrence;
         public int AttemptCount;
         public string RecoveryState;
 
@@ -54,6 +57,7 @@ namespace SaiCont
         private readonly string _filePath;
         private readonly object _ioLock = new object();
         private string _lastFingerprint;
+        private string RecoveryMarkerPath { get { return _filePath + ".recovery-required"; } }
 
         public DurableStateStore(string filePath)
         {
@@ -69,9 +73,10 @@ namespace SaiCont
         {
             get
             {
-                    return LastLoadDisposition == StateLoadDisposition.Corrupt ||
+                return LastLoadDisposition == StateLoadDisposition.Corrupt ||
                     LastLoadDisposition == StateLoadDisposition.UnsupportedSchema ||
-                    LastLoadDisposition == StateLoadDisposition.Unavailable;
+                    LastLoadDisposition == StateLoadDisposition.Unavailable ||
+                    (!String.IsNullOrEmpty(_filePath) && File.Exists(RecoveryMarkerPath));
             }
         }
 
@@ -185,11 +190,13 @@ namespace SaiCont
                         throw new FormatException("state root must be <saicontState>");
                     }
 
+                    ValidateRootShape(root);
                     string version = (string)root.Attribute("version");
                     if (!String.Equals(version, SchemaVersion, StringComparison.Ordinal))
                     {
                         LastLoadDisposition = StateLoadDisposition.UnsupportedSchema;
                         LastError = "unsupported state schema version '" + (version ?? "") + "'";
+                        WriteRecoveryMarker("unsupported");
                         if (quarantineInvalid)
                         {
                             Quarantine("unsupported");
@@ -198,9 +205,15 @@ namespace SaiCont
                         return records;
                     }
 
+                    var seenKeys = new HashSet<string>(StringComparer.Ordinal);
                     foreach (XElement element in root.Elements("record"))
                     {
-                        records.Add(ParseRecord(element));
+                        StateRecord record = ParseRecord(element);
+                        if (!seenKeys.Add(record.CompositeKey))
+                        {
+                            throw new FormatException("state contains duplicate record '" + record.CompositeKey + "'");
+                        }
+                        records.Add(record);
                     }
 
                     records = NormalizeRecords(records, nowUtc);
@@ -226,6 +239,7 @@ namespace SaiCont
                 {
                     LastLoadDisposition = StateLoadDisposition.Corrupt;
                     LastError = exception.GetType().Name + ": " + exception.Message;
+                    WriteRecoveryMarker("corrupt");
                     if (quarantineInvalid)
                     {
                         Quarantine("corrupt");
@@ -248,6 +262,11 @@ namespace SaiCont
 
             lock (_ioLock)
             {
+                if (File.Exists(RecoveryMarkerPath))
+                {
+                    error = "durable state reconciliation required";
+                    return false;
+                }
                 List<StateRecord> normalized = NormalizeRecords(records, nowUtc);
                 string fingerprint = ComputeFingerprint(normalized);
                 if (File.Exists(_filePath) && String.Equals(_lastFingerprint, fingerprint, StringComparison.Ordinal))
@@ -266,15 +285,18 @@ namespace SaiCont
                         new XAttribute("rule", record.RuleName ?? String.Empty),
                         new XAttribute("pid", record.ProcessId),
                         new XAttribute("startUtc", FormatUtc(record.ProcessStartUtc)),
-                        new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
-                        new XAttribute("ruleFingerprint", record.RuleSemanticFingerprint ?? String.Empty),
+new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
+                         new XAttribute("triggerMatchStart", record.TriggerMatchStart),
+                         new XAttribute("ruleFingerprint", record.RuleSemanticFingerprint ?? String.Empty),
                         new XAttribute("lastObserved", FormatUtc(record.LastObservedUtc)),
                         new XAttribute("lastWrite", FormatUtc(record.LastWriteUtc)),
                         new XAttribute("nextAllowed", FormatUtc(record.NextAllowedAttemptUtc)),
                         new XAttribute("awaitingOutcome", record.AwaitingOutcome),
                         new XAttribute("sawBusy", record.SawBusyAfterWrite),
-                        new XAttribute("suppressed", record.SuppressedFingerprint ?? String.Empty),
-                        new XAttribute("attempts", record.AttemptCount),
+                         new XAttribute("suppressed", record.SuppressedFingerprint ?? String.Empty),
+                         new XAttribute("suppressedMatchStart", record.SuppressedTriggerRow),
+                         new XAttribute("attempts", record.AttemptCount),
+                         new XAttribute("occurrence", record.Occurrence),
                         new XAttribute("state", SerializeRecoveryState(record))));
                 }
 
@@ -320,6 +342,37 @@ namespace SaiCont
             }
         }
 
+        internal bool TryClearRecoveryMarker()
+        {
+            lock (_ioLock)
+            {
+                try
+                {
+                    if (File.Exists(RecoveryMarkerPath)) File.Delete(RecoveryMarkerPath);
+                    return true;
+                }
+                catch (Exception exception)
+                {
+                    LastError = exception.GetType().Name + ": " + exception.Message;
+                    return false;
+                }
+            }
+        }
+
+        private void WriteRecoveryMarker(string reason)
+        {
+            try
+            {
+                string directory = Path.GetDirectoryName(RecoveryMarkerPath);
+                if (!String.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                File.WriteAllText(RecoveryMarkerPath, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + " " + reason, Encoding.UTF8);
+            }
+            catch (Exception exception)
+            {
+                LastError = "recovery marker failed: " + exception.Message;
+            }
+        }
+
         public void Save(IEnumerable<StateRecord> records, DateTime nowUtc)
         {
             bool changed;
@@ -336,6 +389,7 @@ namespace SaiCont
             foreach (StateRecord record in (records ?? Enumerable.Empty<StateRecord>()).OrderBy(r => r.CompositeKey, StringComparer.Ordinal))
             {
                 builder.Append(record.CompositeKey).Append('|')
+                    .Append(record.RuleSemanticFingerprint).Append('|')
                     .Append(record.TriggerFingerprint).Append('|')
                     .Append(FormatUtc(RoundDownToHour(record.LastObservedUtc))).Append('|')
                     .Append(FormatUtc(record.LastWriteUtc)).Append('|')
@@ -343,14 +397,60 @@ namespace SaiCont
                     .Append(record.AwaitingOutcome ? '1' : '0').Append('|')
                     .Append(record.SawBusyAfterWrite ? '1' : '0').Append('|')
                     .Append(record.SuppressedFingerprint).Append('|')
+                    .Append(record.SuppressedTriggerRow).Append('|')
                     .Append(record.AttemptCount).Append('|')
+                    .Append(record.Occurrence).Append('|')
                     .Append(record.RecoveryState).Append('\n');
             }
             return builder.ToString();
         }
 
+        private static void ValidateRootShape(XElement root)
+        {
+            string[] attributes = { "version", "updatedUtc" };
+            foreach (XAttribute attribute in root.Attributes())
+            {
+                if (!attributes.Contains(attribute.Name.LocalName, StringComparer.Ordinal))
+                {
+                    throw new FormatException("state root has unknown attribute '" + attribute.Name.LocalName + "'");
+                }
+            }
+            if (root.Attribute("version") == null || root.Attribute("updatedUtc") == null)
+            {
+                throw new FormatException("state root requires version and updatedUtc");
+            }
+            foreach (XElement child in root.Elements())
+            {
+                if (child.Name.LocalName != "record")
+                {
+                    throw new FormatException("state root has unknown element <" + child.Name.LocalName + ">");
+                }
+            }
+        }
+
+        private static void ValidateRecordShape(XElement element)
+        {
+            string[] attributes = { "rule", "pid", "startUtc", "fingerprint", "triggerMatchStart", "ruleFingerprint", "lastObserved", "lastWrite", "nextAllowed", "awaitingOutcome", "sawBusy", "suppressed", "suppressedMatchStart", "attempts", "occurrence", "state" };
+            foreach (XAttribute attribute in element.Attributes())
+            {
+                if (!attributes.Contains(attribute.Name.LocalName, StringComparer.Ordinal))
+                {
+                    throw new FormatException("state record has unknown attribute '" + attribute.Name.LocalName + "'");
+                }
+            }
+            if (element.Elements().Any())
+            {
+                throw new FormatException("state record must not contain child elements");
+            }
+        }
+
         private static StateRecord ParseRecord(XElement element)
         {
+            if (element == null || element.Name.LocalName != "record")
+            {
+                throw new FormatException("state child must be <record>");
+            }
+            ValidateRecordShape(element);
             string lastWriteRaw = RequiredAttributeAllowEmpty(element, "lastWrite");
             string nextAllowedRaw = RequiredAttributeAllowEmpty(element, "nextAllowed");
             string awaitingRaw = RequiredAttribute(element, "awaitingOutcome");
@@ -364,15 +464,18 @@ namespace SaiCont
                 ProcessId = ParseInt(RequiredAttribute(element, "pid")),
                 ProcessStartUtc = ParseUtc(RequiredAttribute(element, "startUtc")),
                 TriggerFingerprint = OptionalAttribute(element, "fingerprint"),
+                TriggerMatchStart = ParseOptionalInt(element, "triggerMatchStart", -1, -1, Int32.MaxValue),
                 RuleSemanticFingerprint = OptionalAttribute(element, "ruleFingerprint"),
                 LastObservedUtc = ParseUtc(RequiredAttribute(element, "lastObserved")),
                 LastWriteUtc = ParseUtcRequired(lastWriteRaw, "lastWrite"),
                 NextAllowedAttemptUtc = ParseUtcRequired(nextAllowedRaw, "nextAllowed"),
                 AwaitingOutcome = ParseBoolStrict(awaitingRaw, "awaitingOutcome"),
                 SawBusyAfterWrite = ParseBoolStrict(sawBusyRaw, "sawBusy"),
-                SuppressedFingerprint = OptionalAttribute(element, "suppressed"),
-                AttemptCount = ParseIntStrict(attemptsRaw, "attempts", 0, 50),
-                RecoveryState = ValidateRecoveryState(stateRaw)
+                 SuppressedFingerprint = OptionalAttribute(element, "suppressed"),
+                 SuppressedTriggerRow = ParseOptionalInt(element, "suppressedMatchStart", -1, -1, Int32.MaxValue),
+                 AttemptCount = ParseIntStrict(attemptsRaw, "attempts", 0, 50),
+                 Occurrence = ParseOptionalInt(element, "occurrence", 0, 0, Int32.MaxValue),
+                 RecoveryState = ValidateRecoveryState(stateRaw)
             };
 
             if (record.ProcessId <= 0 || record.ProcessStartUtc == DateTime.MinValue)
@@ -383,7 +486,47 @@ namespace SaiCont
             {
                 throw new FormatException("state record has invalid lastObserved timestamp");
             }
+            if (HasAntiReplayAuthority(record) && String.IsNullOrWhiteSpace(record.RuleSemanticFingerprint))
+            {
+                throw new FormatException("state record is missing required ruleFingerprint for " + record.RecoveryState);
+            }
+            if (HasAntiReplayAuthority(record) && String.IsNullOrWhiteSpace(record.TriggerFingerprint))
+            {
+                throw new FormatException("state record is missing required fingerprint for " + record.RecoveryState);
+            }
+            if (record.RecoveryState == "EventWaitingDeadline" || record.RecoveryState == "BackoffWait" || record.RecoveryState == "EventReadyToAttempt" || record.RecoveryState == "CommandWrittenAwaitingOutcome" || record.RecoveryState == "AttemptInFlightReserved" || record.RecoveryState == "AmbiguousFailClosed")
+            {
+                if (record.NextAllowedAttemptUtc == DateTime.MinValue)
+                {
+                    throw new FormatException("state record is missing nextAllowed for " + record.RecoveryState);
+                }
+            }
+            if ((record.RecoveryState == "CommandWrittenAwaitingOutcome" || record.RecoveryState == "AttemptInFlightReserved" || record.RecoveryState == "AmbiguousFailClosed") && record.AttemptCount <= 0)
+            {
+                throw new FormatException("state record has no recorded attempt for " + record.RecoveryState);
+            }
             return record;
+        }
+
+        private static bool HasAntiReplayAuthority(StateRecord record)
+        {
+            if (record == null) return false;
+            switch (record.RecoveryState)
+            {
+                case "AttemptInFlightReserved":
+                case "AmbiguousFailClosed":
+                case "CommandWrittenAwaitingOutcome":
+                case "RecoveryConfirmed":
+                case "EventWaitingDeadline":
+                case "BackoffWait":
+                case "EventReadyToAttempt":
+                case "EventStillPresentReady":
+                case "TargetBusyOrProgressing":
+                case "RecoveryExhausted":
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private static string OptionalAttribute(XElement element, string name)
@@ -418,6 +561,13 @@ namespace SaiCont
                 throw new FormatException("state record has invalid boolean '" + fieldName + "'");
             }
             return parsed;
+        }
+
+        private static int ParseOptionalInt(XElement element, string name, int defaultValue, int min, int max)
+        {
+            XAttribute attribute = element.Attribute(name);
+            if (attribute == null || String.IsNullOrEmpty(attribute.Value)) return defaultValue;
+            return ParseIntStrict(attribute.Value, name, min, max);
         }
 
         private static int ParseIntStrict(string value, string fieldName, int min, int max)
@@ -494,7 +644,8 @@ namespace SaiCont
                 {
                     continue;
                 }
-                if (record.LastObservedUtc != DateTime.MinValue && nowUtc - record.LastObservedUtc > DefaultRetention)
+                if (record.LastObservedUtc != DateTime.MinValue && nowUtc - record.LastObservedUtc > DefaultRetention &&
+                    record.NextAllowedAttemptUtc <= nowUtc && !HasAntiReplayAuthority(record))
                 {
                     continue;
                 }

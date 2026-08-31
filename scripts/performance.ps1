@@ -11,12 +11,66 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     & (Join-Path $projectRoot 'build.ps1') | Out-Host
 }
 
+# PERF-005: exercise the embedded self-test path so the production
+# engine actually runs deterministic active-console scenarios (multi-rule
+# send, memory soak, etc.) and emits MEASURE lines. The PowerShell layer
+# captures the structural metrics and adds a one-core-equivalent CPU
+# measurement that the multi-core normalization in the prior script hid.
+
 $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = [IO.Path]::GetFullPath((Join-Path $temporaryRoot ('SAICONT-perf-' + [Guid]::NewGuid().ToString('N'))))
 if (-not $testRoot.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing performance staging outside temporary root: $testRoot"
 }
 
+$selfTestOutput = & $executable --self-test 2>&1
+$selfTestExit = $LASTEXITCODE
+if ($selfTestExit -ne 0) {
+    $selfTestOutput | ForEach-Object { Write-Output $_ }
+    throw "Embedded self-test returned non-zero exit code: $selfTestExit"
+}
+$selfTestOutput | ForEach-Object { Write-Output $_ }
+
+$measureLines = @($selfTestOutput | Where-Object { $_ -like 'MEASURE:*' })
+
+function Get-MeasureValue {
+    param([string]$Line, [string]$Key)
+    $pattern = '(?<=^|\s)' + [regex]::Escape($Key) + '=([0-9.+\-eE]+)'
+    $match = [regex]::Match($Line, $pattern)
+    if ($match.Success) { return [double]$match.Groups[1].Value }
+    return $null
+}
+
+$perfPoll = $measureLines | Where-Object { $_ -like 'MEASURE: perf_poll*' } | Select-Object -First 1
+$perfMulti = $measureLines | Where-Object { $_ -like 'MEASURE: perf_multi*' } | Select-Object -First 1
+$perfMem = $measureLines | Where-Object { $_ -like 'MEASURE: perf_mem*' } | Select-Object -First 1
+$soak = $measureLines | Where-Object { $_ -like 'MEASURE: soak*' } | Select-Object -First 1
+
+if (-not $perfPoll) { throw 'Embedded self-test did not emit perf_poll MEASURE line.' }
+if (-not $perfMulti) { throw 'Embedded self-test did not emit perf_multi MEASURE line.' }
+if (-not $perfMem) { throw 'Embedded self-test did not emit perf_mem MEASURE line.' }
+
+$pollAvg = Get-MeasureValue $perfPoll 'avg_ms'
+$pollMedian = Get-MeasureValue $perfPoll 'median_ms'
+$pollP95 = Get-MeasureValue $perfPoll 'p95_ms'
+$pollMax = Get-MeasureValue $perfPoll 'max_ms'
+$oneCorePct = Get-MeasureValue $perfPoll 'one_core_cpu_pct'
+
+$multiWrites = Get-MeasureValue $perfMulti 'writes'
+$multiStates = Get-MeasureValue $perfMulti 'states'
+
+$memDelta = Get-MeasureValue $perfMem 'managed_delta_bytes'
+
+Write-Output ('MEASURE: idle_scenario poll_avg_ms={0:F2} poll_median_ms={1:F2} poll_p95_ms={2:F2} poll_max_ms={3:F2} one_core_cpu_pct={4:F2}' -f $pollAvg, $pollMedian, $pollP95, $pollMax, $oneCorePct)
+Write-Output ('MEASURE: active_scenario multi_writes={0} multi_states={1}' -f $multiWrites, $multiStates)
+Write-Output ('MEASURE: memory_scenario managed_delta_bytes={0}' -f $memDelta)
+if ($soak) {
+    Write-Output ('MEASURE: soak_scenario ' + $soak.Substring('MEASURE: '.Length))
+}
+
+# Process-level idle measurement against the same executable running
+# against an idle target, so we can also report working set / handles
+# without conflating it with the deterministic self-test path.
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $configPath = Join-Path $testRoot 'perf.config.xml'
@@ -77,20 +131,26 @@ try {
     $stopTimer.Stop()
 
     $cpuMilliseconds = ($cpuAfter - $cpuBefore).TotalMilliseconds
-    $cpuPercent = if ($measurement.ElapsedMilliseconds -gt 0) {
+    $oneCoreCpuPctIdle = if ($measurement.ElapsedMilliseconds -gt 0) {
+        100.0 * $cpuMilliseconds / $measurement.ElapsedMilliseconds
+    } else { 0.0 }
+    $multiCoreCpuPct = if ($measurement.ElapsedMilliseconds -gt 0) {
         100.0 * $cpuMilliseconds / ($measurement.ElapsedMilliseconds * [Environment]::ProcessorCount)
-    }
-    else { 0.0 }
+    } else { 0.0 }
     $workingSetDelta = $workingSetAfter - $workingSetBefore
     $handleDelta = $handlesAfter - $handlesBefore
 
-    Write-Output ('MEASURE: idle duration_ms={0} cpu_ms={1:F3} cpu_percent={2:F4} working_set_start={3} working_set_end={4} working_set_delta={5} handles_start={6} handles_end={7} handle_delta={8} stop_latency_ms={9}' -f
-        $measurement.ElapsedMilliseconds, $cpuMilliseconds, $cpuPercent, $workingSetBefore, $workingSetAfter, $workingSetDelta, $handlesBefore, $handlesAfter, $handleDelta, $stopTimer.ElapsedMilliseconds)
+    Write-Output ('MEASURE: idle_process duration_ms={0} cpu_ms={1:F3} one_core_cpu_pct={2:F4} multi_core_cpu_pct={3:F4} working_set_start={4} working_set_end={5} working_set_delta={6} handles_start={7} handles_end={8} handle_delta={9} stop_latency_ms={10}' -f
+        $measurement.ElapsedMilliseconds, $cpuMilliseconds, $oneCoreCpuPctIdle, $multiCoreCpuPct, $workingSetBefore, $workingSetAfter, $workingSetDelta, $handlesBefore, $handlesAfter, $handleDelta, $stopTimer.ElapsedMilliseconds)
 
-    if ($cpuPercent -ge 5.0) { throw "Idle CPU budget exceeded: $cpuPercent%" }
+    if ($oneCoreCpuPctIdle -ge 25.0) { throw "Idle one-core CPU budget exceeded: $oneCoreCpuPctIdle%" }
     if ($workingSetDelta -ge 16MB) { throw "Working-set growth budget exceeded: $workingSetDelta bytes" }
     if ($handleDelta -gt 4) { throw "Handle growth budget exceeded: $handleDelta" }
     if ($stopTimer.ElapsedMilliseconds -ge 1500) { throw "Stop latency budget exceeded: $($stopTimer.ElapsedMilliseconds) ms" }
+    if ($pollAvg -ge 50.0) { throw "Average poll budget exceeded: $pollAvg ms" }
+    if ($pollP95 -ge 150.0) { throw "P95 poll budget exceeded: $pollP95 ms" }
+    if ($multiWrites -ne 5) { throw "Active scenario must produce exactly five writes, got $multiWrites" }
+    if ($memDelta -ge 8MB) { throw "Memory-scenario budget exceeded: $memDelta bytes" }
     Write-Output 'STATUS: PERFORMANCE_BUDGET PASS'
 }
 finally {
@@ -100,6 +160,6 @@ finally {
     }
     $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
     if ($resolvedTestRoot.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedTestRoot)) {
-        Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
+        Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

@@ -4,7 +4,8 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Text;
-using System.Windows.Forms;
+using System.Windows.Forms;
+
 using System.Threading;
 
 namespace SaiCont
@@ -62,7 +63,7 @@ namespace SaiCont
         private ToolStripStatusLabel stateIndicatorLabel;
         private ToolStripStatusLabel pollStatsLabel;
 
-        private Timer pollTimer;
+        private System.Windows.Forms.Timer pollTimer;
         private NotifyIcon trayIcon;
         private ContextMenuStrip trayMenu;
 
@@ -97,14 +98,26 @@ namespace SaiCont
         private static readonly Font FontSecondary = new Font("Verdana", 11f, FontStyle.Regular);
         private static readonly Font FontSmall = new Font("Verdana", 10f, FontStyle.Regular);
 
-        private readonly List<PollResult> currentPollResults = new List<PollResult>();
-
-        // PERF-002: background polling thread.
-        private Thread _pollThread;
-        private volatile bool _pollRunning;
-        private readonly object _pollLock = new object();
-        private readonly object _resultsLock = new object();
-        private IList<PollResult> _pendingResults;
+        private readonly List<PollResult> currentPollResults = new List<PollResult>();
+
+
+
+        // PERF-002: background polling thread.
+
+        private Thread _pollThread;
+
+        private volatile bool _pollRunning;
+
+        private int _pollGeneration;
+
+        private readonly ManualResetEventSlim _pollWakeup = new ManualResetEventSlim(false);
+
+        private readonly object _pollLock = new object();
+
+        private readonly object _resultsLock = new object();
+
+        private IList<PollResult> _pendingResults;
+
         private volatile bool _pendingResultsReady;
 
         public SaiContGuiForm(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)
@@ -148,7 +161,7 @@ namespace SaiCont
             this.Controls.Add(headerPanel);
             this.Controls.Add(statusStrip);
 
-            pollTimer = new Timer { Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds) };
+            pollTimer = new System.Windows.Forms.Timer { Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds) };
             pollTimer.Tick += OnPollTimerTick;
             pollTimer.Start();
 
@@ -613,7 +626,7 @@ namespace SaiCont
                 IList<PollResult> results;
                 try
                 {
-                    results = engine.PollOnce(false);
+                    results = engine.PollOnce(false, delegate { return shouldStop != null && shouldStop(); });
                 }
                 finally
                 {
@@ -641,11 +654,18 @@ namespace SaiCont
         {
             try
             {
-                currentConfig = WatcherConfiguration.Load(configPath);
+                WatcherConfiguration newConfig = WatcherConfiguration.Load(configPath);
+                WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
+                lock (_pollLock)
+                {
+                    currentConfig = newConfig;
+                    engine = newEngine;
+                }
                 ReloadRulesList();
                 pollTimer.Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds);
                 statusLabel.Text = "Config reloaded (" + currentConfig.Targets.Count + " rules).";
                 AppendLog("INFO", "Config reloaded.");
+                try { _pollWakeup.Set(); } catch (ObjectDisposedException) { }
                 RunProbe();
             }
             catch (Exception ex)
@@ -730,7 +750,8 @@ namespace SaiCont
         // handed to OnPollTimerTick via a lock-protected handoff.
         private void BackgroundPollLoop()
         {
-            while (_pollRunning)
+            int generation = _pollGeneration;
+            while (_pollRunning && generation == _pollGeneration)
             {
                 try
                 {
@@ -754,7 +775,7 @@ namespace SaiCont
                     IList<PollResult> results;
                     lock (_pollLock)
                     {
-                        results = engine.PollOnce(allowInput);
+                        results = engine.PollOnce(allowInput, delegate { return generation != _pollGeneration || (shouldStop != null && shouldStop()); });
                     }
 
                     lock (_resultsLock)
@@ -776,7 +797,14 @@ namespace SaiCont
                 }
 
                 int interval = Math.Max(500, currentConfig.PollIntervalMilliseconds);
-                Thread.Sleep(interval);
+                bool woke;
+                try
+                {
+                    woke = _pollWakeup.Wait(interval);
+                }
+                catch (ObjectDisposedException) { return; }
+                if (!woke) { continue; }
+                _pollWakeup.Reset();
             }
         }
 
@@ -784,22 +812,27 @@ namespace SaiCont
         {
             if (_pollThread != null && _pollThread.IsAlive)
             {
+                try { _pollWakeup.Set(); } catch (ObjectDisposedException) { }
                 return;
             }
             _pollRunning = true;
             _pollThread = new Thread(BackgroundPollLoop);
             _pollThread.IsBackground = true;
             _pollThread.Name = "SAICONT-PollWorker";
+            try { _pollWakeup.Reset(); } catch (ObjectDisposedException) { }
             _pollThread.Start();
         }
 
         private void StopBackgroundPoll()
         {
             _pollRunning = false;
-            if (_pollThread != null)
+            System.Threading.Interlocked.Increment(ref _pollGeneration);
+            try { _pollWakeup.Set(); } catch (ObjectDisposedException) { }
+            Thread worker = _pollThread;
+            if (worker != null)
             {
-                _pollThread.Join(3000);
-                _pollThread = null;
+                try { worker.Join(5000); } catch { }
+                if (!worker.IsAlive) { _pollThread = null; }
             }
         }
 
@@ -935,12 +968,13 @@ namespace SaiCont
             {
                 int removeEntries = Math.Min(100, guiLogEntries - MaximumGuiLogEntries + 100);
                 int removeEnd = 0;
+                string text = logRichText.Text;
                 for (int index = 0; index < removeEntries; index++)
                 {
-                    int newline = logRichText.Text.IndexOf('\n', removeEnd);
+                    int newline = text.IndexOf('\n', removeEnd);
                     if (newline < 0)
                     {
-                        removeEnd = logRichText.TextLength;
+                        removeEnd = text.Length;
                         break;
                     }
                     removeEnd = newline + 1;
@@ -980,6 +1014,16 @@ namespace SaiCont
                 trayIcon.Visible = false;
                 trayIcon.Dispose();
             }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { _pollWakeup.Set(); } catch { }
+                try { _pollWakeup.Dispose(); } catch { }
+            }
+            base.Dispose(disposing);
         }
 
         public static int RunDesktopGui(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)

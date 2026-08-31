@@ -6,6 +6,17 @@ using System.Runtime.InteropServices;
 
 namespace SaiCont
 {
+    internal sealed class ProcessDiscoveryException : InvalidOperationException
+    {
+        public int Win32Error { get; private set; }
+
+        public ProcessDiscoveryException(string message, int win32Error)
+            : base(message)
+        {
+            Win32Error = win32Error;
+        }
+    }
+
     internal sealed class ProcessEntry
     {
         public int Id;
@@ -101,16 +112,27 @@ namespace SaiCont
     internal sealed class ProcessSnapshotIndex
     {
         public readonly Dictionary<int, ProcessEntry> ById;
+        public readonly Dictionary<int, List<ProcessEntry>> ChildrenByParentId;
         public readonly Dictionary<string, List<ProcessEntry>> ByName;
+        public readonly Dictionary<int, ProcessSessionIdentity> SessionIdentities;
 
         public ProcessSnapshotIndex(IList<ProcessEntry> processes)
         {
             ById = new Dictionary<int, ProcessEntry>();
+            ChildrenByParentId = new Dictionary<int, List<ProcessEntry>>();
             ByName = new Dictionary<string, List<ProcessEntry>>(StringComparer.OrdinalIgnoreCase);
+            SessionIdentities = new Dictionary<int, ProcessSessionIdentity>();
 
             foreach (ProcessEntry process in processes)
             {
                 ById[process.Id] = process;
+                List<ProcessEntry> children;
+                if (!ChildrenByParentId.TryGetValue(process.ParentId, out children))
+                {
+                    children = new List<ProcessEntry>();
+                    ChildrenByParentId[process.ParentId] = children;
+                }
+                children.Add(process);
 
                 string normalizedName = ProcessDiscovery.NormalizeName(process.Name);
                 List<ProcessEntry> nameGroup;
@@ -159,7 +181,7 @@ namespace SaiCont
             if (snapshot == InvalidHandleValue)
             {
                 int win32Error = Marshal.GetLastWin32Error();
-                throw new InvalidOperationException("Process snapshot failed (Win32 " + win32Error + ").");
+                throw new ProcessDiscoveryException("Process snapshot failed (Win32 " + win32Error + ").", win32Error);
             }
 
             try
@@ -173,7 +195,7 @@ namespace SaiCont
                     {
                         return entries;
                     }
-                    throw new InvalidOperationException("Process enumeration start failed (Win32 " + win32Error + ").");
+                    throw new ProcessDiscoveryException("Process enumeration start failed (Win32 " + win32Error + ").", win32Error);
                 }
 
                 do
@@ -190,7 +212,7 @@ namespace SaiCont
                 int terminalError = Marshal.GetLastWin32Error();
                 if (terminalError != 18)
                 {
-                    throw new InvalidOperationException("Process enumeration failed (Win32 " + terminalError + ").");
+                    throw new ProcessDiscoveryException("Process enumeration failed (Win32 " + terminalError + ").", terminalError);
                 }
             }
             finally
@@ -261,12 +283,17 @@ namespace SaiCont
 
                 foreach (ProcessEntry process in matched)
                 {
-                    ProcessSessionIdentity session = sessionResolver(process.Id, process.Name);
+                    ProcessSessionIdentity session;
+                    if (!index.SessionIdentities.TryGetValue(process.Id, out session))
+                    {
+                        session = sessionResolver(process.Id, process.Name);
+                        index.SessionIdentities[process.Id] = session;
+                    }
                     candidates.Add(new ConsoleCandidate
                     {
                         MatchedSession = session,
                         ParentProcessId = process.ParentId,
-                        AttachProcessIds = BuildAttachCandidates(process, index.ById)
+                        AttachProcessIds = BuildAttachCandidates(process, index.ById, index.ChildrenByParentId)
                     });
                 }
             }
@@ -275,6 +302,11 @@ namespace SaiCont
         }
 
         public static IList<int> BuildAttachCandidates(ProcessEntry matched, IDictionary<int, ProcessEntry> byId)
+        {
+            return BuildAttachCandidates(matched, byId, null);
+        }
+
+        internal static IList<int> BuildAttachCandidates(ProcessEntry matched, IDictionary<int, ProcessEntry> byId, IDictionary<int, List<ProcessEntry>> childrenByParentId)
         {
             var ids = new List<int>();
             var seen = new HashSet<int>();
@@ -305,11 +337,24 @@ namespace SaiCont
                 current = parent;
             }
 
-            if (byId != null)
+            if (ids.Count < MaximumCandidateCount)
             {
-                foreach (ProcessEntry entry in byId.Values)
+                List<ProcessEntry> children = null;
+                if (childrenByParentId != null)
                 {
-                    if (entry.ParentId == matched.Id && ids.Count < MaximumCandidateCount && seen.Add(entry.Id))
+                    childrenByParentId.TryGetValue(matched.Id, out children);
+                }
+                else if (byId != null)
+                {
+                    children = byId.Values.Where(entry => entry.ParentId == matched.Id).ToList();
+                }
+                foreach (ProcessEntry entry in children ?? new List<ProcessEntry>())
+                {
+                    if (ids.Count >= MaximumCandidateCount)
+                    {
+                        break;
+                    }
+                    if (seen.Add(entry.Id))
                     {
                         ids.Add(entry.Id);
                     }
@@ -338,6 +383,11 @@ namespace SaiCont
 
         internal static string ComputeStableConsoleId(ConsoleSnapshot snapshot, int resolvedAttach)
         {
+            return ComputeStableConsoleId(snapshot, resolvedAttach, 0);
+        }
+
+        internal static string ComputeStableConsoleId(ConsoleSnapshot snapshot, int resolvedAttach, int matchedProcessId)
+        {
             if (snapshot == null)
             {
                 return resolvedAttach.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -346,6 +396,11 @@ namespace SaiCont
             if (snapshot.WindowHandle != IntPtr.Zero)
             {
                 return "win:" + snapshot.WindowHandle.ToInt64().ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            if (matchedProcessId > 0 && ConsoleServesMatchedProcess(snapshot.ConsoleProcessIds, matchedProcessId))
+            {
+                return "session:" + matchedProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture);
             }
 
             if (snapshot.ConsoleProcessIds != null && snapshot.ConsoleProcessIds.Count > 0)
@@ -410,7 +465,7 @@ namespace SaiCont
                 ResolvedAttachProcessId = selectedPid,
                 ConsoleProcessIds = snapshot.ConsoleProcessIds,
                 WindowHandle = snapshot.WindowHandle,
-                StableConsoleId = ComputeStableConsoleId(snapshot, selectedPid),
+                StableConsoleId = ComputeStableConsoleId(snapshot, selectedPid, candidate.MatchedProcessId),
                 Snapshot = snapshot,
                 ResolvedUtc = DateTime.UtcNow,
                 ResolutionError = null

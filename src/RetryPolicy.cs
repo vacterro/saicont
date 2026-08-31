@@ -46,6 +46,11 @@ namespace SaiCont
             get { return Event != null ? Event.DueUtc : _dueUtc; }
             set { _dueUtc = value; }
         }
+
+        public int TriggerMatchStart
+        {
+            get { return Event != null ? Event.MatchStart : -1; }
+        }
     }
 
     internal sealed class RetryDecision
@@ -87,6 +92,9 @@ namespace SaiCont
         private string _triggerToken;
         private string _attemptToken;
         private string _suppressedToken;
+        private int _suppressedMatchStart = -1;
+        private int _occurrence;
+        private int _triggerMatchStart = -1;
         private DateTime _nextAttemptUtc;
         private DateTime _lastObservedUtc;
         private DateTime _lastWriteUtc;
@@ -104,19 +112,31 @@ namespace SaiCont
         public DateTime LastWriteUtc { get { return _lastWriteUtc; } }
         public int AttemptCount { get { return _attemptCount; } }
 
+        // PERF-004: durable-state mutation flag. The engine polls this to
+        // decide whether a full export+TrySave is required this round. Set on
+        // every transition that affects safety-relevant state (Observe,
+        // RecordAttempt, ReserveAttempt, CommitAttempt, RestoreFromClone).
+        // Cleared by the engine after a successful save.
+        private bool _durableDirty;
+        public bool IsDurableDirty { get { return _durableDirty; } }
+        public void ClearDurableDirty() { _durableDirty = false; }
+
         public void RestoreFrom(StateRecord record, DateTime nowUtc)
         {
             if (record == null) return;
             _triggerToken = record.TriggerFingerprint;
+            _triggerMatchStart = record.TriggerMatchStart;
             _lastObservedUtc = SanitizeHistoricalTime(record.LastObservedUtc, nowUtc);
             _lastWriteUtc = SanitizeHistoricalTime(record.LastWriteUtc, nowUtc);
             _nextAttemptUtc = SanitizeNextAttempt(record.NextAllowedAttemptUtc, nowUtc);
             _awaitingOutcome = record.AwaitingOutcome;
             _sawBusy = record.SawBusyAfterWrite;
             _suppressedToken = record.SuppressedFingerprint;
+            _suppressedMatchStart = record.SuppressedTriggerRow;
+            _occurrence = Math.Max(0, record.Occurrence);
+            _triggerMatchStart = record.TriggerMatchStart;
             _attemptCount = Math.Max(0, Math.Min(50, record.AttemptCount));
             _attemptToken = record.TriggerFingerprint;
-
             if (!String.IsNullOrEmpty(record.RecoveryState))
             {
                 try
@@ -143,12 +163,15 @@ namespace SaiCont
                 ProcessId = session != null ? session.ProcessId : 0,
                 ProcessStartUtc = session != null ? session.StartTimeUtc : DateTime.MinValue,
                 TriggerFingerprint = _triggerToken,
+                TriggerMatchStart = _triggerMatchStart,
                 LastObservedUtc = _lastObservedUtc == DateTime.MinValue ? nowUtc : _lastObservedUtc,
                 LastWriteUtc = _lastWriteUtc,
                 NextAllowedAttemptUtc = _nextAttemptUtc,
                 AwaitingOutcome = _awaitingOutcome,
                 SawBusyAfterWrite = _sawBusy,
                 SuppressedFingerprint = _suppressedToken,
+                SuppressedTriggerRow = _suppressedMatchStart,
+                Occurrence = _occurrence,
                 AttemptCount = _attemptCount,
                 RecoveryState = _state.ToString()
             };
@@ -157,6 +180,7 @@ namespace SaiCont
         public RetryDecision Observe(RuleObservation observation, TargetRule rule, DateTime nowUtc)
         {
             _lastObservedUtc = nowUtc;
+            _durableDirty = true;
 
             // W2-002: possible-successful-write (AttemptInFlightReserved restored
             // from a crash window) and partial-write ambiguity (AmbiguousFailClosed)
@@ -170,6 +194,7 @@ namespace SaiCont
                 {
                     // Previous write consumed the trigger: recovery observed.
                     _suppressedToken = _attemptToken;
+                    _suppressedMatchStart = _triggerMatchStart;
                     _state = RecoveryState.RecoveryConfirmed;
                     _attemptCount = 0;
                     _awaitingOutcome = false;
@@ -190,6 +215,7 @@ namespace SaiCont
                     // old ambiguous write is superseded; the new event starts a
                     // fresh retry lifecycle.
                     _triggerToken = observation.TriggerToken;
+                    _triggerMatchStart = observation.TriggerMatchStart;
                     _attemptToken = null;
                     _awaitingOutcome = false;
                     _sawBusy = false;
@@ -213,6 +239,7 @@ namespace SaiCont
                 if ((_state == RecoveryState.CommandWrittenAwaitingOutcome || _state == RecoveryState.TargetBusyOrProgressing) && observation.Ready)
                 {
                     _suppressedToken = _attemptToken;
+                    _suppressedMatchStart = _triggerMatchStart;
                     _state = RecoveryState.RecoveryConfirmed;
                     _attemptCount = 0;
                     _awaitingOutcome = false;
@@ -235,7 +262,19 @@ namespace SaiCont
 
             if (_suppressedToken != null && String.Equals(_suppressedToken, observation.TriggerToken, StringComparison.Ordinal))
             {
-                return Decision(false, "stale trigger suppressed after recovery");
+                if (_suppressedMatchStart < 0 || observation.TriggerMatchStart < 0 || observation.TriggerMatchStart == _suppressedMatchStart)
+                {
+                    return Decision(false, "stale trigger suppressed after recovery");
+                }
+                _occurrence++;
+                _suppressedToken = null;
+                _suppressedMatchStart = -1;
+                _triggerMatchStart = observation.TriggerMatchStart;
+                _attemptToken = null;
+                _attemptCount = 0;
+                _awaitingOutcome = false;
+                _nextAttemptUtc = observation.DueUtc;
+                _state = nowUtc < _nextAttemptUtc ? RecoveryState.EventWaitingDeadline : RecoveryState.EventReadyToAttempt;
             }
 
             if (!String.Equals(_triggerToken, observation.TriggerToken, StringComparison.Ordinal))
@@ -344,6 +383,7 @@ namespace SaiCont
 
         public void RecordAttempt(bool inputWritten, bool nativeWriteAttempted, string triggerToken, TargetRule rule, DateTime nowUtc)
         {
+            _durableDirty = true;
             _attemptToken = triggerToken;
             _sawBusy = false;
             if (nativeWriteAttempted)
@@ -376,6 +416,7 @@ namespace SaiCont
         // immediately re-attempted.
         public void ReserveAttempt(string triggerToken, TargetRule rule, DateTime nowUtc)
         {
+            _durableDirty = true;
             if (String.IsNullOrEmpty(_triggerToken))
             {
                 _triggerToken = triggerToken;
@@ -400,6 +441,7 @@ namespace SaiCont
         // durable fail-closed state and may only leave through console evidence.
         public void CommitAttempt(NativeWriteOutcome outcome, TargetRule rule, DateTime nowUtc)
         {
+            _durableDirty = true;
             _sawBusy = false;
             if (outcome == NativeWriteOutcome.CompleteInputCommitted)
             {
@@ -441,6 +483,44 @@ namespace SaiCont
                 return DateTime.MinValue;
             }
             return value;
+        }
+
+        public RetrySessionState Clone()
+        {
+            var copy = new RetrySessionState();
+            copy._state = _state;
+            copy._awaitingOutcome = _awaitingOutcome;
+            copy._sawBusy = _sawBusy;
+            copy._triggerToken = _triggerToken;
+            copy._attemptToken = _attemptToken;
+            copy._suppressedToken = _suppressedToken;
+            copy._suppressedMatchStart = _suppressedMatchStart;
+            copy._occurrence = _occurrence;
+            copy._triggerMatchStart = _triggerMatchStart;
+            copy._nextAttemptUtc = _nextAttemptUtc;
+            copy._lastObservedUtc = _lastObservedUtc;
+            copy._lastWriteUtc = _lastWriteUtc;
+            copy._attemptCount = _attemptCount;
+            return copy;
+        }
+
+        public void RestoreFromClone(RetrySessionState source)
+        {
+            if (source == null) return;
+            _durableDirty = true;
+            _state = source._state;
+            _awaitingOutcome = source._awaitingOutcome;
+            _sawBusy = source._sawBusy;
+            _triggerToken = source._triggerToken;
+            _attemptToken = source._attemptToken;
+            _suppressedToken = source._suppressedToken;
+            _suppressedMatchStart = source._suppressedMatchStart;
+            _occurrence = source._occurrence;
+            _triggerMatchStart = source._triggerMatchStart;
+            _nextAttemptUtc = source._nextAttemptUtc;
+            _lastObservedUtc = source._lastObservedUtc;
+            _lastWriteUtc = source._lastWriteUtc;
+            _attemptCount = source._attemptCount;
         }
 
         private static DateTime SanitizeNextAttempt(DateTime value, DateTime nowUtc)

@@ -10,9 +10,18 @@ $paths = Get-SaiContPaths
 $stateExistedBefore = Test-Path -LiteralPath $paths.StateFile -PathType Leaf
 $stateHashBefore = if ($stateExistedBefore) { (Get-FileHash -Algorithm SHA256 -LiteralPath $paths.StateFile).Hash } else { $null }
 
-$existingProcess = Get-SaiContProcess -Paths $paths
-if ($null -ne $existingProcess) {
-    throw "Refusing smoke test while SAICONT PID $($existingProcess.Id) is already running."
+$runtimeState = Get-SaiContProcessState -Paths $paths
+if ($runtimeState.Disposition -eq 'RUNNING_VERIFIED') {
+    throw "Refusing smoke test while SAICONT PID $($runtimeState.Process.Id) is already running."
+}
+if ($runtimeState.Disposition -eq 'UNVERIFIABLE') {
+    throw "Refusing smoke test: live runtime identity is unverifiable. $($runtimeState.Error)"
+}
+if ($runtimeState.Disposition -eq 'POSITIVELY_STALE') {
+    & (Join-Path $PSScriptRoot 'status.ps1') -Repair | Out-Host
+    if ((Get-SaiContProcessState -Paths $paths).Disposition -ne 'STOPPED_VERIFIED') {
+        throw 'Refusing smoke test: stale runtime repair did not produce verified stopped state.'
+    }
 }
 
 Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File | ForEach-Object {
@@ -152,6 +161,9 @@ if ($stateExistedBefore -ne $stateExistsAfter -or $stateHashBefore -ne $stateHas
 Write-Output 'PASS: Probe and dry-run left production retry state unchanged'
 
 $shellPath = (Get-Process -Id $PID).Path
+if ((Get-SaiContProcessState -Paths $paths).Disposition -ne 'STOPPED_VERIFIED') {
+    throw 'Refusing synthetic lifecycle fixtures: runtime is not verified stopped.'
+}
 [IO.File]::WriteAllText($paths.PidFile, '999999', [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText($paths.InstanceFile, '<broken>', [Text.Encoding]::UTF8)
 [IO.File]::WriteAllText($paths.StopFile, 'STALE', [Text.Encoding]::ASCII)

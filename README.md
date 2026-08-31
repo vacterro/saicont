@@ -1,6 +1,6 @@
 # SAICONT
 
-![version](https://img.shields.io/badge/version-1.1.0-darkgoldenrod)
+![version](https://img.shields.io/badge/version-1.1.1-darkgoldenrod)
 
 SAICONT is a compact, dependency-free Windows console watcher for safely resuming terminal AI agents without stealing window focus. It finds Cline and Codex through their process trees, reads recent console text, and injects `cc` only when a configured failure is recent, the target input prompt is proven empty and ready, and all retry/backoff deadlines are satisfied.
 

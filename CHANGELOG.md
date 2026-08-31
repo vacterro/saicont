@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 - 2026-08-31
+
+- **Audit ALL_3 wave 3**: ship the static-complete implementation of the remaining findings from the AUDIT_ALL_3 audit handoff. W2-001 TerminalUi worker join, W2-005 nonzero on handler failure, W2-006 stopfile cleanup in finally, PERF-001 ManualResetEventSlim interruptible wait, PERF-004 rule-by-name dict + per-state dirty flag + bounded checkpoint, PERF-005 perf script one-core CPU + median/p95/max + active scenario, plus the prior wave's audit-defect fixes (T-26..T-35, T-59..T-70, T-97..T-114). 265/265 self-tests PASS on a clean csc build. Live Windows-handoff verification (smoke.ps1, acceptance.ps1, W2-005 handler-failure integration) remains an operator task.
+- **Resource identity**: per-resource SHA-256 mutex lease over the canonical physical runtime paths (volume+file-index for existing files, canonical final path otherwise) with sorted acquisition to avoid cross-config deadlock and pairwise collision rejection before any delete/write/quarantine/rotation.
+
 ## 1.1.0 - 2026-08-27
 
 - **Reliability Fail-Safes**: global `AppDomain.UnhandledException` crash guard appending a last-gasp report to `run\SAICONT.crash.log`, WinForms `ThreadException` reporting instead of silent GUI death, and TUI startup/poll exception guards that keep the terminal adapter alive on poll failures.

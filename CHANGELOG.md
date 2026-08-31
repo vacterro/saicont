@@ -9,7 +9,7 @@
 
 - **Reliability Fail-Safes**: global `AppDomain.UnhandledException` crash guard appending a last-gasp report to `run\SAICONT.crash.log`, WinForms `ThreadException` reporting instead of silent GUI death, and TUI startup/poll exception guards that keep the terminal adapter alive on poll failures.
 - **Graceful Ctrl+C Lifecycle**: native `SetConsoleCtrlHandler` stop path replaces the managed hook whose finalizer raced `FreeConsole` and aborted exit with 0xE0434352; Ctrl+C now sets a stop request honored by the watcher loop, letting the existing finally-chain release pid/instance/stop artifacts cleanly.
-- **SAICONT TERMINAL**: new `--terminal` mode and `SAICONT_TERMINAL.cmd` launcher opening the branded monitor/dispatcher adapter window with 220 deterministic self-tests.
+- **SAICONT TERMINAL**: new `--terminal` mode and `SAICONT_TERMINAL.cmd` launcher opening the branded monitor/dispatcher adapter window with 265 deterministic self-tests.
 
 ## 1.0.0 - 2026-08-26
 

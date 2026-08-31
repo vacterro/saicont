@@ -76,6 +76,13 @@ Use `start.ps1 -DryRun` to exercise the hidden lifecycle without input injection
 
 This builds the current sources, registers the `SAICONT` scheduled task for the current user, and starts the watcher. The task launches through the hidden VBS wrapper and does not require a visible console window.
 
+> **Roadmap pack**: `SAICONT_FULL_ROADMAP/` contains the v0.3.1->v1.0 audit
+> handoff and the 09_POST_V1_BACKLOG file. The v0.3.1..v1.0 wave files are
+> historical (superseded by the T-25..T-119 implementation tickets and the
+> v1.1.0/v1.1.1 release); they are kept in the v1.1.1 branch as forensic
+> reference only. `09_POST_V1_BACKLOG_DO_NOT_IMPLEMENT_NOW.md` is
+> explicitly deferred scope and must NOT be acted on without re-approval.
+
 Remove the task and stop the watcher with:
 
 ```powershell

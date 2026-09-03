@@ -83,8 +83,10 @@ namespace SaiCont
                             @"(?i)temporarily rate[- ]limited upstream",
                             @"(?i)rate[- ]limited upstream",
                             @"(?i)daily free model limit reached(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in",
-                            @"(?i)reached today.s free usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in"
-                        },
+                             @"(?i)reached today.s free usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in",
+                             @"(?i)""code""\s*:\s*""internal_error""",
+                             @"(?i)Cannot read\s+""clipboard""\s+\(this model does not support image input\)"
+                         },
                         ReadyPatterns = new[]
                         {
                             @"^.*Ask anything\.\.\.\s*$",
@@ -131,7 +133,7 @@ namespace SaiCont
 
             var configuration = new WatcherConfiguration
             {
-                PollIntervalMilliseconds = ReadInteger(root, "pollIntervalMilliseconds", 250, 3600000),
+                PollIntervalMilliseconds = ReadInteger(root, "pollIntervalMilliseconds", WatcherRuleLimits.PollIntervalMillisecondsMin, WatcherRuleLimits.PollIntervalMillisecondsMax),
                 Targets = new List<TargetRule>()
             };
 
@@ -140,9 +142,9 @@ namespace SaiCont
             ValidateChildElements(logging);
             string configuredLogPath = ReadString(logging, "path");
             configuration.LogFilePath = ResolvePath(Path.GetDirectoryName(fullPath), configuredLogPath);
-            configuration.LogMaximumBytes = ReadLong(logging, "maxBytes", 4096, Int32.MaxValue);
-            configuration.LogRetainedFiles = ReadInteger(logging, "retainedFiles", 1, 20);
-            configuration.LogDuplicateWindowSeconds = ReadInteger(logging, "duplicateWindowSeconds", 1, 3600);
+            configuration.LogMaximumBytes = ReadLong(logging, "maxBytes", WatcherRuleLimits.LogMaximumBytesMin, WatcherRuleLimits.LogMaximumBytesMax);
+            configuration.LogRetainedFiles = ReadInteger(logging, "retainedFiles", WatcherRuleLimits.LogRetainedFilesMin, WatcherRuleLimits.LogRetainedFilesMax);
+            configuration.LogDuplicateWindowSeconds = ReadInteger(logging, "duplicateWindowSeconds", WatcherRuleLimits.LogDuplicateWindowSecondsMin, WatcherRuleLimits.LogDuplicateWindowSecondsMax);
 
             var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             XmlElement targets = RequireChild(root, "targets");
@@ -166,6 +168,9 @@ namespace SaiCont
                     targetElement,
                     "name",
                     "enabled",
+                    "transport",
+                    "endpoint",
+                    "projectDir",
                     "command",
                     "scanLines",
                     "maximumTriggerDistanceLines",
@@ -175,28 +180,42 @@ namespace SaiCont
                     "backoffMultiplier",
                     "maxRetryIntervalSeconds",
                     "maxAttempts");
-                ValidateChildElements(targetElement, "processNames", "triggerPatterns", "readyPatterns", "busyPatterns");
+                string targetTransport = ReadOptionalString(targetElement, "transport", "console");
+                ValidateChildElements(
+                    targetElement,
+                    targetTransport == "opencode-http"
+                        ? new[] { "triggerPatterns", "readyPatterns", "busyPatterns" }
+                        : new[] { "processNames", "triggerPatterns", "readyPatterns", "busyPatterns" });
 
                 var target = new TargetRule
                 {
                     Name = name,
                     Enabled = ReadBoolean(targetElement, "enabled"),
+                    Transport = targetTransport,
+                    Endpoint = ReadOptionalString(targetElement, "endpoint", null),
+                    ProjectDirectory = ReadOptionalString(targetElement, "projectDir", null),
                     Command = ReadString(targetElement, "command"),
-                    ScanLines = ReadInteger(targetElement, "scanLines", 10, NativeConsole.MaximumScanLines),
-                    MaximumTriggerDistanceLines = ReadInteger(targetElement, "maximumTriggerDistanceLines", 1, 5000),
-                    InitialDelaySeconds = ReadInteger(targetElement, "initialDelaySeconds", 10, 86400),
-                    RetryIntervalSeconds = ReadInteger(targetElement, "retryIntervalSeconds", 10, 86400),
+                    ScanLines = String.Equals(targetTransport, "opencode-http", StringComparison.OrdinalIgnoreCase)
+                        ? ReadOptionalInteger(targetElement, "scanLines", 180, WatcherRuleLimits.ScanLinesMin, NativeConsole.MaximumScanLines)
+                        : ReadInteger(targetElement, "scanLines", WatcherRuleLimits.ScanLinesMin, NativeConsole.MaximumScanLines),
+                    MaximumTriggerDistanceLines = String.Equals(targetTransport, "opencode-http", StringComparison.OrdinalIgnoreCase)
+                        ? ReadOptionalInteger(targetElement, "maximumTriggerDistanceLines", 150, WatcherRuleLimits.MaximumTriggerDistanceLinesMin, WatcherRuleLimits.MaximumTriggerDistanceLinesMax)
+                        : ReadInteger(targetElement, "maximumTriggerDistanceLines", WatcherRuleLimits.MaximumTriggerDistanceLinesMin, WatcherRuleLimits.MaximumTriggerDistanceLinesMax),
+                    InitialDelaySeconds = ReadInteger(targetElement, "initialDelaySeconds", WatcherRuleLimits.InitialDelaySecondsMin, WatcherRuleLimits.InitialDelaySecondsMax),
+                    RetryIntervalSeconds = ReadInteger(targetElement, "retryIntervalSeconds", WatcherRuleLimits.RetryIntervalSecondsMin, WatcherRuleLimits.RetryIntervalSecondsMax),
                     ParseRetryTime = ReadBoolean(targetElement, "parseRetryTime"),
-                    BackoffMultiplier = ReadOptionalDouble(targetElement, "backoffMultiplier", 2.0),
-                    MaximumRetryIntervalSeconds = ReadOptionalInteger(targetElement, "maxRetryIntervalSeconds", 3600, 10, 86400),
-                    MaximumAttemptsPerEvent = ReadOptionalInteger(targetElement, "maxAttempts", 5, 1, 50),
-                    ProcessNames = ReadValues(targetElement, "processNames", "process", true),
+                    BackoffMultiplier = ReadOptionalDouble(targetElement, "backoffMultiplier", WatcherRuleLimits.BackoffMultiplierDefault),
+                    MaximumRetryIntervalSeconds = ReadOptionalInteger(targetElement, "maxRetryIntervalSeconds", WatcherRuleLimits.MaxRetryIntervalSecondsDefault, WatcherRuleLimits.MaxRetryIntervalSecondsMin, WatcherRuleLimits.MaxRetryIntervalSecondsMax),
+                    MaximumAttemptsPerEvent = ReadOptionalInteger(targetElement, "maxAttempts", WatcherRuleLimits.MaxAttemptsDefault, WatcherRuleLimits.MaxAttemptsMin, WatcherRuleLimits.MaxAttemptsMax),
+                    ProcessNames = targetTransport == "opencode-http"
+                        ? new string[0]
+                        : ReadValues(targetElement, "processNames", "process", true),
                     TriggerPatterns = ReadValues(targetElement, "triggerPatterns", "pattern", true),
-                    ReadyPatterns = ReadValues(targetElement, "readyPatterns", "pattern", true),
-                    BusyPatterns = ReadValues(targetElement, "busyPatterns", "pattern", false)
+                    ReadyPatterns = ReadValues(targetElement, "readyPatterns", "pattern", targetTransport != "opencode-http", targetTransport != "opencode-http"),
+                    BusyPatterns = ReadValues(targetElement, "busyPatterns", "pattern", false, targetTransport != "opencode-http")
                 };
 
-                ValidateTarget(target);
+                ValidateTargetImpl(target);
                 configuration.Targets.Add(target);
             }
 
@@ -208,15 +227,54 @@ namespace SaiCont
             return configuration;
         }
 
-        private static void ValidateTarget(TargetRule target)
+        internal static void ValidateTarget(TargetRule target)
+        {
+            ValidateTargetImpl(target);
+        }
+
+        private static void ValidateTargetImpl(TargetRule target)
         {
             if (!Regex.IsMatch(target.Name, @"^[A-Za-z0-9._-]+$", RegexOptions.CultureInvariant))
             {
                 throw new FormatException("Target name '" + target.Name + "' must contain only letters, digits, dot, underscore, or hyphen.");
             }
-            if (target.Command.Length > 512)
+
+            string transport = target.Transport ?? "console";
+            if (transport != "console" && transport != "opencode-http")
             {
-                throw new FormatException("Target '" + target.Name + "' command exceeds maximum length of 512.");
+                throw new FormatException("Target '" + target.Name + "' transport must be 'console' or 'opencode-http'.");
+            }
+            if (transport == "opencode-http")
+            {
+                if (String.IsNullOrWhiteSpace(target.Endpoint))
+                {
+                    throw new FormatException("Target '" + target.Name + "' transport='opencode-http' requires endpoint=\"http://host:port\".");
+                }
+                if (target.Enabled && String.IsNullOrWhiteSpace(target.ProjectDirectory))
+                {
+                    throw new FormatException("Target '" + target.Name + "' transport='opencode-http' requires projectDir=\"path\".");
+                }
+                try
+                {
+                    if (!String.IsNullOrWhiteSpace(target.ProjectDirectory))
+                    {
+                        target.ProjectDirectory = Path.GetFullPath(target.ProjectDirectory);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    throw new FormatException("Target '" + target.Name + "' projectDir is invalid: " + exception.Message);
+                }
+                Uri endpointUri;
+                if (!Uri.TryCreate(target.Endpoint, UriKind.Absolute, out endpointUri) || (endpointUri.Scheme != "http" && endpointUri.Scheme != "https"))
+                {
+                    throw new FormatException("Target '" + target.Name + "' endpoint must be an absolute http/https URL.");
+                }
+            }
+
+            if (target.Command.Length > WatcherRuleLimits.CommandMaxLength)
+            {
+                throw new FormatException("Target '" + target.Name + "' command exceeds maximum length of " + WatcherRuleLimits.CommandMaxLength + ".");
             }
 
             if (target.Command.IndexOf('\r') >= 0 || target.Command.IndexOf('\n') >= 0)
@@ -224,19 +282,22 @@ namespace SaiCont
                 throw new FormatException("Target '" + target.Name + "' command must be one line.");
             }
 
-            if (target.ProcessNames == null || target.ProcessNames.Length == 0)
+            if (transport == "console" && (target.ProcessNames == null || target.ProcessNames.Length == 0))
             {
                 throw new FormatException("Target '" + target.Name + "' must have at least one process name.");
             }
 
-            foreach (string processName in target.ProcessNames)
+            if (transport == "console")
             {
-                string normalized = ProcessDiscovery.NormalizeName(processName);
-                if (String.IsNullOrEmpty(normalized) ||
-                    !Regex.IsMatch(processName, @"^[A-Za-z0-9._-]+(?:\.exe)?$", RegexOptions.CultureInvariant) ||
-                    processName.IndexOfAny(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar, ':' }) >= 0)
+                foreach (string processName in target.ProcessNames)
                 {
-                    throw new FormatException("Target '" + target.Name + "' has unsafe process name '" + processName + "'.");
+                    string normalized = ProcessDiscovery.NormalizeName(processName);
+                    if (String.IsNullOrEmpty(normalized) ||
+                        !Regex.IsMatch(processName, @"^[A-Za-z0-9._-]+(?:\.exe)?$", RegexOptions.CultureInvariant) ||
+                        processName.IndexOfAny(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar, ':' }) >= 0)
+                    {
+                        throw new FormatException("Target '" + target.Name + "' has unsafe process name '" + processName + "'.");
+                    }
                 }
             }
 
@@ -244,18 +305,20 @@ namespace SaiCont
             {
                 throw new FormatException("Target '" + target.Name + "' maximumTriggerDistanceLines cannot exceed scanLines.");
             }
-            if (Double.IsNaN(target.BackoffMultiplier) || Double.IsInfinity(target.BackoffMultiplier) || target.BackoffMultiplier < 1.0 || target.BackoffMultiplier > 10.0)
+            if (Double.IsNaN(target.BackoffMultiplier) || Double.IsInfinity(target.BackoffMultiplier) || target.BackoffMultiplier < WatcherRuleLimits.BackoffMultiplierMin || target.BackoffMultiplier > WatcherRuleLimits.BackoffMultiplierMax)
             {
-                throw new FormatException("Target '" + target.Name + "' backoffMultiplier must be a finite value between 1 and 10.");
+                throw new FormatException("Target '" + target.Name + "' backoffMultiplier must be a finite value between " + WatcherRuleLimits.BackoffMultiplierMin + " and " + WatcherRuleLimits.BackoffMultiplierMax + ".");
             }
             if (target.MaximumRetryIntervalSeconds < target.RetryIntervalSeconds)
             {
                 throw new FormatException("Target '" + target.Name + "' maxRetryIntervalSeconds cannot be less than retryIntervalSeconds.");
             }
 
-            ValidatePatternGroup(target.Name, "triggerPatterns", target.TriggerPatterns, 32, true);
-            ValidatePatternGroup(target.Name, "readyPatterns", target.ReadyPatterns, 16, true);
-            ValidatePatternGroup(target.Name, "busyPatterns", target.BusyPatterns, 16, false);
+            ValidatePatternGroup(target.Name, "triggerPatterns", target.TriggerPatterns, WatcherRuleLimits.TriggerPatternsMax, true);
+            // Console rules need prompt markers; OpenCode lifecycle truth comes
+            // from SSE/REST and must not depend on TUI text regexes.
+            ValidatePatternGroup(target.Name, "readyPatterns", target.ReadyPatterns, WatcherRuleLimits.ReadyPatternsMax, transport == "console");
+            ValidatePatternGroup(target.Name, "busyPatterns", target.BusyPatterns, WatcherRuleLimits.BusyPatternsMax, false);
 
             target.CompileRegexes();
         }
@@ -273,9 +336,9 @@ namespace SaiCont
             }
             for (int index = 0; index < count; index++)
             {
-                if (patterns[index].Length > 2048)
+                if (patterns[index].Length > WatcherRuleLimits.PatternMaxLength)
                 {
-                    throw new FormatException("Target '" + targetName + "' " + groupName + "[" + index + "] exceeds 2048 characters.");
+                    throw new FormatException("Target '" + targetName + "' " + groupName + "[" + index + "] exceeds " + WatcherRuleLimits.PatternMaxLength + " characters.");
                 }
             }
         }
@@ -312,6 +375,21 @@ namespace SaiCont
                 throw new FormatException("Missing or empty '" + attributeName + "' on <" + element.Name + ">.");
             }
             return value.Trim();
+        }
+
+        private static string ReadOptionalString(XmlElement element, string attributeName, string fallback)
+        {
+            if (!element.HasAttribute(attributeName))
+            {
+                return fallback;
+            }
+            string value = element.GetAttribute(attributeName);
+            if (value == null)
+            {
+                return fallback;
+            }
+            value = value.Trim();
+            return value.Length == 0 ? fallback : value;
         }
 
         private static bool ReadBoolean(XmlElement element, string attributeName)
@@ -378,9 +456,22 @@ namespace SaiCont
             return value;
         }
 
-        private static string[] ReadValues(XmlElement parent, string containerName, string itemName, bool requireAny)
+        private static string[] ReadValues(XmlElement parent, string containerName, string itemName, bool requireAny, bool requireContainer = true)
         {
-            XmlElement container = RequireChild(parent, containerName);
+            XmlElement container = null;
+            int containerCount = 0;
+            foreach (XmlNode node in parent.ChildNodes)
+            {
+                XmlElement child = node as XmlElement;
+                if (child != null && String.Equals(child.Name, containerName, StringComparison.Ordinal))
+                {
+                    container = child;
+                    containerCount++;
+                }
+            }
+            if (containerCount == 0 && !requireContainer) return new string[0];
+            if (containerCount == 0) throw new FormatException("Missing <" + containerName + "> inside <" + parent.Name + ">.");
+            if (containerCount != 1) throw new FormatException("Duplicate <" + containerName + "> inside <" + parent.Name + ">.");
             ValidateAttributes(container);
             ValidateChildElements(container, itemName);
             var values = new List<string>();
@@ -442,6 +533,12 @@ namespace SaiCont
     {
         public string Name;
         public bool Enabled;
+        public string Transport;
+        public string Endpoint;
+        public string ProjectDirectory;
+        internal string ActiveAgentForSend;
+        internal string ModelProviderForSend;
+        internal string ModelIdForSend;
         public string[] ProcessNames;
         public string Command;
         public int ScanLines;
@@ -467,6 +564,7 @@ namespace SaiCont
             {
                 var builder = new StringBuilder();
                 builder.Append(Name).Append('|').Append(Enabled).Append('|').Append(Command).Append('|')
+                    .Append(Transport ?? "console").Append('|').Append(Endpoint ?? String.Empty).Append('|').Append(ProjectDirectory ?? String.Empty).Append('|')
                     .Append(ScanLines).Append('|').Append(MaximumTriggerDistanceLines).Append('|')
                     .Append(InitialDelaySeconds).Append('|').Append(RetryIntervalSeconds).Append('|')
                     .Append(ParseRetryTime).Append('|').Append(BackoffMultiplier.ToString("R", CultureInfo.InvariantCulture)).Append('|')
@@ -497,27 +595,27 @@ namespace SaiCont
 
         public int SafeInitialDelaySeconds
         {
-            get { return Math.Max(10, InitialDelaySeconds); }
+            get { return Math.Max(WatcherRuleLimits.InitialDelaySecondsMin, InitialDelaySeconds); }
         }
 
         public int SafeRetryIntervalSeconds
         {
-            get { return Math.Max(10, RetryIntervalSeconds); }
+            get { return Math.Max(WatcherRuleLimits.RetryIntervalSecondsMin, RetryIntervalSeconds); }
         }
 
         public double SafeBackoffMultiplier
         {
-            get { return BackoffMultiplier <= 0 ? 2.0 : Math.Max(1.0, Math.Min(10.0, BackoffMultiplier)); }
+            get { return BackoffMultiplier <= 0 ? WatcherRuleLimits.BackoffMultiplierDefault : Math.Max(WatcherRuleLimits.BackoffMultiplierMin, Math.Min(WatcherRuleLimits.BackoffMultiplierMax, BackoffMultiplier)); }
         }
 
         public int SafeMaximumRetryIntervalSeconds
         {
-            get { return MaximumRetryIntervalSeconds <= 0 ? 3600 : Math.Max(SafeRetryIntervalSeconds, Math.Min(86400, MaximumRetryIntervalSeconds)); }
+            get { return MaximumRetryIntervalSeconds <= 0 ? WatcherRuleLimits.MaxRetryIntervalSecondsDefault : Math.Max(SafeRetryIntervalSeconds, Math.Min(WatcherRuleLimits.MaxRetryIntervalSecondsMax, MaximumRetryIntervalSeconds)); }
         }
 
         public int SafeMaximumAttemptsPerEvent
         {
-            get { return MaximumAttemptsPerEvent <= 0 ? 5 : Math.Max(1, Math.Min(50, MaximumAttemptsPerEvent)); }
+            get { return MaximumAttemptsPerEvent <= 0 ? WatcherRuleLimits.MaxAttemptsDefault : Math.Max(WatcherRuleLimits.MaxAttemptsMin, Math.Min(WatcherRuleLimits.MaxAttemptsMax, MaximumAttemptsPerEvent)); }
         }
 
         public void CompileRegexes()

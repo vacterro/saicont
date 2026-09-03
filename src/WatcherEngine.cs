@@ -27,11 +27,61 @@ namespace SaiCont
         public string Error;
         public string TriggerToken;
         public DateTime NextAttemptUtc;
+        public string FailureClass;
+        public string FailureAction;
+        public bool FailureRetryable;
+        public string FailureSeverity;
+        public string FailureMatchedBy;
+        public string DecisionCode { get { return PollDecisionCode.From(this); } }
     }        internal delegate NativeWriteOutcome VerifiedConsoleWriter(
         ResolvedConsoleSession session,
         ProcessSessionIdentity expectedTarget,
         string command,
         out string error);
+
+    // T-141: stable, bounded machine codes. Human Reason/Error text may carry
+    // diagnostics, paths, or provider prose; none of that may leak into the
+    // health contract as an accidental API.
+    internal static class PollDecisionCode
+    {
+        public static string From(PollResult result)
+        {
+            if (result == null) return "no_result";
+            string reason = result.Reason ?? String.Empty;
+            if (result.Sent || reason == "send=command_written") return "command_written";
+            if (reason.StartsWith("send_blocked=process_discovery_unavailable", StringComparison.Ordinal)) return "process_discovery_unavailable";
+            if (reason.StartsWith("send_blocked=state_store_unavailable", StringComparison.Ordinal)) return "state_store_unavailable";
+            if (reason.StartsWith("send_blocked=state_ledger_ambiguous", StringComparison.Ordinal)) return "state_ledger_ambiguous";
+            if (reason.StartsWith("send_blocked=state_capacity_exhausted", StringComparison.Ordinal)) return "state_capacity_exhausted";
+            if (reason.StartsWith("send_blocked=state_recovery_cooldown", StringComparison.Ordinal) || reason == "state_recovery_cooldown") return "state_recovery_cooldown";
+            if (reason.StartsWith("send_blocked=rule_evaluation_failed", StringComparison.Ordinal)) return "rule_evaluation_failed";
+            if (reason.StartsWith("send_blocked=authorization_revoked_mid_poll", StringComparison.Ordinal)) return "authorization_revoked";
+            if (reason.StartsWith("send_blocked=target_identity_unavailable", StringComparison.Ordinal)) return "target_identity_unavailable";
+            if (reason.StartsWith("send_blocked=process_session_changed", StringComparison.Ordinal)) return "process_session_changed";
+            if (reason.StartsWith("send_blocked=target_disappeared", StringComparison.Ordinal)) return "target_disappeared";
+            if (reason.StartsWith("send_blocked=re-resolution_failed", StringComparison.Ordinal)) return "reresolution_failed";
+            if (reason.StartsWith("send_blocked=console_changed", StringComparison.Ordinal)) return "console_changed";
+            if (reason.StartsWith("send_blocked=target_not_in_console", StringComparison.Ordinal)) return "target_not_in_console";
+            if (reason.StartsWith("send_blocked=event_changed", StringComparison.Ordinal)) return "event_changed";
+            if (reason.StartsWith("send_blocked=prompt_not_ready", StringComparison.Ordinal)) return "prompt_not_ready";
+            if (reason.StartsWith("send_blocked=target_busy", StringComparison.Ordinal)) return "target_busy";
+            if (reason.StartsWith("send_blocked=stop_requested", StringComparison.Ordinal)) return "stop_requested";
+            if (reason.StartsWith("send_blocked=console_already_attempted_this_poll", StringComparison.Ordinal)) return "console_already_attempted";
+            if (reason.StartsWith("send_blocked=console_unavailable_backoff", StringComparison.Ordinal)) return "console_unavailable_backoff";
+            if (reason.StartsWith("send_blocked=transport_unavailable_backoff", StringComparison.Ordinal)) return "transport_unavailable_backoff";
+            if (reason.StartsWith("send_blocked=ambiguous_partial_write", StringComparison.Ordinal)) return "ambiguous_partial_write";
+            if (reason.StartsWith("send_blocked=input_write_failed", StringComparison.Ordinal)) return "input_write_failed";
+            if (reason == "console unavailable") return "console_unavailable";
+            if (reason == "poll failed") return "poll_failed";
+            if (result.FailureAction == FailureRecoveryAction.STOP_AND_REPORT.ToString()) return "provider_stop";
+            if (result.WouldSend) return "attempt_ready";
+            if (result.Busy) return "target_busy";
+            if (result.Triggered) return "trigger_wait";
+            if (!String.IsNullOrEmpty(result.Error)) return "runtime_error";
+            if (result.Read) return "observed";
+            return "no_match";
+        }
+    }
 
     internal sealed class WatcherEngine
     {
@@ -46,6 +96,20 @@ namespace SaiCont
         private readonly Func<DateTime> _clock;
         private readonly DurableStateStore _stateStore;
         private readonly ConsoleMembershipCheck _membershipChecker;
+        private readonly Dictionary<string, ITargetTransport> _targetTransports = new Dictionary<string, ITargetTransport>(StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _restoredOpenCodeSessions = new Dictionary<string, string>(StringComparer.Ordinal);
+        // T-158: console-resolution failure backoff. When a matched process
+        // cannot be bound to an attachable console (headless-host cline,
+        // dead-parent lineage, GUI-only binary, etc.), re-probing on every
+        // 2s poll is wasted work AND spams ERROR logs. Per-PID exponential
+        // backoff bounds the retry cadence while still recovering the moment
+        // the console becomes resolvable (e.g. after a rate-limit reset).
+        private readonly Dictionary<int, DateTime> _resolutionUnavailableUntilUtc = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, int> _resolutionUnavailableAttempts = new Dictionary<int, int>();
+        // T-158-http: transport-level backoff for HTTP targets whose server
+        // is unreachable. Keyed by rule name; same exponential cadence.
+        private readonly Dictionary<string, DateTime> _transportUnavailableUntilUtc = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> _transportUnavailableAttempts = new Dictionary<string, int>(StringComparer.Ordinal);
         private bool _stateLoaded;
         private bool _stateStoreHealthy = true;
         private bool _stateLedgerAmbiguous;
@@ -55,6 +119,19 @@ namespace SaiCont
         // change happened, while keeping a bounded checkpoint cadence for
         // LastObservedUtc retention semantics.
         private DateTime _lastDurableCheckpointUtc = DateTime.MinValue;
+        // T-139: health contract tracking. Health is written atomically to
+        // run/SAICONT.health.json and is non-authoritative for safety/retry.
+        private string _healthFilePath;
+        private int _policyRevision;
+        private DateTime _lastPollUtc = DateTime.MinValue;
+        private DateTime _lastSuccessfulPollUtc = DateTime.MinValue;
+        private DateTime _LastErrorUtc = DateTime.MinValue;
+        private string _lastErrorCode;
+        private DateTime _lastWriteUtc = DateTime.MinValue;
+        private string _lastWriteTarget;
+        private DateTime _lastHealthWriteUtc = DateTime.MinValue;
+        private const int HealthHeartbeatIntervalSeconds = 45;
+        private const int ProductVersionMajor = 1, ProductVersionMinor = 2;
         private Dictionary<string, TargetRule> _ruleByName;
         private bool _ruleByNameValid;
         private const int DurableCheckpointIntervalSeconds = 60;
@@ -106,7 +183,7 @@ namespace SaiCont
             _stateStore = stateStore;
         }
 
-        public IList<PollResult> PollOnce(bool allowInput, Func<bool> shouldStop = null)
+        public IList<PollResult> PollOnce(bool allowInput, Func<bool> shouldStop = null, Func<bool> authorizationRevoked = null)
         {
             DateTime nowUtc = _clock();
             string stateDiagnostic = null;
@@ -165,6 +242,7 @@ namespace SaiCont
                             ProcessName = String.Empty,
                             StartTimeUtc = rec.ProcessStartUtc
                         };
+                        RememberRestoredOpenCodeSession(rec, savedRule);
                     }
                 }
                 if (_stateStore.LastLoadDisposition == StateLoadDisposition.Unavailable)
@@ -222,6 +300,13 @@ namespace SaiCont
                     continue;
                 }
 
+                string transportKind = rule.Transport ?? "console";
+                if (String.Equals(transportKind, "opencode-http", StringComparison.OrdinalIgnoreCase))
+                {
+                    results.Add(PollOpenCodeHttp(rule, allowInput, shouldStop, authorizationRevoked, nowUtc));
+                    continue;
+                }
+
                 ISet<string> targetNameSet = rule.ProcessNameSet;
                 if (targetNameSet == null || targetNameSet.Count == 0)
                 {
@@ -257,8 +342,34 @@ namespace SaiCont
                     }
                     ResolvedConsoleSession resolvedConsole;
                     string readError;
+                    int resolutionKey = candidate.MatchedProcessId;
+                    DateTime resolutionCooldownUntil;
+                    if (_resolutionUnavailableUntilUtc.TryGetValue(resolutionKey, out resolutionCooldownUntil) && nowUtc < resolutionCooldownUntil)
+                    {
+                        // T-158: still inside the console-resolution backoff
+                        // window. Do not re-probe; report the waiting state so
+                        // the operator can see the cadence is intentional.
+                        results.Add(new PollResult
+                        {
+                            Target = rule.Name,
+                            ProcessId = resolutionKey,
+                            ParentProcessId = candidate.ParentProcessId,
+                            ProcessName = candidate.MatchedProcessName,
+                            Read = false,
+                            Error = null,
+                            Reason = "send_blocked=console_unavailable_backoff",
+                            NextAttemptUtc = resolutionCooldownUntil
+                        });
+                        continue;
+                    }
                     if (!TryReadTarget(rule, candidate, shouldStop, out resolvedConsole, out readError, ref sharedRefreshedProcesses, ref sharedRefreshedIndex, ref sharedRefreshTaken))
                     {
+                        // T-158: console could not be resolved (AttachConsole
+                        // invalid-handle, "console does not contain matched
+                        // process", membership unavailable, etc.). Record an
+                        // exponential backoff for THIS pid so the next polls
+                        // skip the expensive re-probe until it expires.
+                        AdvanceResolutionBackoff(resolutionKey, rule, nowUtc);
                         if (IsNonConsoleDiscoveryFailure(readError))
                         {
                             continue;
@@ -277,6 +388,10 @@ namespace SaiCont
                         });
                         continue;
                     }
+
+                    // T-158: console resolved; clear any pending backoff so a
+                    // future transient failure starts a fresh backoff ladder.
+                    ClearResolutionBackoff(resolutionKey);
 
                     RuleObservation observation = RuleMatcher.Inspect(rule, resolvedConsole.Snapshot, nowUtc);
                     // CORE-005: an evaluation failure (regex timeout / rule
@@ -354,7 +469,12 @@ namespace SaiCont
                         WouldSend = decision.Send,
                         Reason = decision.Reason,
                         TriggerToken = observation.TriggerToken,
-                        NextAttemptUtc = decision.NextAttemptUtc
+                        NextAttemptUtc = decision.NextAttemptUtc,
+                        FailureClass = observation.Failure != null && observation.Failure.IsKnown ? observation.Failure.Class.ToString() : null,
+                        FailureAction = observation.Failure != null && observation.Failure.IsKnown ? observation.Failure.RecommendedAction.ToString() : null,
+                        FailureRetryable = observation.Failure != null && observation.Failure.Retryable,
+                        FailureSeverity = observation.Failure != null && observation.Failure.IsKnown ? observation.Failure.Severity : null,
+                        FailureMatchedBy = observation.Failure != null && observation.Failure.MatchedBy != null ? String.Join(",", observation.Failure.MatchedBy) : null
                     };
 
                     if (!String.IsNullOrEmpty(observation.EvaluationError))
@@ -363,8 +483,17 @@ namespace SaiCont
                         result.Reason = "send_blocked=rule_evaluation_failed";
                     }
 
-                    if (decision.Send && allowInput)
+                    // T-135: pre-write authorization barrier. allowInput was captured
+                    // before PollOnce began; if authorization was revoked mid-poll
+                    // (e.g. WATCH -> DRY-RUN), the write must not proceed.
+                    if (decision.Send && allowInput && (authorizationRevoked == null || !authorizationRevoked()))
                     {
+                        if (authorizationRevoked != null && authorizationRevoked())
+                        {
+                            result.Reason = "send_blocked=authorization_revoked_mid_poll";
+                            state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
+                            continue;
+                        }
                         if (_stateStore != null && (!_stateStoreHealthy || _stateLedgerAmbiguous))
                         {
                             result.Error = _stateLedgerAmbiguous ? "state_ledger_ambiguous" : "state_store_unavailable";
@@ -558,7 +687,347 @@ namespace SaiCont
                 }
             }
 
+            // T-139: track poll outcome for health contract.
+            bool hadError = false;
+            string errorCode = null;
+            if (results != null)
+            {
+                foreach (PollResult r in results)
+                {
+                    if (!String.IsNullOrEmpty(r.Error))
+                    {
+                        hadError = true;
+                        errorCode = r.DecisionCode;
+                        break;
+                    }
+                }
+            }
+            _lastPollUtc = nowUtc;
+            if (hadError)
+            {
+                _LastErrorUtc = nowUtc;
+                _lastErrorCode = errorCode;
+            }
+            else
+            {
+                _lastSuccessfulPollUtc = nowUtc;
+            }
+            WriteHealth(nowUtc, results, !hadError);
+
             return results;
+        }
+
+        // SRC-023: OpenCode HTTP transport path. Mirrors the console candidate
+        // flow but reads through ITargetTransport.Poll instead of a Win32
+        // screen buffer, and commits through ITargetTransport.Send instead of
+        // WriteConsoleInputW. The transport builds a synthetic text surface
+        // that RuleMatcher.Inspect consumes unchanged, so trigger/ready/busy
+        // regexes, FailureIntelligence, and RetrySessionState all behave
+        // identically to the console path.
+        private PollResult PollOpenCodeHttp(
+            TargetRule rule,
+            bool allowInput,
+            Func<bool> shouldStop,
+            Func<bool> authorizationRevoked,
+            DateTime nowUtc)
+        {
+            ITargetTransport transport;
+            string transportKey = (rule.Endpoint ?? String.Empty).TrimEnd('/') + "|" + (rule.ProjectDirectory ?? String.Empty);
+            // T-158-http: while inside the unreachable-server backoff window,
+            // do not construct/poll the transport at all. A dead endpoint is
+            // reported once per cooldown instead of every 2s poll.
+            DateTime transportCooldownUntil;
+            if (_transportUnavailableUntilUtc.TryGetValue(rule.Name, out transportCooldownUntil) && nowUtc < transportCooldownUntil)
+            {
+                return new PollResult
+                {
+                    Target = rule.Name,
+                    Reason = "send_blocked=transport_unavailable_backoff",
+                    NextAttemptUtc = transportCooldownUntil
+                };
+            }
+            if (!_targetTransports.TryGetValue(transportKey, out transport))
+            {
+                string restoredSessionId;
+                bool restoredSessionKnown = TryGetRestoredOpenCodeSession(rule, out restoredSessionId);
+                transport = new OpenCodeHttpTransport(rule.Endpoint, rule.ProjectDirectory, restoredSessionKnown ? restoredSessionId : null, restoredSessionKnown && String.IsNullOrEmpty(restoredSessionId));
+                _targetTransports[transportKey] = transport;
+            }
+            string pollError;
+            TargetObservation observation = transport.Poll(rule, nowUtc, out pollError);
+
+            if (!String.IsNullOrEmpty(pollError) || observation == null)
+            {
+                AdvanceTransportBackoff(rule, nowUtc);
+                return new PollResult
+                {
+                    Target = rule.Name,
+                    Error = String.IsNullOrEmpty(pollError) ? "http_poll_failed" : pollError,
+                    Reason = "send_blocked=transport_unavailable"
+                };
+            }
+            ClearTransportBackoff(rule.Name);
+            if (!observation.CanSend)
+            {
+                return new PollResult
+                {
+                    Target = rule.Name,
+                    Error = observation.BlockReason ?? "transport_blocked",
+                    Reason = "send_blocked=" + (observation.BlockReason ?? "transport_blocked")
+                };
+            }
+
+            // Build the synthetic console surface the rule engine expects.
+            string text = observation.Text ?? String.Empty;
+            int cursorRow = observation.CursorRow > 0 ? observation.CursorRow : CountLines(text);
+            var snapshot = new ConsoleSnapshot
+            {
+                ProcessId = 0,
+                WindowHandle = IntPtr.Zero,
+                Title = observation.SessionIdentity,
+                Text = text,
+                CursorLine = LastLine(text),
+                CursorColumn = 0,
+                CursorRow = cursorRow,
+                StartRow = observation.StartRow,
+                BufferWidth = 120,
+                ConsoleProcessIds = new int[0],
+                MembershipStatus = ConsoleMembershipStatus.VerifiedPresent,
+                MembershipError = null
+            };
+
+            RuleObservation ruleObservation = RuleMatcher.Inspect(rule, snapshot, nowUtc);
+            if (!String.IsNullOrEmpty(ruleObservation.EvaluationError))
+            {
+                return new PollResult
+                {
+                    Target = rule.Name,
+                    Error = "rule_evaluation_failed=" + ruleObservation.EvaluationError,
+                    Reason = "send_blocked=rule_evaluation_failed"
+                };
+            }
+            // OpenCode owns lifecycle truth through its API. The matcher still
+            // supplies trigger/failure policy, but message history must not
+            // turn an idle session into busy (or vice versa) merely because a
+            // historical line contains words such as "working".
+            ruleObservation.Ready = observation.Ready;
+            ruleObservation.Busy = observation.Busy;
+
+            // Stable pseudo-PID for state identity: deterministic hash of
+            // endpoint+session so durable state survives restart.
+            int pseudoPid = StableIdentity(rule.Endpoint, observation.SessionIdentity);
+            DateTime sessionStart = StableSessionStart(rule.Endpoint, observation.SessionIdentity);
+            var identity = new ProcessSessionIdentity
+            {
+                ProcessId = pseudoPid,
+                ProcessName = "opencode-http",
+                StartTimeUtc = sessionStart
+            };
+            string stateKey = rule.Name + ":" + pseudoPid + ":" + sessionStart.ToString("o", CultureInfo.InvariantCulture);
+
+            RetrySessionState state;
+            if (!_states.TryGetValue(stateKey, out state))
+            {
+                if (_states.Count >= MaximumSessionStates && !TryMakeStateCapacity())
+                {
+                    return new PollResult
+                    {
+                        Target = rule.Name,
+                        Error = "state_capacity_exhausted",
+                        Reason = "send_blocked=state_capacity_exhausted"
+                    };
+                }
+                state = new RetrySessionState();
+                _states[stateKey] = state;
+            }
+            state.SetTransportIdentity(observation);
+            if (identity.IsStrong)
+            {
+                _stateIdentities[stateKey] = identity;
+            }
+
+            RetryDecision decision = state.Observe(ruleObservation, rule, nowUtc);
+            var result = new PollResult
+            {
+                Target = rule.Name,
+                ProcessId = pseudoPid,
+                ProcessName = "opencode-http",
+                AttachProcessId = pseudoPid,
+                Title = observation.SessionIdentity,
+                Read = true,
+                Triggered = ruleObservation.Triggered,
+                Ready = ruleObservation.Ready,
+                Busy = ruleObservation.Busy,
+                WouldSend = decision.Send,
+                Reason = decision.Reason,
+                TriggerToken = ruleObservation.TriggerToken,
+                NextAttemptUtc = decision.NextAttemptUtc,
+                FailureClass = ruleObservation.Failure != null && ruleObservation.Failure.IsKnown ? ruleObservation.Failure.Class.ToString() : null,
+                FailureAction = ruleObservation.Failure != null && ruleObservation.Failure.IsKnown ? ruleObservation.Failure.RecommendedAction.ToString() : null,
+                FailureRetryable = ruleObservation.Failure != null && ruleObservation.Failure.Retryable,
+                FailureSeverity = ruleObservation.Failure != null && ruleObservation.Failure.IsKnown ? ruleObservation.Failure.Severity : null,
+                FailureMatchedBy = ruleObservation.Failure != null && ruleObservation.Failure.MatchedBy != null ? String.Join(",", ruleObservation.Failure.MatchedBy) : null
+            };
+
+            SendOutcome completedOutcome;
+            if (transport.TryTakeCompletedSend(observation.SessionIdentity, out completedOutcome))
+            {
+                state.CommitAttempt(MapOutcome(completedOutcome), rule, nowUtc);
+                result.Sent = completedOutcome != null && completedOutcome.Disposition == SendDisposition.CompleteInputCommitted;
+                result.Error = result.Sent ? null : "http_send_failed: " + (completedOutcome == null ? "unknown" : completedOutcome.Disposition.ToString());
+                result.Reason = result.Sent ? "send=command_written" : "send_blocked=ambiguous_partial_write";
+                return result;
+            }
+
+            // T-135 mirror: same pre-write authorization barrier as console.
+            if (decision.Send && allowInput && (authorizationRevoked == null || !authorizationRevoked()))
+            {
+                if (_stateStore != null && (!_stateStoreHealthy || _stateLedgerAmbiguous))
+                {
+                    result.Error = _stateLedgerAmbiguous ? "state_ledger_ambiguous" : "state_store_unavailable";
+                    result.Reason = _stateLedgerAmbiguous ? "send_blocked=state_ledger_ambiguous" : "send_blocked=state_store_unavailable";
+                }
+                else if (_stateRecoveryNotBeforeUtc != DateTime.MinValue && nowUtc < _stateRecoveryNotBeforeUtc)
+                {
+                    result.Reason = "send_blocked=state_recovery_cooldown";
+                    state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
+                }
+                else if (shouldStop != null && shouldStop())
+                {
+                    result.Reason = "send_blocked=stop_requested";
+                    state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
+                }
+                else
+                {
+                    string validateError;
+                    if (!transport.ValidatePreSend(observation, rule, out validateError))
+                    {
+                        result.Reason = "send_blocked=pre_send_validation: " + validateError;
+                        state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
+                    }
+                    else
+                    {
+                        RetrySessionState preReservationSnapshot = state.Clone();
+                        state.ReserveAttempt(ruleObservation.TriggerToken, rule, nowUtc);
+                        if (_stateStore != null)
+                        {
+                            bool preChanged;
+                            string preError;
+                            List<StateRecord> preRecords = ExportAllStates(nowUtc);
+                            if (!_stateStore.TrySave(preRecords, nowUtc, out preChanged, out preError))
+                            {
+                                state.RestoreFromClone(preReservationSnapshot);
+                                _stateStoreHealthy = false;
+                                result.Error = "state_write_failed: " + preError;
+                                result.Reason = "send_blocked=state_store_unavailable";
+                                return result;
+                            }
+                        }
+                        string sendError;
+                        SendOutcome outcome = transport.Send(
+                            observation,
+                            rule,
+                            rule.Command,
+                            delegate
+                            {
+                                return (authorizationRevoked == null || !authorizationRevoked()) &&
+                                    (shouldStop == null || !shouldStop());
+                            },
+                            out sendError);
+                        result.Sent = outcome != null && outcome.Disposition == SendDisposition.CompleteInputCommitted;
+                        result.Error = sendError;
+                        if (outcome != null && outcome.Disposition == SendDisposition.Pending)
+                        {
+                            result.Reason = "send=pending";
+                            return result;
+                        }
+                        if (result.Sent)
+                        {
+                            result.Reason = "send=command_written";
+                        }
+                        else
+                        {
+                            result.Reason = sendError ?? "send_blocked=send_failed";
+                        }
+                        NativeWriteOutcome mapped = MapOutcome(outcome);
+                        state.CommitAttempt(mapped, rule, nowUtc);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static NativeWriteOutcome MapOutcome(SendOutcome outcome)
+        {
+            if (outcome == null) return NativeWriteOutcome.NoInputCommitted;
+            switch (outcome.Disposition)
+            {
+                case SendDisposition.CompleteInputCommitted: return NativeWriteOutcome.CompleteInputCommitted;
+                case SendDisposition.AmbiguousOrPartialInput: return NativeWriteOutcome.AmbiguousOrPartialInput;
+                default: return NativeWriteOutcome.NoInputCommitted;
+            }
+        }
+
+        private void RememberRestoredOpenCodeSession(StateRecord record, TargetRule rule)
+        {
+            if (record == null || rule == null || !String.Equals(rule.Transport, "opencode-http", StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(record.TransportKind, "opencode-http", StringComparison.OrdinalIgnoreCase) ||
+                String.IsNullOrWhiteSpace(record.SessionIdentity)) return;
+            string key = OpenCodeStateKey(rule.Name, rule.Endpoint, rule.ProjectDirectory);
+            string existing;
+            if (_restoredOpenCodeSessions.TryGetValue(key, out existing) && !String.Equals(existing, record.SessionIdentity, StringComparison.Ordinal))
+            {
+                _restoredOpenCodeSessions[key] = String.Empty;
+            }
+            else if (!_restoredOpenCodeSessions.ContainsKey(key))
+            {
+                _restoredOpenCodeSessions[key] = record.SessionIdentity;
+            }
+        }
+
+        private bool TryGetRestoredOpenCodeSession(TargetRule rule, out string sessionId)
+        {
+            return _restoredOpenCodeSessions.TryGetValue(OpenCodeStateKey(rule.Name, rule.Endpoint, rule.ProjectDirectory), out sessionId);
+        }
+
+        private static string OpenCodeStateKey(string ruleName, string endpoint, string projectDirectory)
+        {
+            return (ruleName ?? String.Empty) + "|" + (endpoint ?? String.Empty).TrimEnd('/') + "|" + (projectDirectory ?? String.Empty);
+        }
+
+        private static int StableIdentity(string endpoint, string sessionId)
+        {
+            unchecked
+            {
+                int hash = 17;
+                foreach (char c in (endpoint ?? String.Empty) + "|" + (sessionId ?? String.Empty))
+                {
+                    hash = hash * 31 + c;
+                }
+                return hash & 0x7FFFFFFF;
+            }
+        }
+
+        private static DateTime StableSessionStart(string endpoint, string sessionId)
+        {
+            long offset = (long)StableIdentity(endpoint, sessionId) % TimeSpan.TicksPerDay;
+            return new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddTicks(offset);
+        }
+
+        private static int CountLines(string text)
+        {
+            if (String.IsNullOrEmpty(text)) return 0;
+            int n = 0;
+            for (int i = 0; i < text.Length; i++) { if (text[i] == '\n') n++; }
+            return n + 1;
+        }
+
+        private static string LastLine(string text)
+        {
+            if (String.IsNullOrEmpty(text)) return String.Empty;
+            int idx = text.LastIndexOf('\n');
+            return idx < 0 ? text : text.Substring(idx + 1);
         }
 
         internal static bool IsNonConsoleDiscoveryFailure(string error)
@@ -566,6 +1035,52 @@ namespace SaiCont
             return !String.IsNullOrEmpty(error) &&
                 error.StartsWith("AttachConsole failed", StringComparison.Ordinal) &&
                 error.EndsWith("(6)", StringComparison.Ordinal);
+        }
+
+        // T-158: record an exponential backoff for a PID whose console
+        // could not be resolved. Subsequent polls skip the expensive
+        // re-probe until the cooldown expires. Backoff base uses the
+        // rule's configured retry interval (min 30s), multiplied by
+        // the configured backoff multiplier, capped at the rule's
+        // maximum retry interval (or 300s, whichever is smaller).
+        private void AdvanceResolutionBackoff(int pid, TargetRule rule, DateTime nowUtc)
+        {
+            int attempts;
+            _resolutionUnavailableAttempts.TryGetValue(pid, out attempts);
+            attempts++;
+            _resolutionUnavailableAttempts[pid] = attempts;
+            int baseInterval = Math.Max(30, rule.SafeRetryIntervalSeconds);
+            double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, attempts - 1));
+            int maxInterval = Math.Min(rule.SafeMaximumRetryIntervalSeconds, 300);
+            int backoffSeconds = (int)Math.Min(maxInterval, Math.Max(baseInterval, baseInterval * multiplier));
+            _resolutionUnavailableUntilUtc[pid] = nowUtc.AddSeconds(backoffSeconds);
+        }
+
+        private void ClearResolutionBackoff(int pid)
+        {
+            _resolutionUnavailableAttempts.Remove(pid);
+            _resolutionUnavailableUntilUtc.Remove(pid);
+        }
+
+        // T-158-http: same exponential ladder as the console path, keyed by
+        // rule name. A dead opencode endpoint stops being probed every poll.
+        private void AdvanceTransportBackoff(TargetRule rule, DateTime nowUtc)
+        {
+            int attempts;
+            _transportUnavailableAttempts.TryGetValue(rule.Name, out attempts);
+            attempts++;
+            _transportUnavailableAttempts[rule.Name] = attempts;
+            int baseInterval = Math.Max(30, rule.SafeRetryIntervalSeconds);
+            double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, attempts - 1));
+            int maxInterval = Math.Min(rule.SafeMaximumRetryIntervalSeconds, 300);
+            int backoffSeconds = (int)Math.Min(maxInterval, Math.Max(baseInterval, baseInterval * multiplier));
+            _transportUnavailableUntilUtc[rule.Name] = nowUtc.AddSeconds(backoffSeconds);
+        }
+
+        private void ClearTransportBackoff(string ruleName)
+        {
+            _transportUnavailableAttempts.Remove(ruleName);
+            _transportUnavailableUntilUtc.Remove(ruleName);
         }
 
         private bool TryRecoverStateStore(DateTime nowUtc, ref string stateDiagnostic)
@@ -627,6 +1142,7 @@ namespace SaiCont
                         ProcessName = String.Empty,
                         StartTimeUtc = rec.ProcessStartUtc
                     };
+                    RememberRestoredOpenCodeSession(rec, savedRule);
                 }
             }
 
@@ -733,6 +1249,25 @@ namespace SaiCont
         // prevent permanent capacity exhaustion.
         private void PruneInactiveStates(DateTime nowUtc, ISet<int> livePids = null)
         {
+            // T-158: drop resolution-backoff entries for PIDs that no longer
+            // exist so the maps cannot grow unbounded across process churn.
+            if (livePids != null)
+            {
+                var staleBackoff = new List<int>();
+                foreach (int pid in _resolutionUnavailableUntilUtc.Keys)
+                {
+                    if (!livePids.Contains(pid))
+                    {
+                        staleBackoff.Add(pid);
+                    }
+                }
+                for (int i = 0; i < staleBackoff.Count; i++)
+                {
+                    _resolutionUnavailableUntilUtc.Remove(staleBackoff[i]);
+                    _resolutionUnavailableAttempts.Remove(staleBackoff[i]);
+                }
+            }
+
             if (_states.Count < 100)
             {
                 return;
@@ -861,6 +1396,85 @@ namespace SaiCont
 
         private void InvalidateRuleCache() { _ruleByNameValid = false; }
 
+        /// <summary>T--139: set the path to write SAICONT.health.json to. null disables health.</summary>
+        public string HealthFilePath
+        {
+            get { return _healthFilePath; }
+            set { _healthFilePath = value; }
+        }
+
+        /// <summary>T-139: increment policy revision when configuration is swapped.</summary>
+        public void BumpPolicyRevision()
+        {
+            _policyRevision++;
+        }
+
+        private void WriteHealth(DateTime nowUtc, IList<PollResult> results, bool pollSucceeded)
+        {
+            if (String.IsNullOrEmpty(_healthFilePath)) { return; }
+            // T-140: bounded heartbeat -- do not rewrite every poll when
+            // nothing changed. Rewrite on: meaningful transition (error,
+            // success-after-error, write), or heartbeat interval elapsed.
+            bool meaningfulTransition =
+                (nowUtc - _lastHealthWriteUtc).TotalSeconds >= HealthHeartbeatIntervalSeconds ||
+                (pollSucceeded && _lastSuccessfulPollUtc == DateTime.MinValue) ||
+                (!pollSucceeded && _LastErrorUtc == DateTime.MinValue) ||
+                (results != null && results.Count > 0);
+            if (!meaningfulTransition && _lastHealthWriteUtc != DateTime.MinValue)
+            {
+                return;
+            }
+            int active = 0, triggered = 0, writeEligible = 0;
+            DateTime nextDue = DateTime.MaxValue;
+            if (results != null)
+            {
+                foreach (PollResult r in results)
+                {
+                    active++;
+                    if (r.Triggered) triggered++;
+                    if (r.WouldSend || r.Sent) writeEligible++;
+                    if (r.Sent)
+                    {
+                        _lastWriteUtc = nowUtc;
+                        _lastWriteTarget = r.Target;
+                    }
+                    if (r.NextAttemptUtc != DateTime.MinValue && r.NextAttemptUtc < nextDue)
+                    {
+                        nextDue = r.NextAttemptUtc;
+                    }
+                }
+            }
+            var report = new HealthReport
+            {
+                ProductVersion = ProductVersionMajor + "." + ProductVersionMinor,
+                ProcessId = 0,
+                ProcessStartUtc = null,
+                InstanceShortId = null,
+                Mode = null,
+                PolicyRevision = _policyRevision,
+                ConfigFingerprint = _configuration != null ? (_configuration.Targets != null ? _configuration.Targets.Count.ToString(CultureInfo.InvariantCulture) + "_targets" : "0_targets") : "null",
+                LastPollUtc = _lastPollUtc == DateTime.MinValue ? (DateTime?)null : _lastPollUtc,
+                LastSuccessfulPollUtc = _lastSuccessfulPollUtc == DateTime.MinValue ? (DateTime?)null : _lastSuccessfulPollUtc,
+                LastErrorUtc = _LastErrorUtc == DateTime.MinValue ? (DateTime?)null : _LastErrorUtc,
+                LastErrorCode = _lastErrorCode,
+                StateStoreDisposition = _stateStoreHealthy ? (_stateLedgerAmbiguous ? "ambiguous" : "healthy") : "unhealthy",
+                StateStoreHealthy = _stateStoreHealthy && !_stateLedgerAmbiguous,
+                ActiveSessions = active,
+                TriggeredSessions = triggered,
+                WriteEligibleSessions = writeEligible,
+                NextDueUtc = nextDue == DateTime.MaxValue ? (DateTime?)null : nextDue,
+                LastWriteUtc = _lastWriteUtc == DateTime.MinValue ? (DateTime?)null : _lastWriteUtc,
+                LastWriteTarget = _lastWriteTarget,
+                HealthUpdatedUtc = nowUtc
+            };
+            string healthError;
+            if (report.TryWrite(_healthFilePath, out healthError))
+            {
+                _lastHealthWriteUtc = nowUtc;
+            }
+            // health write failure is non-authoritative: do not change safety/retry truth
+        }
+
         public void Run(bool allowInput, Action<PollResult> onResult, Func<bool> shouldStop)
         {
             while (shouldStop == null || !shouldStop())
@@ -893,6 +1507,16 @@ namespace SaiCont
 
                 WaitForNextPoll(Math.Max(250, _configuration.PollIntervalMilliseconds), shouldStop);
             }
+            Dispose();
+        }
+
+        public void Dispose()
+        {
+            foreach (ITargetTransport transport in _targetTransports.Values)
+            {
+                try { transport.Dispose(); } catch { }
+            }
+            _targetTransports.Clear();
         }
 
         private static void WaitForNextPoll(int milliseconds, Func<bool> shouldStop)

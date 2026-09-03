@@ -63,6 +63,7 @@ namespace SaiCont
         private const uint OpenExisting = 3;
         private const short KeyEvent = 0x0001;
         private const ushort VkReturn = 0x0D;
+        private const ushort VkBack = 0x08;
         private const uint MaxProcessListBuffer = 1024;
         private static readonly object ConsoleLock = new object();
 
@@ -422,14 +423,24 @@ namespace SaiCont
                         bool commandAlreadyTyped = session.Snapshot != null && ContainsTypedCommand(
                             String.IsNullOrWhiteSpace(session.Snapshot.CursorLine) ? LastNonEmptyLine(session.Snapshot.Text) : session.Snapshot.CursorLine,
                             command);
-                        if (!commandAlreadyTyped)
+                        // If the command is already visible on the prompt line,
+                        // previous Enter may have failed to submit (e.g. ConPTY/Readline
+                        // desync). Send Backspace sequence to clear the stale input,
+                        // then type the command fresh and submit with Enter.
+                        if (commandAlreadyTyped)
                         {
-                            foreach (char character in command)
+                            for (int b = 0; b < command.Length; b++)
                             {
-                                ushort virtualKey = VirtualKeyForCharacter(character);
-                                records.Add(CreateKeyRecord(true, character, virtualKey));
-                                records.Add(CreateKeyRecord(false, character, virtualKey));
+                                records.Add(CreateKeyRecord(true, '\b', VkBack));
+                                records.Add(CreateKeyRecord(false, '\b', VkBack));
                             }
+                        }
+
+                        foreach (char character in command)
+                        {
+                            ushort virtualKey = VirtualKeyForCharacter(character);
+                            records.Add(CreateKeyRecord(true, character, virtualKey));
+                            records.Add(CreateKeyRecord(false, character, virtualKey));
                         }
 
                         records.Add(CreateKeyRecord(true, '\r', VkReturn));

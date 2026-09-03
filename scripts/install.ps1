@@ -13,7 +13,13 @@ if (-not $PSCmdlet.ShouldProcess($taskName, 'Build, register a hidden logon task
     exit 0
 }
 
-& (Join-Path $paths.ProjectRoot 'build.ps1') | Out-Host
+$sourceRoot = Join-Path $paths.ProjectRoot 'src'
+if (Test-Path -LiteralPath $sourceRoot -PathType Container) {
+    & (Join-Path $paths.ProjectRoot 'build.ps1') | Out-Host
+}
+elseif (-not (Test-Path -LiteralPath $paths.Executable -PathType Leaf)) {
+    throw "Neither source tree nor packaged executable exists: $($paths.Executable)"
+}
 & $paths.Executable --validate-config --config $paths.Configuration | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "Configuration preflight failed with exit code $LASTEXITCODE"
@@ -23,6 +29,15 @@ if ($LASTEXITCODE -ne 0) {
     throw "Self-test preflight failed with exit code $LASTEXITCODE"
 }
 
+# T-132: serialize the entire install transaction (previous-state capture ->
+# stop old runtime -> task replace -> start new runtime -> verified status ->
+# rollback) under the same lifecycle lock start.ps1/stop.ps1 use. Those
+# scripts re-acquire the named mutex recursively on the same thread, which is
+# safe; the outer install lock prevents install/start/stop interleaving from
+# a separate caller.
+$installLock = Enter-SaiContLifecycleLock
+$rollbackFailure = $null
+try {
 $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
 $taskArguments = "//B //Nologo `"$($paths.Launcher)`""
 $action = New-ScheduledTaskAction -Execute $wscriptPath -Argument $taskArguments
@@ -37,7 +52,6 @@ if ($previousState.Disposition -eq 'UNVERIFIABLE') {
 }
 $previousRunning = $previousState.Process
 $previousMode = if ($null -ne $previousRunning -and $previousRunning.Mode -eq '--dry-run') { 'dry-run' } else { 'watch' }
-$rollbackFailure = $null
 
 try {
     if ($null -ne $previousRunning) {
@@ -87,3 +101,7 @@ catch {
     throw "Install failed and rollback completed: $primaryFailure"
 }
 Write-Output "INSTALLED task=$taskName user=$identity trigger=AtLogOn"
+}
+finally {
+    Exit-SaiContLifecycleLock -Mutex $installLock
+}

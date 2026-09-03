@@ -1,0 +1,9 @@
+{"payload":{"id":"evt_05bf92401001xhzdl8HfvpcmLK","type":"server.connected","properties":{}}}
+{"directory":"V:\\___VAC\\__K\\__CODE\\_AI_STUFF_AGENTIC\\_SAIPAL","project":"global","payload":{"id":"evt_05bf95eec001KFiG0ixtPVyUee","type":"session.created","properties":{"sessionID":"ses_fa406a114ffe5haUlwT8x1AgRG"}}}
+{"directory":"V:\\___VAC\\__K\\__CODE\\_AI_STUFF_AGENTIC\\_SAIPAL","project":"global","payload":{"id":"evt_05bf9b4e10016TxNQzDL56mwBG","type":"session.status","properties":{"sessionID":"ses_fa406a114ffe5haUlwT8x1AgRG","status":{"type":"busy"}}}}
+{"directory":"V:\\___VAC\\__K\\__CODE\\_AI_STUFF_AGENTIC\\_SAIPAL","project":"global","payload":{"id":"evt_05bf9e89c001LIqv2U58ymuSU6","type":"session.status","properties":{"sessionID":"ses_fa406a114ffe5haUlwT8x1AgRG","status":{"type":"idle"}}}}
+{"directory":"V:\\___VAC\\__K\\__CODE\\_AI_STUFF_AGENTIC\\_SAIPAL","project":"global","payload":{"id":"evt_05bf9e89c002lwR90aBJykwXO7","type":"session.idle","properties":{"sessionID":"ses_fa406a114ffe5haUlwT8x1AgRG"}}}
+{"id":"evt_05c0d746d001rrXeXdAQI3DILT","type":"session.status","properties":{"sessionID":"ses_fa3f28be7ffew0Otwt1mcEe0Wq","status":{"type":"busy"}}}
+{"id":"evt_05c0d746e001pDQeA2d5iKAVVU","type":"session.error","properties":{"sessionID":"ses_fa3f28be7ffew0Otwt1mcEe0Wq","error":{"name":"UnknownError","data":{"message":"Model not found: sairoute/__PROOF_INVALID_MODEL_3__."}}}}
+{"id":"evt_05c0d746e00209oZibUrv3FaJG","type":"session.status","properties":{"sessionID":"ses_fa3f28be7ffew0Otwt1mcEe0Wq","status":{"type":"idle"}}}
+{"id":"evt_05c0d746e003uxKN2a5ZXEH2HT","type":"session.idle","properties":{"sessionID":"ses_fa3f28be7ffew0Otwt1mcEe0Wq"}}

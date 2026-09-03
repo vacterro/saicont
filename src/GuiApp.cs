@@ -108,7 +108,7 @@ namespace SaiCont
 
         private volatile bool _pollRunning;
 
-        private int _pollGeneration;
+        private readonly RuntimeControlGeneration _pollGeneration = new RuntimeControlGeneration();
 
         private readonly ManualResetEventSlim _pollWakeup = new ManualResetEventSlim(false);
 
@@ -233,9 +233,11 @@ namespace SaiCont
             btnReload = CreateRaisedButton("Reload", (s, e) => ReloadConfig());
             btnClearLog = CreateRaisedButton("Clear Log", (s, e) => ClearLog());
             btnCopy = CreateRaisedButton("Copy", (s, e) => CopySelectedSessionInfo());
+            Button btnSettings = CreateRaisedButton("Settings", (s, e) => OpenSettingsDialog());
 
-            var sep = new Panel { Dock = DockStyle.Left, Width = 8, BackColor = Color.Transparent };
+            var sep = new Panel { Dock = DockStyle.Left, Width = 8, BackColor = CBackgroundSoft };
 
+            stateControlPanel.Controls.Add(btnSettings);
             stateControlPanel.Controls.Add(btnCopy);
             stateControlPanel.Controls.Add(btnClearLog);
             stateControlPanel.Controls.Add(btnReload);
@@ -261,9 +263,13 @@ namespace SaiCont
             mainTabs = new TabControl
             {
                 Dock = DockStyle.Fill,
-                Font = FontSmall
+                Font = FontSmall,
+                DrawMode = TabDrawMode.OwnerDrawFixed,
+                Padding = new Point(6, 2),
+                ItemSize = new Size(72, 18)
             };
             mainTabs.BackColor = CBackground;
+            mainTabs.DrawItem += DrawTabItem;
 
             tabSessions = new TabPage("Sessions");
             tabRules = new TabPage("Rules");
@@ -474,6 +480,21 @@ namespace SaiCont
             return btn;
         }
 
+        private void DrawTabItem(object sender, DrawItemEventArgs e)
+        {
+            bool isSelected = e.Index == mainTabs.SelectedIndex;
+            Rectangle bounds = e.Bounds;
+            using (var fill = new SolidBrush(isSelected ? CSurface : CSurfaceRaised))
+                e.Graphics.FillRectangle(fill, bounds);
+            DrawBevel(e.Graphics, bounds, !isSelected);
+            string text = mainTabs.TabPages[e.Index].Text;
+            using (var brush = new SolidBrush(isSelected ? CTextPrimary : CTextSecondary))
+            {
+                SizeF textSize = e.Graphics.MeasureString(text, FontSmall);
+                e.Graphics.DrawString(text, FontSmall, brush, bounds.Left + (bounds.Width - textSize.Width) / 2f, bounds.Top + (bounds.Height - textSize.Height) / 2f);
+            }
+        }
+
         private static void DrawBevel(Graphics g, Rectangle r, bool raised)
         {
             Color light = raised ? CBevelLight : CBorderDark;
@@ -568,7 +589,7 @@ namespace SaiCont
 
             stateBanner.Text = bannerText;
             stateBanner.BackColor = bannerBg;
-            stateBanner.ForeColor = (systemState == SystemOperationalState.Paused) ? Color.Black : Color.White;
+            stateBanner.ForeColor = CTextPrimary;
             stateIndicatorLabel.ForeColor = stateColor;
         }
 
@@ -598,10 +619,61 @@ namespace SaiCont
                 if (idx >= 0 && idx < currentConfig.Targets.Count)
                 {
                     TargetRule r = currentConfig.Targets[idx];
-                    r.Enabled = !r.Enabled;
+                    bool newEnabled = !r.Enabled;
+                    // T-136: immutable rule-policy swap. Never mutate the
+                    // TargetRule instance the active poll may be reading; build
+                    // a new WatcherConfiguration snapshot with a cloned rule and
+                    // a fresh Targets list, then swap engine under _pollLock so
+                    // the in-flight poll keeps reading the old immutable
+                    // snapshot until it observes the swap.
+                    var newTargets = new List<TargetRule>(currentConfig.Targets.Count);
+                    for (int i = 0; i < currentConfig.Targets.Count; i++)
+                    {
+                        TargetRule src = currentConfig.Targets[i];
+                        TargetRule copy = new TargetRule
+                        {
+                            Name = src.Name,
+                            Enabled = (i == idx) ? newEnabled : src.Enabled,
+                            Transport = src.Transport,
+                            Endpoint = src.Endpoint,
+                            ProjectDirectory = src.ProjectDirectory,
+                            ProcessNames = src.ProcessNames,
+                            Command = src.Command,
+                            ScanLines = src.ScanLines,
+                            MaximumTriggerDistanceLines = src.MaximumTriggerDistanceLines,
+                            InitialDelaySeconds = src.InitialDelaySeconds,
+                            RetryIntervalSeconds = src.RetryIntervalSeconds,
+                            ParseRetryTime = src.ParseRetryTime,
+                            BackoffMultiplier = src.BackoffMultiplier,
+                            MaximumRetryIntervalSeconds = src.MaximumRetryIntervalSeconds,
+                            MaximumAttemptsPerEvent = src.MaximumAttemptsPerEvent,
+                            TriggerPatterns = src.TriggerPatterns,
+                            ReadyPatterns = src.ReadyPatterns,
+                            BusyPatterns = src.BusyPatterns
+                        };
+                        newTargets.Add(copy);
+                    }
+                    var newConfig = new WatcherConfiguration
+                    {
+                        PollIntervalMilliseconds = currentConfig.PollIntervalMilliseconds,
+                        LogFilePath = currentConfig.LogFilePath,
+                        LogMaximumBytes = currentConfig.LogMaximumBytes,
+                        LogRetainedFiles = currentConfig.LogRetainedFiles,
+                        LogDuplicateWindowSeconds = currentConfig.LogDuplicateWindowSeconds,
+                        Targets = newTargets
+                    };
+                    WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
+                    WatcherEngine oldEngine;
+                    lock (_pollLock)
+                    {
+                        currentConfig = newConfig;
+                        oldEngine = engine;
+                        engine = newEngine;
+                    }
+                    try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception ex) { AppendLog("WARN", "Old transport shutdown failed: " + ex.Message); }
                     ReloadRulesList();
-                    AppendLog("INFO", "Rule '" + r.Name + "' set to: " + (r.Enabled ? "ON" : "OFF"));
-                    statusLabel.Text = "Rule '" + r.Name + "' " + (r.Enabled ? "ON" : "OFF");
+                    AppendLog("INFO", "Rule '" + r.Name + "' set to: " + (newEnabled ? "ON" : "OFF"));
+                    statusLabel.Text = "Rule '" + r.Name + "' " + (newEnabled ? "ON" : "OFF");
                 }
             }
             else
@@ -656,11 +728,14 @@ namespace SaiCont
             {
                 WatcherConfiguration newConfig = WatcherConfiguration.Load(configPath);
                 WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
+                WatcherEngine oldEngine;
                 lock (_pollLock)
                 {
                     currentConfig = newConfig;
+                    oldEngine = engine;
                     engine = newEngine;
                 }
+                try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception ex) { AppendLog("WARN", "Old transport shutdown failed: " + ex.Message); }
                 ReloadRulesList();
                 pollTimer.Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds);
                 statusLabel.Text = "Config reloaded (" + currentConfig.Targets.Count + " rules).";
@@ -680,6 +755,33 @@ namespace SaiCont
             logRichText.Clear();
             guiLogEntries = 0;
             statusLabel.Text = "Log cleared.";
+        }
+
+        private void OpenSettingsDialog()
+        {
+            using (var dlg = new SettingsDialog(currentConfig, configPath))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK || !dlg.DidApply)
+                {
+                    return;
+                }
+                WatcherConfiguration newConfig = dlg.AppliedConfig;
+                WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
+                WatcherEngine oldEngine;
+                lock (_pollLock)
+                {
+                    currentConfig = newConfig;
+                    oldEngine = engine;
+                    engine = newEngine;
+                }
+                try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception ex) { AppendLog("WARN", "Old transport shutdown failed: " + ex.Message); }
+                ReloadRulesList();
+                pollTimer.Interval = Math.Max(500, currentConfig.PollIntervalMilliseconds);
+                statusLabel.Text = "Settings applied (" + currentConfig.Targets.Count + " rules).";
+                AppendLog("INFO", "Settings applied from dialog.");
+                try { _pollWakeup.Set(); } catch (ObjectDisposedException) { }
+                RunProbe();
+            }
         }
 
         private void CopySelectedSessionInfo()
@@ -750,8 +852,8 @@ namespace SaiCont
         // handed to OnPollTimerTick via a lock-protected handoff.
         private void BackgroundPollLoop()
         {
-            int generation = _pollGeneration;
-            while (_pollRunning && generation == _pollGeneration)
+            int generation = _pollGeneration.Current;
+            while (_pollRunning && _pollGeneration.IsCurrent(generation))
             {
                 try
                 {
@@ -767,15 +869,19 @@ namespace SaiCont
                                 Close();
                             }));
                         }
-                        catch { }
+                        catch (Exception ex) { Program.TryReportTeardownFailure("GUI lifecycle-stop BeginInvoke", ex); }
                         return;
                     }
 
                     bool allowInput = (systemState == SystemOperationalState.OnWatch);
+                    // T-135: pass a live authorization-revocation predicate so a
+                    // mid-poll mode change (WATCH -> DRY-RUN/PAUSE/STOP) revokes
+                    // the write even though allowInput was captured before PollOnce.
+                    SystemOperationalState stateAtCapture = systemState;
                     IList<PollResult> results;
                     lock (_pollLock)
                     {
-                        results = engine.PollOnce(allowInput, delegate { return generation != _pollGeneration || (shouldStop != null && shouldStop()); });
+                        results = engine.PollOnce(allowInput, delegate { return !_pollGeneration.IsCurrent(generation) || (shouldStop != null && shouldStop()); }, delegate { return systemState != stateAtCapture; });
                     }
 
                     lock (_resultsLock)
@@ -826,12 +932,12 @@ namespace SaiCont
         private void StopBackgroundPoll()
         {
             _pollRunning = false;
-            System.Threading.Interlocked.Increment(ref _pollGeneration);
-            try { _pollWakeup.Set(); } catch (ObjectDisposedException) { }
+            _pollGeneration.Increment();
+            try { FaultInjectionSeams.WakeWorker(_pollWakeup); } catch (ObjectDisposedException) { }
             Thread worker = _pollThread;
             if (worker != null)
             {
-                try { worker.Join(5000); } catch { }
+                try { FaultInjectionSeams.JoinWorker(worker, 5000); } catch (Exception ex) { Program.TryReportTeardownFailure("GUI worker join", ex); }
                 if (!worker.IsAlive) { _pollThread = null; }
             }
         }
@@ -1009,6 +1115,7 @@ namespace SaiCont
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
             StopBackgroundPoll();
+            try { if (engine != null) engine.Dispose(); } catch (Exception ex) { Program.TryReportTeardownFailure("GUI transport shutdown", ex); }
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;

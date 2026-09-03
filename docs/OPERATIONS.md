@@ -64,7 +64,7 @@ Features:
 .\scripts\stop.ps1
 ```
 
-`start.ps1` uses `wscript.exe` with window style 0. The executable writes `run\SAICONT.pid`, watches for `run\SAICONT.stop`, and exits cleanly when `stop.ps1` creates that marker. If graceful shutdown exceeds ten seconds, `stop.ps1` verifies the executable path before terminating that exact process.
+`start.ps1` launches the executable directly with a hidden window. The executable writes `run\SAICONT.pid`, watches for `run\SAICONT.stop`, and exits cleanly when `stop.ps1` creates that marker. If graceful shutdown exceeds ten seconds, `stop.ps1` verifies the executable path before terminating that exact process.
 
 Use `start.ps1 -DryRun` to exercise the hidden lifecycle without input injection.
 
@@ -74,7 +74,7 @@ Use `start.ps1 -DryRun` to exercise the hidden lifecycle without input injection
 .\scripts\install.ps1
 ```
 
-This builds the current sources, registers the `SAICONT` scheduled task for the current user, and starts the watcher. The task launches through the hidden VBS wrapper and does not require a visible console window.
+This transaction builds when a source tree is present (or uses the packaged executable), validates configuration, runs self-tests, registers the enabled `SAICONT` task for the current interactive user, and starts a verified watcher. Task replacement and watcher start share one lifecycle lock; failure restores the prior task/runtime state. The task uses an `AtLogOn` trigger, `StartWhenAvailable`, three one-minute restart attempts, and the hidden VBS wrapper. Pre-logon `AtStartup` is intentionally unsupported because SAICONT must inspect processes in the user's interactive console session.
 
 > **Roadmap pack**: `SAICONT_FULL_ROADMAP/` contains the v0.3.1->v1.0 audit
 > handoff and the 09_POST_V1_BACKLOG file. The v0.3.1..v1.0 wave files are
@@ -93,7 +93,7 @@ Uninstalling preserves `SAICONT.config.xml` and the `logs` directory.
 
 ## Configuration
 
-Edit `SAICONT.config.xml` while the watcher is stopped, then start it again. Relative log paths are resolved from the configuration file directory.
+Edit `SAICONT.config.xml` and use Reload in the GUI/TUI, or restart the hidden watcher. Reload parses and validates a complete replacement before an atomic policy swap; malformed input leaves the prior policy active. GUI/TUI rule enable/disable is a runtime-only copy-on-write override: it never edits XML and a successful reload restores file-defined values. Relative log paths are resolved from the configuration file directory.
 
 Each target controls:
 
@@ -112,7 +112,40 @@ Malformed XML, invalid regular expressions, unsafe interval values, empty proces
 
 Operational events are written to `logs\SAICONT.log`. Repeated identical trigger and error states are suppressed for the configured duplicate window. At the configured byte limit, files rotate to `.1`, `.2`, and so on up to `retainedFiles`.
 
+## OpenCode / SAIPAL HTTP transport
+
+OpenCode TUI runs through ConPTY, so its target must use the API transport:
+
+```xml
+<target name="saipal" enabled="true" transport="opencode-http"
+        endpoint="http://127.0.0.1:41961"
+        projectDir="V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPAL"
+        command="cc">
+  <triggerPatterns><pattern>(?i)"code"\s*:\s*"internal_error"</pattern></triggerPatterns>
+</target>
+```
+
+`projectDir` is mandatory for an enabled HTTP target. SAICONT subscribes to
+the project-scoped `/event` SSE stream, binds the session that produced the
+failure, and cross-checks `/session/status` plus `/session/:id/message` before
+send. Multiple sessions, stale sessions, malformed/disconnected SSE, unknown
+OpenCode versions, and conflicting SSE/REST state block input. The continuation
+is sent to `POST /session/:id/message` with the observed agent/model context;
+TUI prompt endpoints and keyboard/clipboard injection are never used.
+
 The watcher logs startup, shutdown, limit states, failed console reads, dry-run decisions, and sent commands. Ordinary no-trigger polls produce no log line.
+
+## Runtime control and machine status
+
+`WATCH` permits guarded continuation writes. `DRY-RUN` keeps polling but forbids input. `PAUSE` stops continuous polling. Every transition revokes the current control generation before worker shutdown, so a poll that began under an older mode cannot write afterward.
+
+`run\SAICONT.health.json` is an atomic schema-v1 heartbeat written at most once per meaningful change or 45 seconds. Treat it as stale when `health_updated_utc` stops advancing beyond the consumer's chosen allowance; process start time and PID let consumers reject a dead/reused process. The file contains bounded counters/codes only—never console, prompt, command, token, or credential text.
+
+`scripts\status.ps1 -Json` emits one read-only schema-v1 JSON object and preserves the normal command's exit semantics (`0` running, `1` stopped/stale, `2` unverifiable). Only explicit `-Repair` may remove positively stale lifecycle artifacts.
+
+## Console boundary
+
+SAICONT supports classic Win32 console screen buffers reachable through the target process tree. ConPTY-backed Windows Terminal tabs and redirected/headless terminal surfaces are not claimed or silently treated as supported; use `--probe` to prove a specific host before enabling WATCH.
 
 ## Minimal terminal commands
 

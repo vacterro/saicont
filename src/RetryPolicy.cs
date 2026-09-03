@@ -14,6 +14,7 @@ namespace SaiCont
         public int DistanceLines;
         public string TriggerText;
         public string TriggerFingerprint;
+        public string RecoveryFamily;
         public DateTime DueUtc;
     }
 
@@ -22,12 +23,20 @@ namespace SaiCont
         private string _triggerToken;
         private DateTime _dueUtc;
         private int _triggerRow;
+        private string _recoveryFamily;
 
         public bool Triggered;
         public bool Ready;
         public bool Busy;
         public TriggerEvent Event;
         public string EvaluationError;
+        public FailureAssessment Failure;
+
+        public string RecoveryFamily
+        {
+            get { return Event != null ? Event.RecoveryFamily : _recoveryFamily; }
+            set { _recoveryFamily = value; }
+        }
 
         public string TriggerToken
         {
@@ -96,9 +105,21 @@ namespace SaiCont
         private int _occurrence;
         private int _triggerMatchStart = -1;
         private DateTime _nextAttemptUtc;
+        // T-158: the provider's own reset deadline for the CURRENT event, as
+        // parsed from the console text ("try again at 4:40 PM" / "try again in
+        // 8h 57m"). Backoff after a blocked attempt must never pull the next
+        // attempt EARLIER than this: doing so is exactly the "hammer the
+        // prompt every 60s for 8 hours" behaviour. Anchored when an event is
+        // accepted, never re-derived per poll (see CORE-001).
+        private DateTime _eventDueUtc;
         private DateTime _lastObservedUtc;
         private DateTime _lastWriteUtc;
         private int _attemptCount;
+        private string _recoveryFamily;
+        private string _transportKind;
+        private string _endpointIdentity;
+        private string _projectIdentity;
+        private string _sessionIdentity;
 
         public RecoveryState State { get { return _state; } }
         public bool Active { get { return _state != RecoveryState.IdleNoEvent && _state != RecoveryState.RecoveryConfirmed; } }
@@ -111,6 +132,16 @@ namespace SaiCont
         public DateTime LastObservedUtc { get { return _lastObservedUtc; } }
         public DateTime LastWriteUtc { get { return _lastWriteUtc; } }
         public int AttemptCount { get { return _attemptCount; } }
+        public string SessionIdentity { get { return _sessionIdentity; } }
+
+        public void SetTransportIdentity(TargetObservation observation)
+        {
+            if (observation == null) return;
+            _transportKind = observation.TransportKind;
+            _endpointIdentity = observation.EndpointIdentity;
+            _projectIdentity = observation.ProjectIdentity;
+            _sessionIdentity = observation.SessionIdentity;
+        }
 
         // PERF-004: durable-state mutation flag. The engine polls this to
         // decide whether a full export+TrySave is required this round. Set on
@@ -129,6 +160,12 @@ namespace SaiCont
             _lastObservedUtc = SanitizeHistoricalTime(record.LastObservedUtc, nowUtc);
             _lastWriteUtc = SanitizeHistoricalTime(record.LastWriteUtc, nowUtc);
             _nextAttemptUtc = SanitizeNextAttempt(record.NextAllowedAttemptUtc, nowUtc);
+            // T-158: schema v1 carries no separate event-due column, but the
+            // persisted nextAllowed is already floored at the event deadline
+            // (ApplyEventDueFloor guarantees nextAttempt >= eventDue), so it
+            // is a safe conservative floor to restore. Worst case the floor is
+            // later than the provider's reset, never earlier.
+            _eventDueUtc = _nextAttemptUtc;
             _awaitingOutcome = record.AwaitingOutcome;
             _sawBusy = record.SawBusyAfterWrite;
             _suppressedToken = record.SuppressedFingerprint;
@@ -136,6 +173,11 @@ namespace SaiCont
             _occurrence = Math.Max(0, record.Occurrence);
             _triggerMatchStart = record.TriggerMatchStart;
             _attemptCount = Math.Max(0, Math.Min(50, record.AttemptCount));
+            _recoveryFamily = record.RecoveryFamily;
+            _transportKind = record.TransportKind;
+            _endpointIdentity = record.EndpointIdentity;
+            _projectIdentity = record.ProjectIdentity;
+            _sessionIdentity = record.SessionIdentity;
             _attemptToken = record.TriggerFingerprint;
             if (!String.IsNullOrEmpty(record.RecoveryState))
             {
@@ -159,6 +201,10 @@ namespace SaiCont
             return new StateRecord
             {
                 RuleName = ruleName,
+                TransportKind = _transportKind,
+                EndpointIdentity = _endpointIdentity,
+                ProjectIdentity = _projectIdentity,
+                SessionIdentity = _sessionIdentity,
                 RuleSemanticFingerprint = rule == null ? String.Empty : rule.SemanticFingerprint,
                 ProcessId = session != null ? session.ProcessId : 0,
                 ProcessStartUtc = session != null ? session.StartTimeUtc : DateTime.MinValue,
@@ -173,6 +219,7 @@ namespace SaiCont
                 SuppressedTriggerRow = _suppressedMatchStart,
                 Occurrence = _occurrence,
                 AttemptCount = _attemptCount,
+                RecoveryFamily = _recoveryFamily,
                 RecoveryState = _state.ToString()
             };
         }
@@ -197,8 +244,10 @@ namespace SaiCont
                     _suppressedMatchStart = _triggerMatchStart;
                     _state = RecoveryState.RecoveryConfirmed;
                     _attemptCount = 0;
+                    _recoveryFamily = observation.RecoveryFamily;
                     _awaitingOutcome = false;
                     _sawBusy = false;
+                    _eventDueUtc = DateTime.MinValue;
                     return Decision(false, "ambiguous write resolved: trigger cleared");
                 }
 
@@ -220,7 +269,9 @@ namespace SaiCont
                     _awaitingOutcome = false;
                     _sawBusy = false;
                     _attemptCount = 0;
+                    _recoveryFamily = observation.RecoveryFamily;
                     _nextAttemptUtc = observation.DueUtc;
+                    _eventDueUtc = observation.DueUtc;
                     _state = nowUtc < _nextAttemptUtc ? RecoveryState.EventWaitingDeadline : RecoveryState.EventReadyToAttempt;
                     if (nowUtc < _nextAttemptUtc)
                     {
@@ -244,6 +295,7 @@ namespace SaiCont
                     _attemptCount = 0;
                     _awaitingOutcome = false;
                     _sawBusy = false;
+                    _eventDueUtc = DateTime.MinValue;
                     return Decision(false, "recovery confirmed; trigger cleared");
                 }
 
@@ -254,6 +306,7 @@ namespace SaiCont
                     _triggerToken = null;
                     _attemptToken = null;
                     _nextAttemptUtc = DateTime.MinValue;
+                    _eventDueUtc = DateTime.MinValue;
                 }
 
                 _suppressedToken = null;
@@ -272,19 +325,29 @@ namespace SaiCont
                 _triggerMatchStart = observation.TriggerMatchStart;
                 _attemptToken = null;
                 _attemptCount = 0;
+                _recoveryFamily = observation.RecoveryFamily;
                 _awaitingOutcome = false;
                 _nextAttemptUtc = observation.DueUtc;
+                _eventDueUtc = observation.DueUtc;
                 _state = nowUtc < _nextAttemptUtc ? RecoveryState.EventWaitingDeadline : RecoveryState.EventReadyToAttempt;
             }
 
             if (!String.Equals(_triggerToken, observation.TriggerToken, StringComparison.Ordinal))
             {
+                bool carryRecoveryBudget = _attemptCount > 0 &&
+                    !String.IsNullOrEmpty(_recoveryFamily) &&
+                    String.Equals(_recoveryFamily, observation.RecoveryFamily, StringComparison.Ordinal);
                 _triggerToken = observation.TriggerToken;
                 _attemptToken = null;
                 _awaitingOutcome = false;
                 _sawBusy = false;
-                _attemptCount = 0;
-                _nextAttemptUtc = observation.DueUtc;
+                _eventDueUtc = observation.DueUtc;
+                if (!carryRecoveryBudget)
+                {
+                    _attemptCount = 0;
+                    _nextAttemptUtc = observation.DueUtc;
+                }
+                _recoveryFamily = observation.RecoveryFamily;
                 _state = nowUtc < _nextAttemptUtc ? RecoveryState.EventWaitingDeadline : RecoveryState.EventReadyToAttempt;
             }
 
@@ -306,6 +369,7 @@ namespace SaiCont
                         _attemptCount = 0;
                         _awaitingOutcome = false;
                         _sawBusy = false;
+                        _eventDueUtc = DateTime.MinValue;
                         return Decision(false, "recovery observed; old trigger suppressed");
                     }
 
@@ -332,6 +396,7 @@ namespace SaiCont
                     _attemptCount = 0;
                     _awaitingOutcome = false;
                     _sawBusy = false;
+                    _eventDueUtc = DateTime.MinValue;
                     return Decision(false, "recovery observed; old trigger suppressed");
                 }
             }
@@ -405,7 +470,7 @@ namespace SaiCont
             int baseInterval = rule.SafeRetryIntervalSeconds;
             double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, _attemptCount - 1));
             int backoffSeconds = (int)Math.Min(rule.SafeMaximumRetryIntervalSeconds, Math.Max(baseInterval, baseInterval * multiplier));
-            _nextAttemptUtc = nowUtc.AddSeconds(backoffSeconds);
+            _nextAttemptUtc = ApplyEventDueFloor(nowUtc.AddSeconds(backoffSeconds));
         }
 
         // CORE-004: mark the session as selected for a native write BEFORE the
@@ -429,7 +494,7 @@ namespace SaiCont
             int baseInterval = rule.SafeRetryIntervalSeconds;
             double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, _attemptCount - 1));
             int backoffSeconds = (int)Math.Min(rule.SafeMaximumRetryIntervalSeconds, Math.Max(baseInterval, baseInterval * multiplier));
-            _nextAttemptUtc = nowUtc.AddSeconds(backoffSeconds);
+            _nextAttemptUtc = ApplyEventDueFloor(nowUtc.AddSeconds(backoffSeconds));
             _lastWriteUtc = nowUtc;
         }
 
@@ -465,7 +530,22 @@ namespace SaiCont
             int baseInterval = rule.SafeRetryIntervalSeconds;
             double multiplier = Math.Pow(rule.SafeBackoffMultiplier, Math.Max(0, _attemptCount - 1));
             int backoffSeconds = (int)Math.Min(rule.SafeMaximumRetryIntervalSeconds, Math.Max(baseInterval, baseInterval * multiplier));
-            _nextAttemptUtc = nowUtc.AddSeconds(backoffSeconds);
+            _nextAttemptUtc = ApplyEventDueFloor(nowUtc.AddSeconds(backoffSeconds));
+        }
+
+        // T-158: never schedule an attempt EARLIER than the provider's own
+        // stated reset deadline for the current event. Blind exponential
+        // backoff from "now" is what produced the hammer-the-prompt loop:
+        // a parsed "try again at 14:19" was overwritten by now+60s on every
+        // blocked attempt. The floor keeps the event's absolute deadline
+        // authoritative while backoff can still push the attempt LATER.
+        private DateTime ApplyEventDueFloor(DateTime candidateUtc)
+        {
+            if (_eventDueUtc == DateTime.MinValue)
+            {
+                return candidateUtc;
+            }
+            return candidateUtc < _eventDueUtc ? _eventDueUtc : candidateUtc;
         }
 
         private static DateTime SanitizeHistoricalTime(DateTime value, DateTime nowUtc)
@@ -498,9 +578,15 @@ namespace SaiCont
             copy._occurrence = _occurrence;
             copy._triggerMatchStart = _triggerMatchStart;
             copy._nextAttemptUtc = _nextAttemptUtc;
+            copy._eventDueUtc = _eventDueUtc;
             copy._lastObservedUtc = _lastObservedUtc;
             copy._lastWriteUtc = _lastWriteUtc;
             copy._attemptCount = _attemptCount;
+            copy._recoveryFamily = _recoveryFamily;
+            copy._transportKind = _transportKind;
+            copy._endpointIdentity = _endpointIdentity;
+            copy._projectIdentity = _projectIdentity;
+            copy._sessionIdentity = _sessionIdentity;
             return copy;
         }
 
@@ -518,9 +604,15 @@ namespace SaiCont
             _occurrence = source._occurrence;
             _triggerMatchStart = source._triggerMatchStart;
             _nextAttemptUtc = source._nextAttemptUtc;
+            _eventDueUtc = source._eventDueUtc;
             _lastObservedUtc = source._lastObservedUtc;
             _lastWriteUtc = source._lastWriteUtc;
             _attemptCount = source._attemptCount;
+            _recoveryFamily = source._recoveryFamily;
+            _transportKind = source._transportKind;
+            _endpointIdentity = source._endpointIdentity;
+            _projectIdentity = source._projectIdentity;
+            _sessionIdentity = source._sessionIdentity;
         }
 
         private static DateTime SanitizeNextAttempt(DateTime value, DateTime nowUtc)
@@ -602,30 +694,90 @@ namespace SaiCont
                 bool ready = MatchesAny(inputLine, rule.CompiledReadyPatterns) || ContainsTypedCommand(inputLine, rule.Command);
                 bool busy = rule.CompiledBusyPatterns != null && rule.CompiledBusyPatterns.Length > 0 && MatchesAny(ExtractCursorTail(snapshot.Text, 5), rule.CompiledBusyPatterns);
 
-                if (bestMatch == null)
+                FailureAssessment failure = FailureIntelligence.Classify(snapshot.Text);
+                bool failureSelected = false;
+                int matchStart = bestMatch == null ? -1 : bestMatch.Index;
+                int matchLength = bestMatch == null ? 0 : bestMatch.Length;
+                string matchValue = bestMatch == null ? String.Empty : bestMatch.Value;
+                string recoveryFamily = null;
+
+                if (failure.IsKnown)
+                {
+                    bool overlapsConfigured = bestMatch != null && SameLine(snapshot.Text, failure.MatchStart, bestMatch.Index);
+
+                    if (bestMatch == null && failure.IsAutomaticRecovery)
+                    {
+                        failureSelected = true;
+                    }
+                    if (bestMatch != null && failure.IsAutomaticRecovery &&
+                        failure.RecommendedAction != FailureRecoveryAction.WAIT_FOR_RESET && overlapsConfigured)
+                    {
+                        // Keep the operator regex's exact token for the pre-send
+                        // safety reread, but share the retry budget family.
+                        recoveryFamily = "transient-provider-recovery";
+                    }
+                    if (bestMatch != null && failure.MatchStart > bestMatch.Index && !overlapsConfigured)
+                    {
+                        // A newer recognized permanent failure blocks an older
+                        // transient trigger. An explicit trigger overlapping the
+                        // same envelope still wins: configuration is operator policy.
+                        if (failure.IsAutomaticRecovery)
+                        {
+                            failureSelected = true;
+                        }
+                        else
+                        {
+                            bestMatch = null;
+                            matchStart = -1;
+                        }
+                    }
+                }
+
+                if (failureSelected)
+                {
+                    bestPatternIndex = -((int)failure.Class + 1);
+                    matchStart = failure.MatchStart;
+                    matchLength = failure.MatchLength;
+                    matchValue = failure.FingerprintMaterial;
+                    if (failure.RecommendedAction != FailureRecoveryAction.WAIT_FOR_RESET)
+                    {
+                        recoveryFamily = "transient-provider-recovery";
+                    }
+                }
+
+                if (bestMatch == null && !failureSelected)
                 {
                     return new RuleObservation
                     {
                         Triggered = false,
                         Ready = ready,
-                        Busy = busy
+                        Busy = busy,
+                        Failure = failure
                     };
                 }
 
-                int relativeRow = CountNewLines(snapshot.Text, bestMatch.Index);
+                int relativeRow = CountNewLines(snapshot.Text, matchStart);
                 int triggerRow = snapshot.StartRow + relativeRow;
                 int distance = snapshot.CursorRow - triggerRow;
                 bool nearCursor = distance >= 0 && distance <= Math.Max(1, rule.MaximumTriggerDistanceLines);
 
                 // Bounded event context: inspect up to 6 lines starting from the trigger line
-                string eventContext = ExtractLinesAfterMatch(snapshot.Text, bestMatch.Index, 6);
+                string eventContext = ExtractLinesAfterMatch(snapshot.Text, matchStart, 6);
 
                 DateTime due = nowUtc.AddSeconds(rule.SafeInitialDelaySeconds);
-                if (rule.ParseRetryTime)
+                bool parsedRetryTime = false;
+                // SRC-021: parseRetryTime is a quota/reset affordance. A
+                // RETRY_SAME transient failure (internal_error, overload,
+                // timeout, network, stream) must keep the bounded retry backoff
+                // instead of being pinned to a far-future clock parsed from a
+                // nearby usage-limit line. Quota/rate resets and unrecognized
+                // triggers keep honoring a visible retry deadline.
+                if (rule.ParseRetryTime && failure.RecommendedAction != FailureRecoveryAction.RETRY_SAME)
                 {
                     DateTime parsed;
                     if (RetryTimeParser.TryParseDue(eventContext, nowUtc.ToLocalTime(), out parsed))
                     {
+                        parsedRetryTime = true;
                         due = parsed.ToUniversalTime().AddSeconds(3);
                         if (due < nowUtc)
                         {
@@ -634,8 +786,25 @@ namespace SaiCont
                     }
                 }
 
-                string normalizedContext = NormalizeEventContext(bestMatch.Value);
-                string token = rule.Name + ":" + bestPatternIndex + ":" + StableHash(normalizedContext).ToString("X8", CultureInfo.InvariantCulture);
+                if (failureSelected && failure.RecommendedAction == FailureRecoveryAction.WAIT_FOR_RESET && !parsedRetryTime)
+                {
+                    // Quota exhaustion without a provider reset time cannot be
+                    // repaired by blind retries. Keep it classified and visible,
+                    // but do not start a continuation lifecycle.
+                    return new RuleObservation
+                    {
+                        Triggered = false,
+                        Ready = ready,
+                        Busy = busy,
+                        Failure = failure
+                    };
+                }
+
+                string normalizedContext = failureSelected
+                    ? failure.FingerprintMaterial
+                    : NormalizeEventContext(matchValue);
+                string tokenPrefix = failureSelected ? "failure:" + failure.Class : bestPatternIndex.ToString(CultureInfo.InvariantCulture);
+                string token = rule.Name + ":" + tokenPrefix + ":" + StableHash(normalizedContext).ToString("X8", CultureInfo.InvariantCulture);
                 // CORE-001: event identity is STABLE; the parsed due is carried separately
                 // via TriggerEvent.DueUtc and is anchored in RetrySessionState on first
                 // acceptance, not re-derived from every poll's nowLocal. A relative-duration
@@ -649,12 +818,13 @@ namespace SaiCont
                 {
                     RuleName = rule.Name,
                     PatternIndex = bestPatternIndex,
-                    MatchStart = bestMatch.Index,
-                    MatchLength = bestMatch.Length,
+                    MatchStart = matchStart,
+                    MatchLength = matchLength,
                     TriggerRow = triggerRow,
                     DistanceLines = distance,
-                    TriggerText = bestMatch.Value,
+                    TriggerText = matchValue,
                     TriggerFingerprint = token,
+                    RecoveryFamily = recoveryFamily,
                     DueUtc = due
                 };
 
@@ -663,7 +833,8 @@ namespace SaiCont
                     Triggered = nearCursor,
                     Ready = ready,
                     Busy = busy,
-                    Event = triggerEvent
+                    Event = triggerEvent,
+                    Failure = failure
                 };
             }
             catch (RegexMatchTimeoutException)
@@ -806,6 +977,17 @@ namespace SaiCont
                 }
             }
             return count;
+        }
+
+        private static bool SameLine(string text, int first, int second)
+        {
+            if (String.IsNullOrEmpty(text) || first < 0 || second < 0)
+            {
+                return false;
+            }
+            int start = Math.Min(first, second);
+            int end = Math.Max(first, second);
+            return text.IndexOf('\n', start, end - start) < 0;
         }
 
         private static uint StableHash(string text)

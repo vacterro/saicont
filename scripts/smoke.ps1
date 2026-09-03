@@ -24,10 +24,61 @@ if ($runtimeState.Disposition -eq 'POSITIVELY_STALE') {
     }
 }
 
+function Get-StatusReadOnlyFingerprint {
+    $lines = Get-ChildItem -LiteralPath $projectRoot -Recurse -File | Where-Object {
+        $_.FullName -notmatch '[\\/](\.git|\.saipen|bin|logs)[\\/]'
+    } | Sort-Object FullName | ForEach-Object {
+        $relative = $_.FullName.Substring($projectRoot.Length).TrimStart([char[]]'\/')
+        "$relative|$($_.Length)|$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)"
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+    }
+    finally { $sha.Dispose() }
+}
+
+$statusTreeBefore = Get-StatusReadOnlyFingerprint
+$jsonStatusText = (& (Join-Path $PSScriptRoot 'status.ps1') -Json 2>&1 | Out-String).Trim()
+$jsonStatusExit = $LASTEXITCODE
+$jsonStatus = $jsonStatusText | ConvertFrom-Json
+$humanStatusText = (& (Join-Path $PSScriptRoot 'status.ps1') 2>&1 | Out-String).Trim()
+$humanStatusExit = $LASTEXITCODE
+$statusTreeAfter = Get-StatusReadOnlyFingerprint
+if ($jsonStatusExit -ne 1 -or $jsonStatus.schema_version -ne 1 -or $jsonStatus.status -ne 'STOPPED') {
+    throw "status.ps1 -Json stopped-state contract failed: exit=$jsonStatusExit output=$jsonStatusText"
+}
+if ($humanStatusExit -ne 1 -or $humanStatusText -ne 'STOPPED') {
+    throw "status.ps1 human compatibility failed: exit=$humanStatusExit output=$humanStatusText"
+}
+if ($statusTreeBefore -ne $statusTreeAfter) {
+    throw 'status.ps1 default and -Json modes mutated the filesystem.'
+}
+Write-Output 'PASS: status.ps1 -Json is schema-stable, read-only, and preserves human output'
+
 Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File | ForEach-Object {
     [void][scriptblock]::Create((Get-Content -Raw -LiteralPath $_.FullName))
 }
 Write-Output 'PASS: PowerShell parser checks'
+
+$boundaryShell = (Get-Process -Id $PID).Path
+& $boundaryShell -NoProfile -File (Join-Path $PSScriptRoot 'boundary-check.ps1') | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Product boundary guard failed with exit code $LASTEXITCODE"
+}
+$boundaryFixture = Join-Path ([IO.Path]::GetTempPath()) ("saicont-boundary-" + [Guid]::NewGuid().ToString('N'))
+try {
+    [IO.Directory]::CreateDirectory((Join-Path $boundaryFixture 'src')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $boundaryFixture 'src\Evil.cs'), 'class Evil { void Run() { System.Diagnostics.Process.Start("cmd.exe"); } }')
+    [IO.File]::WriteAllText((Join-Path $boundaryFixture 'build.ps1'), "'/reference:System.Core.dll'")
+    & $boundaryShell -NoProfile -File (Join-Path $PSScriptRoot 'boundary-check.ps1') -ScanRoot $boundaryFixture 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw 'Product boundary negative control stayed green.' }
+}
+finally {
+    Remove-Item -LiteralPath $boundaryFixture -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Output 'PASS: product boundary guard rejects arbitrary process launch'
 
 & (Join-Path $projectRoot 'build.ps1') | Out-Host
 & $executablePath --self-test
@@ -45,7 +96,10 @@ Write-Output 'Controlled input injection harness test:'
 $harnessFile = [System.IO.Path]::GetTempFileName()
 try {
     $harnessProcess = Start-Process -FilePath $executablePath -ArgumentList @('--input-harness', $harnessFile) -PassThru
-    Start-Sleep -Milliseconds 400
+    $harnessReady = $harnessFile + '.ready'
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not (Test-Path -LiteralPath $harnessReady) -and [DateTime]::UtcNow -lt $readyDeadline) { Start-Sleep -Milliseconds 50 }
+    if (-not (Test-Path -LiteralPath $harnessReady)) { throw 'Input harness did not reach drained ready state.' }
     $startTicks = $harnessProcess.StartTime.ToUniversalTime().Ticks
     & $executablePath --verified-harness-inject $harnessProcess.Id $startTicks 'must_not_arrive' 1 'wrong-start' | Out-Host
     if ($LASTEXITCODE -ne 0) {
@@ -67,7 +121,10 @@ try {
 
     $vanishedFile = $harnessFile + '.vanished'
     $vanished = Start-Process -FilePath $executablePath -ArgumentList @('--input-harness', $vanishedFile) -PassThru
-    Start-Sleep -Milliseconds 300
+    $vanishedReady = $vanishedFile + '.ready'
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not (Test-Path -LiteralPath $vanishedReady) -and [DateTime]::UtcNow -lt $readyDeadline) { Start-Sleep -Milliseconds 50 }
+    if (-not (Test-Path -LiteralPath $vanishedReady)) { throw 'Vanished harness did not reach drained ready state.' }
     $vanishedTicks = $vanished.StartTime.ToUniversalTime().Ticks
     Stop-Process -Id $vanished.Id -Force
     $null = $vanished.WaitForExit(5000)
@@ -84,12 +141,14 @@ try {
         throw 'Verified harness process-disappeared negative control unexpectedly wrote input.'
     }
     Remove-Item -LiteralPath $vanishedFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $vanishedReady -Force -ErrorAction SilentlyContinue
     Write-Output 'PASS: Controlled verified-write process-disappeared race refused'
 }
 finally {
     if (Test-Path -LiteralPath $harnessFile) {
         Remove-Item -LiteralPath $harnessFile -Force -ErrorAction SilentlyContinue
     }
+    Remove-Item -LiteralPath ($harnessFile + '.ready') -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output 'Cline-first live probe (read-only):'

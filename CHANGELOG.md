@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0 - 2026-09-01
+
+- **v1.2 control and operations**: atomic local health JSON, bounded decision codes, read-only JSON status, generation-safe GUI/TUI mode transitions, transactional logon-task installation, deterministic allowlisted packaging, and explicit classic-console support boundaries.
+- **Failure Intelligence**: classify 21 provider/transport failure families from HTTP status, structured code/type, message signatures, and transport exceptions. Automatic continuation is limited to transient failures or explicit reset deadlines; permanent failures stop, volatile IDs normalize into one durable event, and existing exponential backoff plus per-event attempt caps prevent loops.
+
 ## 1.1.1 - 2026-08-31
 
 - **Audit ALL_3 wave 3**: ship the static-complete implementation of the remaining findings from the AUDIT_ALL_3 audit handoff. W2-001 TerminalUi worker join, W2-005 nonzero on handler failure, W2-006 stopfile cleanup in finally, PERF-001 ManualResetEventSlim interruptible wait, PERF-004 rule-by-name dict + per-state dirty flag + bounded checkpoint, PERF-005 perf script one-core CPU + median/p95/max + active scenario, plus the prior wave's audit-defect fixes (T-26..T-35, T-59..T-70, T-97..T-114). 265/265 self-tests PASS on a clean csc build. Live Windows-handoff verification (smoke.ps1, acceptance.ps1, W2-005 handler-failure integration) remains an operator task.

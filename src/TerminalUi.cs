@@ -174,7 +174,7 @@ namespace SaiCont
             object pollSync = new object();
             bool pollInFlight = false;
             IList<PollResult> pendingPollResults = null;
-            int pollGeneration = 0;
+            var pollGeneration = new RuntimeControlGeneration();
             int pollCounter = 0;
             DateTime lastPollTime = DateTime.MinValue;
             long nextPollDueTicks = Stopwatch.GetTimestamp();
@@ -200,14 +200,14 @@ namespace SaiCont
                 {
                     if (pollInFlight) return;
                     pollInFlight = true;
-                    int generation = pollGeneration;
+                    int generation = pollGeneration.Current;
                     WatcherEngine pollEngine = engine;
                     Thread worker = new Thread((ThreadStart)delegate
                     {
                         IList<PollResult> results;
                         try
                         {
-                            results = pollEngine.PollOnce(allowInput, delegate { return interruptRequested || (stopPredicate != null && stopPredicate()) || generation != pollGeneration; });
+                            results = pollEngine.PollOnce(allowInput, delegate { return interruptRequested || (stopPredicate != null && stopPredicate()) || !pollGeneration.IsCurrent(generation); });
                         }
                         catch (Exception pollException)
                         {
@@ -215,7 +215,7 @@ namespace SaiCont
                         }
                         lock (pollSync)
                         {
-                            if (generation == pollGeneration) pendingPollResults = results;
+                            if (pollGeneration.IsCurrent(generation)) pendingPollResults = results;
                             pollInFlight = false;
                             livePollWorker = null;
                         }
@@ -388,7 +388,7 @@ namespace SaiCont
                                     case ConsoleKey.Q:
                                     case ConsoleKey.Escape:
                                         running = false;
-                                        Interlocked.Increment(ref pollGeneration);
+                                        pollGeneration.Increment();
                                         dirtyRender = true;
                                         break;
 
@@ -517,7 +517,7 @@ namespace SaiCont
                                         if (mode == TuiMode.DryRun)
                                         {
                                              mode = TuiMode.Idle;
-                                             Interlocked.Increment(ref pollGeneration);
+                                             pollGeneration.Increment();
                                              statusMessage = "Dry-run stopped. In IDLE mode.";
                                             AddLog(logs, "INFO", "operator", 0, "Dry-run stopped.");
                                         }
@@ -534,7 +534,7 @@ namespace SaiCont
                                         if (mode == TuiMode.Watch)
                                         {
                                              mode = TuiMode.Idle;
-                                             Interlocked.Increment(ref pollGeneration);
+                                             pollGeneration.Increment();
                                              statusMessage = "Watch mode paused. In IDLE mode.";
                                             AddLog(logs, "INFO", "operator", 0, "Watch mode stopped.");
                                         }
@@ -547,7 +547,7 @@ namespace SaiCont
 
                                      case ConsoleKey.S:
                                          mode = TuiMode.Idle;
-                                         Interlocked.Increment(ref pollGeneration);
+                                         pollGeneration.Increment();
                                         confirmWatch = false;
                                         statusMessage = "Stopped. In IDLE mode.";
                                         AddLog(logs, "INFO", "operator", 0, "Monitoring stopped.");
@@ -559,8 +559,10 @@ namespace SaiCont
                                         try
                                         {
                                              configuration = WatcherConfiguration.Load(configPath);
-                                             Interlocked.Increment(ref pollGeneration);
+                                             pollGeneration.Increment();
+                                             WatcherEngine oldEngine = engine;
                                              engine = new WatcherEngine(configuration, stateStore);
+                                             try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception shutdownException) { AddLog(logs, "WARN", "config", 0, "Old transport shutdown failed: " + shutdownException.Message); }
                                             statusMessage = "Config reloaded successfully (" + configuration.Targets.Count + " targets).";
                                             AddLog(logs, "INFO", "config", 0, "Configuration reloaded from " + Path.GetFileName(configPath));
                                         }
@@ -609,14 +611,14 @@ namespace SaiCont
             finally
             {
                 // W2-001: invalidate any in-flight poll and join the worker
-                // before the lifecycle owner releases the mutex/instance.
-                Interlocked.Increment(ref pollGeneration);
+                // before the lifecycle owner releases the mutex/instance.                                             pollGeneration.Increment();
                 Thread joiner;
                 lock (pollSync) { joiner = livePollWorker; }
                 if (joiner != null)
                 {
-                    try { joiner.Join(5000); } catch { }
+                    try { FaultInjectionSeams.JoinWorker(joiner, 5000); } catch (Exception ex) { Program.TryReportTeardownFailure("TUI worker join", ex); }
                 }
+                try { if (engine != null) engine.Dispose(); } catch (Exception ex) { Program.TryReportTeardownFailure("TUI transport shutdown", ex); }
                 NativeConsole.UnsetCtrlHandler();
                 try { Console.CursorVisible = origCursorVisible; } catch { }
                 try { Console.ForegroundColor = origFg; } catch { }
@@ -1171,11 +1173,12 @@ namespace SaiCont
             if (!String.IsNullOrEmpty(result.Error))
             {
                 return String.Format(
-                    "ERROR target={0} pid={1} error={2} reason={3}",
+                    "ERROR target={0} pid={1} error={2} reason={3} code={4}",
                     result.Target,
                     result.ProcessId,
                     Quote(result.Error),
-                    Quote(result.Reason));
+                    Quote(result.Reason),
+                    result.DecisionCode);
             }
 
             string next = result.NextAttemptUtc == DateTime.MinValue
@@ -1183,7 +1186,7 @@ namespace SaiCont
                 : result.NextAttemptUtc.ToString("o", CultureInfo.InvariantCulture);
 
             return String.Format(
-                "MATCH target={0} pid={1} attach={2} title={3} trigger={4} ready={5} busy={6} would_send={7} sent={8} next={9} reason={10}",
+                "MATCH target={0} pid={1} attach={2} title={3} trigger={4} ready={5} busy={6} would_send={7} sent={8} next={9} reason={10} failure={11} action={12} retryable={13} severity={14} matched_by={15} code={16}",
                 result.Target,
                 result.ProcessId,
                 result.AttachProcessId,
@@ -1194,7 +1197,13 @@ namespace SaiCont
                 result.WouldSend,
                 result.Sent,
                 next,
-                Quote(result.Reason));
+                Quote(result.Reason),
+                result.FailureClass ?? "-",
+                result.FailureAction ?? "-",
+                result.FailureRetryable,
+                result.FailureSeverity ?? "-",
+                Quote(result.FailureMatchedBy),
+                result.DecisionCode);
         }
 
         private static string Quote(string value)
@@ -1203,5 +1212,3 @@ namespace SaiCont
         }
     }
 }
-
-

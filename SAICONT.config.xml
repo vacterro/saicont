@@ -13,6 +13,8 @@
         <pattern>(?i)rate[- ]limited upstream</pattern>
         <pattern>(?i)daily free model limit reached(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in</pattern>
         <pattern>(?i)reached today.s free usage limit(?:[^\r\n]*\r?\n){0,4}[^\r\n]*try again in</pattern>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
       </triggerPatterns>
       <readyPatterns>
         <pattern>^.*Ask anything\.\.\.\s*$</pattern>
@@ -31,6 +33,8 @@
         <pattern>(?i)usage limit[^\r\n]{0,256}(?:try\s+again|reset|renew)</pattern>
         <pattern>(?i)(?:rate|request) limit[^\r\n]{0,256}(?:exceeded|reached|try\s+again)</pattern>
         <pattern>(?i)(?:try\s+)?again\s+at\s+[A-Za-z0-9]</pattern>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
       </triggerPatterns>
       <readyPatterns>
         <pattern>^\s*›\s*Ask Codex to do anything\s*$</pattern>
@@ -39,6 +43,65 @@
       </readyPatterns>
       <busyPatterns>
         <pattern>(?im)^\s*[›&gt;]\s*Working\s*\(</pattern>
+      </busyPatterns>
+    </target>
+    <target name="saipal-http" enabled="true" transport="opencode-http" endpoint="http://127.0.0.1:41961" projectDir="V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPAL" command="cc" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="false">
+      <triggerPatterns>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
+        <pattern>(?i)(?:an\s+)?internal(?:\s+server)?\s+error(?:\s+occurred)?</pattern>
+      </triggerPatterns>
+    </target>
+    <target name="saituls-http" enabled="false" transport="opencode-http" endpoint="http://127.0.0.1:44010" command="cc" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="false">
+      <triggerPatterns>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
+        <pattern>(?i)(?:an\s+)?internal(?:\s+server)?\s+error(?:\s+occurred)?</pattern>
+      </triggerPatterns>
+      <readyPatterns>
+        <pattern>(?i)ready|idle|done</pattern>
+      </readyPatterns>
+      <busyPatterns>
+        <pattern>(?i)thinking|streaming|working</pattern>
+      </busyPatterns>
+    </target>
+    <target name="audapack-http" enabled="false" transport="opencode-http" endpoint="http://127.0.0.1:43398" command="cc" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="false">
+      <triggerPatterns>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
+        <pattern>(?i)(?:an\s+)?internal(?:\s+server)?\s+error(?:\s+occurred)?</pattern>
+      </triggerPatterns>
+      <readyPatterns>
+        <pattern>(?i)ready|idle|done</pattern>
+      </readyPatterns>
+      <busyPatterns>
+        <pattern>(?i)thinking|streaming|working</pattern>
+      </busyPatterns>
+    </target>
+    <target name="termisai-http" enabled="false" transport="opencode-http" endpoint="http://127.0.0.1:43635" command="cc" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="false">
+      <triggerPatterns>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
+        <pattern>(?i)(?:an\s+)?internal(?:\s+server)?\s+error(?:\s+occurred)?</pattern>
+      </triggerPatterns>
+      <readyPatterns>
+        <pattern>(?i)ready|idle|done</pattern>
+      </readyPatterns>
+      <busyPatterns>
+        <pattern>(?i)thinking|streaming|working</pattern>
+      </busyPatterns>
+    </target>
+    <target name="fastprompter-http" enabled="false" transport="opencode-http" endpoint="http://127.0.0.1:43425" command="cc" initialDelaySeconds="60" retryIntervalSeconds="60" parseRetryTime="false">
+      <triggerPatterns>
+        <pattern>(?i)&quot;code&quot;\s*:\s*&quot;internal_error&quot;</pattern>
+        <pattern>(?i)Cannot read\s+&quot;clipboard&quot;\s+\(this model does not support image input\)</pattern>
+        <pattern>(?i)(?:an\s+)?internal(?:\s+server)?\s+error(?:\s+occurred)?</pattern>
+      </triggerPatterns>
+      <readyPatterns>
+        <pattern>(?i)ready|idle|done</pattern>
+      </readyPatterns>
+      <busyPatterns>
+        <pattern>(?i)thinking|streaming|working</pattern>
       </busyPatterns>
     </target>
   </targets>

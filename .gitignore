@@ -4,6 +4,8 @@ logs/
 run/
 *.pdb
 *.tmp
+dist/
+.freebuff/
 
 # SAIPEN state
 .saipen/*

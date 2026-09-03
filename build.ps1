@@ -31,6 +31,7 @@ $arguments = @(
     '/warnaserror+',
     "/out:$outputPath",
     '/reference:System.Core.dll',
+    '/reference:System.Web.Extensions.dll',
     '/reference:System.Windows.Forms.dll',
     '/reference:System.Drawing.dll'
 ) + $sources

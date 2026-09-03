@@ -48,7 +48,7 @@ try {
     $launcher = $null
     $startupVerified = $false
     try {
-        $launcher = Start-Process -FilePath $paths.Executable -ArgumentList ($launcherArguments -join ' ') -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $launcher = Start-Process -FilePath $paths.Executable -ArgumentList $launcherArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
         $deadlineUtc = [DateTime]::UtcNow.AddSeconds(10)
         do {
             Start-Sleep -Milliseconds 200

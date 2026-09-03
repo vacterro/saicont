@@ -12,6 +12,12 @@ namespace SaiCont
     internal sealed class StateRecord
     {
         public string RuleName;
+        // Optional transport identity. Empty values preserve compatibility
+        // with state files written before the OpenCode HTTP backend existed.
+        public string TransportKind;
+        public string EndpointIdentity;
+        public string ProjectIdentity;
+        public string SessionIdentity;
         public int ProcessId;
         public DateTime ProcessStartUtc;
         public string TriggerFingerprint;
@@ -26,6 +32,7 @@ namespace SaiCont
         public int SuppressedTriggerRow;
         public int Occurrence;
         public int AttemptCount;
+        public string RecoveryFamily;
         public string RecoveryState;
 
         public string CompositeKey
@@ -283,6 +290,10 @@ namespace SaiCont
                     root.Add(new XElement(
                         "record",
                         new XAttribute("rule", record.RuleName ?? String.Empty),
+                        new XAttribute("transport", record.TransportKind ?? String.Empty),
+                        new XAttribute("endpoint", record.EndpointIdentity ?? String.Empty),
+                        new XAttribute("project", record.ProjectIdentity ?? String.Empty),
+                        new XAttribute("session", record.SessionIdentity ?? String.Empty),
                         new XAttribute("pid", record.ProcessId),
                         new XAttribute("startUtc", FormatUtc(record.ProcessStartUtc)),
 new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
@@ -296,6 +307,7 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
                          new XAttribute("suppressed", record.SuppressedFingerprint ?? String.Empty),
                          new XAttribute("suppressedMatchStart", record.SuppressedTriggerRow),
                          new XAttribute("attempts", record.AttemptCount),
+                         new XAttribute("recoveryFamily", record.RecoveryFamily ?? String.Empty),
                          new XAttribute("occurrence", record.Occurrence),
                         new XAttribute("state", SerializeRecoveryState(record))));
                 }
@@ -390,6 +402,10 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
             {
                 builder.Append(record.CompositeKey).Append('|')
                     .Append(record.RuleSemanticFingerprint).Append('|')
+                    .Append(record.TransportKind).Append('|')
+                    .Append(record.EndpointIdentity).Append('|')
+                    .Append(record.ProjectIdentity).Append('|')
+                    .Append(record.SessionIdentity).Append('|')
                     .Append(record.TriggerFingerprint).Append('|')
                     .Append(FormatUtc(RoundDownToHour(record.LastObservedUtc))).Append('|')
                     .Append(FormatUtc(record.LastWriteUtc)).Append('|')
@@ -399,6 +415,7 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
                     .Append(record.SuppressedFingerprint).Append('|')
                     .Append(record.SuppressedTriggerRow).Append('|')
                     .Append(record.AttemptCount).Append('|')
+                    .Append(record.RecoveryFamily).Append('|')
                     .Append(record.Occurrence).Append('|')
                     .Append(record.RecoveryState).Append('\n');
             }
@@ -430,7 +447,7 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
 
         private static void ValidateRecordShape(XElement element)
         {
-            string[] attributes = { "rule", "pid", "startUtc", "fingerprint", "triggerMatchStart", "ruleFingerprint", "lastObserved", "lastWrite", "nextAllowed", "awaitingOutcome", "sawBusy", "suppressed", "suppressedMatchStart", "attempts", "occurrence", "state" };
+            string[] attributes = { "rule", "transport", "endpoint", "project", "session", "pid", "startUtc", "fingerprint", "triggerMatchStart", "ruleFingerprint", "lastObserved", "lastWrite", "nextAllowed", "awaitingOutcome", "sawBusy", "suppressed", "suppressedMatchStart", "attempts", "recoveryFamily", "occurrence", "state" };
             foreach (XAttribute attribute in element.Attributes())
             {
                 if (!attributes.Contains(attribute.Name.LocalName, StringComparer.Ordinal))
@@ -461,6 +478,10 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
             var record = new StateRecord
             {
                 RuleName = RequiredAttribute(element, "rule"),
+                TransportKind = OptionalAttribute(element, "transport"),
+                EndpointIdentity = OptionalAttribute(element, "endpoint"),
+                ProjectIdentity = OptionalAttribute(element, "project"),
+                SessionIdentity = OptionalAttribute(element, "session"),
                 ProcessId = ParseInt(RequiredAttribute(element, "pid")),
                 ProcessStartUtc = ParseUtc(RequiredAttribute(element, "startUtc")),
                 TriggerFingerprint = OptionalAttribute(element, "fingerprint"),
@@ -474,6 +495,7 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
                  SuppressedFingerprint = OptionalAttribute(element, "suppressed"),
                  SuppressedTriggerRow = ParseOptionalInt(element, "suppressedMatchStart", -1, -1, Int32.MaxValue),
                  AttemptCount = ParseIntStrict(attemptsRaw, "attempts", 0, 50),
+                 RecoveryFamily = OptionalAttribute(element, "recoveryFamily"),
                  Occurrence = ParseOptionalInt(element, "occurrence", 0, 0, Int32.MaxValue),
                  RecoveryState = ValidateRecoveryState(stateRaw)
             };

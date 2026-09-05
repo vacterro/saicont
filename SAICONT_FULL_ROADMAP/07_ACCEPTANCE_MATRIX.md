@@ -27,6 +27,28 @@
 | 23 | Docs match actual behavior and counts | release truth pass |
 | 24 | v1.2.0 is tagged only after all previous gates | final release gate |
 
+## v1.3 external-audit invariants (SRC-005 / T-163)
+
+| # | Invariant | Gate |
+|---|---|---|
+| 25 | Corrupt/unsupported durable state has a reachable, atomic, fail-closed reconciliation | CORE-001 engine + store tests (commit before marker clear; failed commit keeps the marker) |
+| 26 | OpenCode malformed/restored ambiguity is resolvable only by authoritative reconciliation | CORE-002 transport tests (reconnect alone never clears) |
+| 27 | Process-discovery failure is scoped to transports that need it | CORE-003 mixed console+HTTP poll test |
+| 28 | Asynchronous HTTP completion has exact rule/state ownership | CORE-004 sibling-rule consumption test |
+| 29 | Every lifecycle mode publishes health bound to real PID/start/mode/config | CORE-005 health identity + semantic fingerprint tests |
+| 30 | `status.ps1 -Json` joins lifecycle and health into verified classifications | CORE-006 status contract test in smoke |
+| 31 | Unchanged health obeys the 45-second bound | CORE-007 write-count test at poll cadence |
+| 32 | Settings preserves every target draft across selection/reload/reset | W2L1-001 draft-ownership tests |
+| 33 | Every successful Settings save round-trips through the authoritative loader | W2L1-002 loader-backed Apply gate tests |
+| 34 | HTTP anti-replay state is retired only by transport-correct liveness, and pruning persists | W2L1-003 pruning test at >=100 states |
+| 35 | GUI/TUI cannot dispose/swap/release lifecycle ownership before workers are proven dead | W2L1-004 worker-retirement tests (timeout is a failure) |
+| 36 | Forced/failed-start cleanup removes matching dead-owner artifacts or reports degraded | W2L1-005 dead-owner cleanup + `STOPPED_DEGRADED` |
+| 37 | OpenCode request amplification is bounded without weakening commit safety | PERF-001 request-count budget in performance.ps1 |
+| 38 | SSE session/text/frame memory is explicitly bounded | PERF-002 churn + rolling-buffer tests |
+| 39 | One console is captured once per poll generation regardless of rule count | PERF-003 observation-count test; pre-send reread stays fresh |
+| 40 | Failure classification avoids unconditional full-snapshot work without changing precedence | PERF-004 gate-domination + golden-corpus tests |
+| 41 | The performance gate measures active production paths with valid metrics | PERF-005 mandatory scenarios; CPU from `TotalProcessorTime` |
+
 ## Absolute release blockers
 
 Any of the following blocks v1.2.0:

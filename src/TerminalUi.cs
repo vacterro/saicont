@@ -117,7 +117,7 @@ namespace SaiCont
             }
         }
 
-        public static int RunInteractiveTui(WatcherConfiguration configuration, string configPath, string initialModeName = null, DurableStateStore stateStore = null, Func<bool> stopPredicate = null)
+        public static int RunInteractiveTui(WatcherConfiguration configuration, string configPath, string initialModeName = null, DurableStateStore stateStore = null, Func<bool> stopPredicate = null, LifecycleHealthContext lifecycleHealth = null)
         {
             ConsoleColor origFg = ConsoleColor.Gray;
             ConsoleColor origBg = ConsoleColor.Black;
@@ -171,6 +171,9 @@ namespace SaiCont
             var logs = new List<TuiLogEntry>();
             var latestSessions = new List<PollResult>();
             WatcherEngine engine = new WatcherEngine(configuration, stateStore);
+            // CORE-005: interactive engines publish the same health contract as
+            // --watch, bound to the lifecycle owner's real identity.
+            engine.LifecycleHealth = lifecycleHealth;
             object pollSync = new object();
             bool pollInFlight = false;
             IList<PollResult> pendingPollResults = null;
@@ -559,9 +562,30 @@ namespace SaiCont
                                         try
                                         {
                                              configuration = WatcherConfiguration.Load(configPath);
-                                             pollGeneration.Increment();
+                                             // W2L1-004: retire the running poll worker BEFORE swapping
+                                             // and disposing the engine. Disposing an engine while its
+                                             // poll is still inside a transport call manufactures
+                                             // ambiguity in exactly the state the poll was about to
+                                             // commit, and a timed-out join is a lifecycle failure, not
+                                             // a successful reload.
                                              WatcherEngine oldEngine = engine;
+                                             Thread reloadJoiner;
+                                             lock (pollSync) { reloadJoiner = livePollWorker; }
+                                             WorkerRetirement retirement = WorkerRetirementPolicy.Retire(
+                                                 reloadJoiner,
+                                                 pollGeneration,
+                                                 null,
+                                                 delegate { if (oldEngine != null) oldEngine.CancelInFlight(); });
+                                             if (retirement == WorkerRetirement.TimedOut)
+                                             {
+                                                 statusMessage = "Config reload aborted: previous poll worker is still running.";
+                                                 AddLog(logs, "ERROR", "config", 0, "Reload refused: poll worker did not retire; engine not replaced.");
+                                                 break;
+                                             }
+                                             lock (pollSync) { livePollWorker = null; pollInFlight = false; }
                                              engine = new WatcherEngine(configuration, stateStore);
+                                             // CORE-005: a replacement engine keeps publishing health.
+                                             engine.LifecycleHealth = lifecycleHealth;
                                              try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception shutdownException) { AddLog(logs, "WARN", "config", 0, "Old transport shutdown failed: " + shutdownException.Message); }
                                             statusMessage = "Config reloaded successfully (" + configuration.Targets.Count + " targets).";
                                             AddLog(logs, "INFO", "config", 0, "Configuration reloaded from " + Path.GetFileName(configPath));
@@ -610,15 +634,30 @@ namespace SaiCont
             }
             finally
             {
-                // W2-001: invalidate any in-flight poll and join the worker
-                // before the lifecycle owner releases the mutex/instance.                                             pollGeneration.Increment();
+                // W2-001 / W2L1-004: invalidate authorization, then PROVE the poll
+                // worker exited before disposing the engine and returning to the
+                // lifecycle owner, which releases the installation mutex as soon
+                // as this method returns. A timed-out join used to be treated as
+                // success, so a surviving worker could still reach durable state
+                // while a replacement process took ownership.
+                WatcherEngine engineAtTeardown = engine;
                 Thread joiner;
                 lock (pollSync) { joiner = livePollWorker; }
-                if (joiner != null)
+                WorkerRetirement retirement = WorkerRetirementPolicy.Retire(
+                    joiner,
+                    pollGeneration,
+                    null,
+                    delegate { if (engineAtTeardown != null) engineAtTeardown.CancelInFlight(); });
+                if (retirement == WorkerRetirement.TimedOut)
                 {
-                    try { FaultInjectionSeams.JoinWorker(joiner, 5000); } catch (Exception ex) { Program.TryReportTeardownFailure("TUI worker join", ex); }
+                    Program.TryReportTeardownFailure(
+                        "TUI worker retirement",
+                        new TimeoutException("poll worker still alive after cancellation; engine not disposed"));
                 }
-                try { if (engine != null) engine.Dispose(); } catch (Exception ex) { Program.TryReportTeardownFailure("TUI transport shutdown", ex); }
+                else
+                {
+                    try { if (engine != null) engine.Dispose(); } catch (Exception ex) { Program.TryReportTeardownFailure("TUI transport shutdown", ex); }
+                }
                 NativeConsole.UnsetCtrlHandler();
                 try { Console.CursorVisible = origCursorVisible; } catch { }
                 try { Console.ForegroundColor = origFg; } catch { }

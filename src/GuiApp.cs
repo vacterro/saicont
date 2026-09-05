@@ -23,6 +23,9 @@ namespace SaiCont
         private readonly string configPath;
         private readonly DurableStateStore stateStore;
         private readonly Func<bool> shouldStop;
+        // CORE-005: authoritative lifecycle identity for every engine this form
+        // creates, including reload replacements.
+        private readonly LifecycleHealthContext _lifecycleHealth;
         private WatcherConfiguration currentConfig;
         private WatcherEngine engine;
         private SystemOperationalState systemState = SystemOperationalState.Paused;
@@ -120,13 +123,17 @@ namespace SaiCont
 
         private volatile bool _pendingResultsReady;
 
-        public SaiContGuiForm(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)
+        public SaiContGuiForm(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null, LifecycleHealthContext lifecycleHealth = null)
         {
             configPath = configurationFilePath;
             stateStore = sharedStateStore;
             shouldStop = stopPredicate;
+            _lifecycleHealth = lifecycleHealth;
             currentConfig = config;
             engine = new WatcherEngine(currentConfig, stateStore);
+            // CORE-005: the GUI publishes the same health contract as --watch and
+            // preserves it across every engine replacement below.
+            engine.LifecycleHealth = _lifecycleHealth;
 
             if (String.Equals(initialMode, "--watch", StringComparison.OrdinalIgnoreCase)) systemState = SystemOperationalState.OnWatch;
             else if (String.Equals(initialMode, "--dry-run", StringComparison.OrdinalIgnoreCase)) systemState = SystemOperationalState.OnDryRun;
@@ -662,13 +669,12 @@ namespace SaiCont
                         LogDuplicateWindowSeconds = currentConfig.LogDuplicateWindowSeconds,
                         Targets = newTargets
                     };
-                    WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
                     WatcherEngine oldEngine;
-                    lock (_pollLock)
+                    if (!TryReplaceEngine(newConfig, out oldEngine))
                     {
-                        currentConfig = newConfig;
-                        oldEngine = engine;
-                        engine = newEngine;
+                        AppendLog("ERROR", "Rule toggle refused: poll worker did not retire.");
+                        statusLabel.Text = "Rule toggle refused (poll worker still running).";
+                        return;
                     }
                     try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception ex) { AppendLog("WARN", "Old transport shutdown failed: " + ex.Message); }
                     ReloadRulesList();
@@ -722,18 +728,47 @@ namespace SaiCont
             }
         }
 
+        /// <summary>
+        /// W2L1-004 / CORE-005: swap in a new engine only after the current poll
+        /// worker has been proven retired, and carry the lifecycle health context
+        /// across so a replacement engine keeps publishing health. Returns false
+        /// when the worker could not be retired; the caller must NOT dispose the
+        /// old engine in that case.
+        /// </summary>
+        private bool TryReplaceEngine(WatcherConfiguration newConfig, out WatcherEngine oldEngine)
+        {
+            oldEngine = null;
+            bool wasRunning = _pollRunning;
+            if (!StopBackgroundPoll(true))
+            {
+                return false;
+            }
+            var newEngine = new WatcherEngine(newConfig, stateStore);
+            newEngine.LifecycleHealth = _lifecycleHealth;
+            lock (_pollLock)
+            {
+                currentConfig = newConfig;
+                oldEngine = engine;
+                engine = newEngine;
+            }
+            if (wasRunning)
+            {
+                StartBackgroundPoll();
+            }
+            return true;
+        }
+
         private void ReloadConfig()
         {
             try
             {
                 WatcherConfiguration newConfig = WatcherConfiguration.Load(configPath);
-                WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
                 WatcherEngine oldEngine;
-                lock (_pollLock)
+                if (!TryReplaceEngine(newConfig, out oldEngine))
                 {
-                    currentConfig = newConfig;
-                    oldEngine = engine;
-                    engine = newEngine;
+                    statusLabel.Text = "Reload refused (poll worker still running).";
+                    AppendLog("ERROR", "Reload refused: poll worker did not retire; engine not replaced.");
+                    return;
                 }
                 try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception ex) { AppendLog("WARN", "Old transport shutdown failed: " + ex.Message); }
                 ReloadRulesList();
@@ -766,13 +801,12 @@ namespace SaiCont
                     return;
                 }
                 WatcherConfiguration newConfig = dlg.AppliedConfig;
-                WatcherEngine newEngine = new WatcherEngine(newConfig, stateStore);
                 WatcherEngine oldEngine;
-                lock (_pollLock)
+                if (!TryReplaceEngine(newConfig, out oldEngine))
                 {
-                    currentConfig = newConfig;
-                    oldEngine = engine;
-                    engine = newEngine;
+                    statusLabel.Text = "Settings not activated (poll worker still running).";
+                    AppendLog("ERROR", "Settings saved to disk but engine not replaced: poll worker did not retire.");
+                    return;
                 }
                 try { if (oldEngine != null) oldEngine.Dispose(); } catch (Exception ex) { AppendLog("WARN", "Old transport shutdown failed: " + ex.Message); }
                 ReloadRulesList();
@@ -931,15 +965,39 @@ namespace SaiCont
 
         private void StopBackgroundPoll()
         {
+            StopBackgroundPoll(false);
+        }
+
+        /// <summary>
+        /// W2L1-004: retire the poll worker through the shared primitive. When
+        /// <paramref name="required"/> is true (shutdown), a worker that survives
+        /// cancellation is a lifecycle failure and the engine is NOT disposed --
+        /// the previous code joined for 5s, ignored the result, and disposed
+        /// anyway, so a blocked poll could still touch durable state after the
+        /// installation mutex was released.
+        /// </summary>
+        private bool StopBackgroundPoll(bool required)
+        {
             _pollRunning = false;
-            _pollGeneration.Increment();
-            try { FaultInjectionSeams.WakeWorker(_pollWakeup); } catch (ObjectDisposedException) { }
             Thread worker = _pollThread;
-            if (worker != null)
+            WatcherEngine engineAtStop = engine;
+            WorkerRetirement retirement = WorkerRetirementPolicy.Retire(
+                worker,
+                _pollGeneration,
+                delegate { try { FaultInjectionSeams.WakeWorker(_pollWakeup); } catch (ObjectDisposedException) { } },
+                delegate { if (engineAtStop != null) engineAtStop.CancelInFlight(); });
+            if (retirement != WorkerRetirement.TimedOut)
             {
-                try { FaultInjectionSeams.JoinWorker(worker, 5000); } catch (Exception ex) { Program.TryReportTeardownFailure("GUI worker join", ex); }
-                if (!worker.IsAlive) { _pollThread = null; }
+                _pollThread = null;
+                return true;
             }
+            if (required)
+            {
+                Program.TryReportTeardownFailure(
+                    "GUI worker retirement",
+                    new TimeoutException("poll worker still alive after cancellation; engine not disposed"));
+            }
+            return false;
         }
 
         private void UpdateSessionsList(IList<PollResult> results)
@@ -1114,8 +1172,15 @@ namespace SaiCont
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
-            StopBackgroundPoll();
-            try { if (engine != null) engine.Dispose(); } catch (Exception ex) { Program.TryReportTeardownFailure("GUI transport shutdown", ex); }
+            // W2L1-004: dispose the engine only when the poll worker is proven
+            // gone. RunInteractiveWithLifecycle releases the installation mutex
+            // as soon as this returns, so an unproven worker must not be
+            // reported as a clean teardown.
+            bool retired = StopBackgroundPoll(true);
+            if (retired)
+            {
+                try { if (engine != null) engine.Dispose(); } catch (Exception ex) { Program.TryReportTeardownFailure("GUI transport shutdown", ex); }
+            }
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;
@@ -1133,7 +1198,7 @@ namespace SaiCont
             base.Dispose(disposing);
         }
 
-        public static int RunDesktopGui(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null)
+        public static int RunDesktopGui(WatcherConfiguration config, string configurationFilePath, string initialMode = null, DurableStateStore sharedStateStore = null, Func<bool> stopPredicate = null, LifecycleHealthContext lifecycleHealth = null)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -1154,7 +1219,7 @@ namespace SaiCont
                 };
             }
             catch { }
-            Application.Run(new SaiContGuiForm(config, configurationFilePath, initialMode, sharedStateStore, stopPredicate));
+            Application.Run(new SaiContGuiForm(config, configurationFilePath, initialMode, sharedStateStore, stopPredicate, lifecycleHealth));
             return 0;
         }
     }

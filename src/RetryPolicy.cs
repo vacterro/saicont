@@ -133,6 +133,12 @@ namespace SaiCont
         public DateTime LastWriteUtc { get { return _lastWriteUtc; } }
         public int AttemptCount { get { return _attemptCount; } }
         public string SessionIdentity { get { return _sessionIdentity; } }
+        // W2L1-003: which transport owns this record. State retirement policy is
+        // transport-specific: an OS PID that vanished is real evidence for a
+        // console session and MEANINGLESS for an opencode-http session, whose
+        // identity carries a synthetic pseudo-PID that can never appear in a
+        // Toolhelp snapshot.
+        public string TransportKind { get { return _transportKind; } }
 
         public void SetTransportIdentity(TargetObservation observation)
         {
@@ -645,6 +651,19 @@ namespace SaiCont
     {
         public static RuleObservation Inspect(TargetRule rule, ConsoleSnapshot snapshot, DateTime nowUtc)
         {
+            return Inspect(rule, snapshot, nowUtc, null);
+        }
+
+        /// <summary>
+        /// PERF-004: <paramref name="precomputedFailure"/> lets the caller supply
+        /// the rule-INDEPENDENT failure assessment for this exact immutable
+        /// snapshot. Failure classification does not depend on any rule field, so
+        /// when several rules inspect one console snapshot in the same poll the
+        /// classifier runs once instead of once per rule. Passing null keeps the
+        /// original behaviour.
+        /// </summary>
+        public static RuleObservation Inspect(TargetRule rule, ConsoleSnapshot snapshot, DateTime nowUtc, FailureAssessment precomputedFailure)
+        {
             if (rule == null || snapshot == null || String.IsNullOrEmpty(snapshot.Text))
             {
                 return new RuleObservation
@@ -694,7 +713,7 @@ namespace SaiCont
                 bool ready = MatchesAny(inputLine, rule.CompiledReadyPatterns) || ContainsTypedCommand(inputLine, rule.Command);
                 bool busy = rule.CompiledBusyPatterns != null && rule.CompiledBusyPatterns.Length > 0 && MatchesAny(ExtractCursorTail(snapshot.Text, 5), rule.CompiledBusyPatterns);
 
-                FailureAssessment failure = FailureIntelligence.Classify(snapshot.Text);
+                FailureAssessment failure = precomputedFailure ?? FailureIntelligence.Classify(snapshot.Text);
                 bool failureSelected = false;
                 int matchStart = bestMatch == null ? -1 : bestMatch.Index;
                 int matchLength = bestMatch == null ? 0 : bestMatch.Length;

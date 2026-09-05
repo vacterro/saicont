@@ -11,6 +11,11 @@ namespace SaiCont
 {
     internal enum OpenCodeStatusKind { Unknown, Idle, Busy, Retry, Error }
 
+    // PERF-001 / CORE-002 / CORE-004 test seam: replaces the real REST layer with
+    // a deterministic in-process responder so request counts and reconciliation
+    // transitions can be asserted without a live endpoint or a network.
+    internal delegate bool OpenCodeHttpInvoke(string method, string path, string body, out int status, out string responseBody, out string error);
+
     internal sealed class OpenCodeSseEvent
     {
         public string Id;
@@ -42,6 +47,7 @@ namespace SaiCont
         private readonly object _gate = new object();
         private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
         private readonly Dictionary<string, OpenCodeRuntimeSession> _sessions = new Dictionary<string, OpenCodeRuntimeSession>(StringComparer.Ordinal);
+        private readonly Queue<string> _sessionOrder = new Queue<string>();
         private readonly HashSet<string> _seenEventIds = new HashSet<string>(StringComparer.Ordinal);
         private readonly Queue<string> _seenEventOrder = new Queue<string>();
         private readonly string _endpoint;
@@ -49,7 +55,20 @@ namespace SaiCont
         private readonly Thread _eventThread;
         private volatile bool _stopping;
         private volatile bool _connected;
-        private bool _malformedEvent;
+        // CORE-002: ambiguity is a RESOLVABLE state, not a one-way poison latch.
+        // _ambiguityGeneration names the SSE stream generation whose evidence is
+        // untrustworthy; it is cleared only after a NEWER stream is established
+        // AND authoritative REST/SSE identity agree, never merely because the
+        // socket reopened. _streamGeneration increments on every connect.
+        private int _streamGeneration;
+        private int _ambiguousGeneration = -1;
+        private string _ambiguityReason;
+        // CORE-002: reconciliation requires a NEWER stream generation, and a
+        // malformed frame does not disconnect by itself, so ambiguity has to ASK
+        // for a fresh stream. One request per generation: the event loop observes
+        // the flag, ends the round, and reconnects with generation + 1.
+        private volatile bool _ambiguityDisconnectRequested;
+        private int _ambiguityDisconnectGeneration = -1;
         private bool _reconcileRequired;
         private string _boundSessionId;
         private SendOperation _send;
@@ -57,24 +76,189 @@ namespace SaiCont
         private HttpWebRequest _activeSendRequest;
         private readonly bool _restoredSessionAmbiguous;
 
+        // PERF-002: bound the runtime-session table. The bound session and any
+        // session carrying pending send / failure authority are never evicted;
+        // everything else is a recent-LRU window.
+        private const int MaxRetainedSessions = 64;
+        // PERF-002: hard bound on ONE physical SSE input line. StreamReader
+        // would otherwise materialize an arbitrarily long line before the frame
+        // guard could reject it.
+        private const int MaxLineChars = 256 * 1024;
+
+        // PERF-001: one authoritative REST snapshot per poll generation.
+        private ObservationSnapshot _snapshot;
+        private long _snapshotSequence;
+        private const int SnapshotLifetimeMs = 750;
+        // PERF-001: single-use proof that a candidate already passed
+        // ValidatePreSend inside the current snapshot generation.
+        private long _validationTicketSequence = -1;
+        private string _validationTicketSession;
+        private string _validationTicketEndpointIdentity;
+        // CORE-004: monotonic per-transport send generation.
+        private long _sendGeneration;
+        // PERF-001: last message-history evidence, keyed by the SSE evidence
+        // sequence that produced it.
+        private string _messageCacheSession;
+        private int _messageCacheStreamGeneration = -1;
+        private long _messageCacheEvidenceSequence = -1;
+        private bool _messageCacheValid;
+        private MessageReconciliation _messageCache;
+
         public OpenCodeHttpTransport() : this(null, null) { }
 
         internal OpenCodeHttpTransport(string endpoint, string projectDirectory)
             : this(endpoint, projectDirectory, null, false) { }
 
         internal OpenCodeHttpTransport(string endpoint, string projectDirectory, string initialSessionId, bool restoredSessionAmbiguous)
+            : this(endpoint, projectDirectory, initialSessionId, restoredSessionAmbiguous, true) { }
+
+        // PERF-001 test seam: startEventLoop=false keeps the SSE thread from
+        // dialing anything, so a test transport performs exactly the REST calls
+        // the harness counts and nothing else.
+        internal OpenCodeHttpTransport(string endpoint, string projectDirectory, string initialSessionId, bool restoredSessionAmbiguous, bool startEventLoop)
         {
             _endpoint = endpoint;
             _projectDirectory = projectDirectory;
             _boundSessionId = initialSessionId;
             _restoredSessionAmbiguous = restoredSessionAmbiguous;
-            _malformedEvent = restoredSessionAmbiguous;
+            if (restoredSessionAmbiguous)
+            {
+                // Generation 0 is the first stream this transport will open, so
+                // marking generation 0 ambiguous means "no stream observed so
+                // far is trustworthy"; reconciliation requires generation >= 1.
+                _ambiguousGeneration = 0;
+                _ambiguityReason = "restored_session_ambiguous";
+            }
             _eventThread = new Thread(EventLoop) { IsBackground = true, Name = "SAICONT OpenCode SSE" };
-            if (!String.IsNullOrWhiteSpace(endpoint) && !String.IsNullOrWhiteSpace(projectDirectory)) _eventThread.Start();
+            if (startEventLoop && !String.IsNullOrWhiteSpace(endpoint) && !String.IsNullOrWhiteSpace(projectDirectory)) _eventThread.Start();
+        }
+
+        internal static OpenCodeHttpTransport CreateForTests(string endpoint, string projectDirectory, string initialSessionId, bool restoredSessionAmbiguous)
+        {
+            return new OpenCodeHttpTransport(endpoint, projectDirectory, initialSessionId, restoredSessionAmbiguous, false);
         }
 
         public string Kind { get { return "opencode-http"; } }
         public bool HasPendingSend { get { lock (_gate) { return _send != null && !_send.Completed; } } }
+
+        /// <summary>
+        /// PERF-001 test seam: when set, every REST call is served by this
+        /// delegate instead of HttpWebRequest. Null in production.
+        /// </summary>
+        internal OpenCodeHttpInvoke HttpInvokeForTests;
+
+        /// <summary>
+        /// CORE-002 test seam: force the live-stream state a running EventLoop
+        /// would otherwise own, so reconciliation can be exercised deterministically
+        /// without a socket. Advancing the generation models a NEW stream.
+        /// </summary>
+        internal void SetStreamStateForTests(bool connected, bool advanceGeneration)
+        {
+            lock (_gate)
+            {
+                if (advanceGeneration) _streamGeneration++;
+                _connected = connected;
+                _reconcileRequired = !connected;
+            }
+        }
+
+        /// <summary>CORE-002 test seam: inject SSE-derived session state.</summary>
+        internal void SetSessionStateForTests(string sessionId, OpenCodeStatusKind status, string text, string failureCode)
+        {
+            lock (_gate)
+            {
+                OpenCodeRuntimeSession runtime = GetRuntimeSessionLocked(sessionId);
+                runtime.Status = status;
+                runtime.FailureCode = failureCode;
+                if (!String.IsNullOrEmpty(text)) runtime.AppendText(text, MaxTextChars);
+                runtime.EvidenceSequence++;
+            }
+        }
+
+        /// <summary>CORE-002 test seam: bind the session the transport tracks.</summary>
+        internal void BindSessionForTests(string sessionId)
+        {
+            lock (_gate) { _boundSessionId = sessionId; }
+        }
+
+        /// <summary>CORE-002 test seam: mark evidence ambiguous.</summary>
+        internal void MarkAmbiguousForTests(string reason)
+        {
+            MarkAmbiguous(reason);
+        }
+
+        /// <summary>PERF-002 test seam: feed one SSE frame through the real path.</summary>
+        internal void ProcessFrameForTests(string frame)
+        {
+            ProcessFrame(frame);
+        }
+
+        /// <summary>PERF-002 test seam: the retained text for one session.</summary>
+        internal string SessionTextForTests(string sessionId)
+        {
+            lock (_gate)
+            {
+                OpenCodeRuntimeSession runtime;
+                return _sessions.TryGetValue(sessionId, out runtime) ? runtime.TextSnapshot() : null;
+            }
+        }
+
+        // CORE-002: true while the current evidence is untrustworthy. Reading it
+        // does not clear it; only ClearAmbiguityIfReconciledLocked can.
+        internal bool IsAmbiguous { get { lock (_gate) { return _ambiguousGeneration >= 0; } } }
+        internal string AmbiguityReason { get { lock (_gate) { return _ambiguityReason; } } }
+
+        /// <summary>CORE-002 test seam: whether a fresh stream has been requested.</summary>
+        internal bool AmbiguityDisconnectRequestedForTests { get { return _ambiguityDisconnectRequested; } }
+
+        private void MarkAmbiguousLocked(string reason)
+        {
+            _ambiguousGeneration = _streamGeneration;
+            _ambiguityReason = reason;
+            _reconcileRequired = true;
+            // CORE-002: ask the event loop for a fresh stream ONCE per poisoned
+            // generation. Without this a malformed frame on a healthy socket would
+            // wait forever for a newer generation that nothing was going to open.
+            if (_ambiguityDisconnectGeneration != _streamGeneration)
+            {
+                _ambiguityDisconnectGeneration = _streamGeneration;
+                _ambiguityDisconnectRequested = true;
+            }
+        }
+
+        private void MarkAmbiguous(string reason)
+        {
+            HttpWebRequest streamRequest = null;
+            lock (_gate)
+            {
+                MarkAmbiguousLocked(reason);
+                if (_ambiguityDisconnectRequested) streamRequest = _activeRequest;
+            }
+            // CORE-002: the event thread may be parked inside ReadLine on a
+            // perfectly healthy socket. Abort the stream so it ends this round and
+            // reconnects with a newer generation; the loop's own flag check covers
+            // the case where this call came from the event thread itself.
+            if (streamRequest != null) { try { streamRequest.Abort(); } catch { } }
+        }
+
+        /// <summary>
+        /// CORE-002: the only path out of ambiguity. Requires a strictly NEWER
+        /// live stream generation than the one that produced the ambiguity, plus
+        /// authoritative agreement supplied by the caller (fresh REST session in
+        /// this project, exactly one bound session, REST and SSE both idle).
+        /// A reconnect alone advances the generation but never satisfies this.
+        /// </summary>
+        private bool ClearAmbiguityIfReconciledLocked(string sessionId, bool authoritativeAgreement)
+        {
+            if (_ambiguousGeneration < 0) return true;
+            if (!authoritativeAgreement) return false;
+            if (!_connected || _reconcileRequired) return false;
+            if (_streamGeneration <= _ambiguousGeneration) return false;
+            if (String.IsNullOrEmpty(_boundSessionId) || !String.Equals(_boundSessionId, sessionId, StringComparison.Ordinal)) return false;
+            _ambiguousGeneration = -1;
+            _ambiguityReason = null;
+            return true;
+        }
 
         public bool IsApplicable(TargetRule rule)
         {
@@ -102,9 +286,23 @@ namespace SaiCont
                 observation.BlockReason = error;
                 return observation;
             }
+            // W2L1-004: never begin a REST sequence on a transport that is being
+            // torn down. Without this the worker could enter four sequential
+            // 5-second requests after shutdown already started.
+            if (_stopping)
+            {
+                error = "transport_disposed";
+                observation.BlockReason = error;
+                return observation;
+            }
+
+            // PERF-001: one bounded authoritative snapshot per poll generation.
+            // Several rules may share this transport within a single PollOnce;
+            // they observe one identity fact, not one per rule.
+            ObservationSnapshot snapshot = BeginSnapshot(nowUtc);
 
             HealthPayload health;
-            if (!TryGetHealth(rule.Endpoint, out health, out error))
+            if (!TryGetHealthCached(snapshot, rule.Endpoint, out health, out error))
             {
                 observation.BlockReason = "server_unavailable: " + error;
                 return observation;
@@ -118,22 +316,24 @@ namespace SaiCont
             observation.EndpointIdentity = CanonicalEndpoint(rule.Endpoint) + "|" + health.Version;
 
             IList<SessionSummary> sessions;
-            if (!TryGetSessions(rule, out sessions, out error))
+            if (!TryGetSessionsCached(snapshot, rule, out sessions, out error))
             {
                 observation.BlockReason = "session_list_unavailable: " + error;
+                return observation;
+            }
+            Dictionary<string, OpenCodeStatusKind> statuses;
+            if (!TryGetStatusesCached(snapshot, rule, out statuses, out error))
+            {
+                observation.BlockReason = "status_unavailable: " + error;
                 return observation;
             }
             SessionSummary session;
             string resolveError;
             if (!TryResolveBoundSession(sessions, out session, out resolveError))
             {
-                Dictionary<string, OpenCodeStatusKind> coldStatuses;
-                if (!TryGetStatuses(rule, out coldStatuses, out error))
-                {
-                    observation.BlockReason = "status_unavailable: " + error;
-                    return observation;
-                }
-                List<SessionSummary> busy = FindBusySessions(sessions, coldStatuses);
+                // PERF-001: the status map above is the same fact the cold path
+                // used to fetch a second time.
+                List<SessionSummary> busy = FindBusySessions(sessions, statuses);
                 if (busy.Count != 1)
                 {
                     error = busy.Count == 0 ? "no_active_session" : "ambiguous_active_sessions";
@@ -157,32 +357,30 @@ namespace SaiCont
             rule.ModelProviderForSend = session.Provider;
             rule.ModelIdForSend = session.Model;
 
-            Dictionary<string, OpenCodeStatusKind> statuses;
-            if (!TryGetStatuses(rule, out statuses, out error))
+            OpenCodeStatusKind sseStatus;
+            string sseText;
+            string sseFailure;
+            DateTime retryAt;
+            long evidenceSeq;
+            int streamGeneration;
+            lock (_gate)
             {
-                observation.BlockReason = "status_unavailable: " + error;
-                return observation;
+                OpenCodeRuntimeSession runtime = GetRuntimeSessionLocked(session.Id);
+                sseStatus = runtime.Status;
+                sseText = runtime.TextSnapshot();
+                sseFailure = runtime.FailureCode;
+                retryAt = runtime.RetryAtUtc;
+                evidenceSeq = runtime.EvidenceSequence;
+                streamGeneration = _streamGeneration;
+                observation.TriggerToken = runtime.LastEventId;
             }
             MessageReconciliation messages;
-            if (!TryGetMessages(rule, session.Id, out messages, out error))
+            if (!TryGetMessagesCached(snapshot, rule, session.Id, streamGeneration, evidenceSeq, out messages, out error))
             {
                 observation.BlockReason = "messages_unavailable: " + error;
                 return observation;
             }
 
-            OpenCodeStatusKind sseStatus;
-            string sseText;
-            string sseFailure;
-            DateTime retryAt;
-            lock (_gate)
-            {
-                OpenCodeRuntimeSession runtime = GetRuntimeSessionLocked(session.Id);
-                sseStatus = runtime.Status;
-                sseText = runtime.Text;
-                sseFailure = runtime.FailureCode;
-                retryAt = runtime.RetryAtUtc;
-                observation.TriggerToken = runtime.LastEventId;
-            }
             OpenCodeStatusKind apiStatus;
             statuses.TryGetValue(session.Id, out apiStatus);
             if (sseStatus != OpenCodeStatusKind.Unknown && apiStatus != OpenCodeStatusKind.Unknown && sseStatus != apiStatus)
@@ -191,11 +389,26 @@ namespace SaiCont
                 observation.Diagnostic = observation.BlockReason;
                 return observation;
             }
-            if (_malformedEvent)
+            // CORE-002: attempt reconciliation with the authoritative evidence
+            // just gathered. Agreement means: this session is present in THIS
+            // project's REST session list, it is the single bound session, and
+            // REST plus SSE both report it idle on a live stream that is newer
+            // than the one whose evidence was poisoned.
+            lock (_gate)
             {
-                observation.BlockReason = "malformed_sse_event_requires_reconciliation";
-                observation.Diagnostic = observation.BlockReason;
-                return observation;
+                if (_ambiguousGeneration >= 0)
+                {
+                    bool agreement = _connected && !_reconcileRequired &&
+                        apiStatus == OpenCodeStatusKind.Idle &&
+                        sseStatus == OpenCodeStatusKind.Idle &&
+                        !ClearedByForeignProject(session, rule);
+                    if (!ClearAmbiguityIfReconciledLocked(session.Id, agreement))
+                    {
+                        observation.BlockReason = "malformed_sse_event_requires_reconciliation";
+                        observation.Diagnostic = observation.BlockReason + ": " + (_ambiguityReason ?? "unknown");
+                        return observation;
+                    }
+                }
             }
             if (!_connected)
             {
@@ -245,23 +458,31 @@ namespace SaiCont
             if (!IsApplicable(rule) || !String.Equals(rule.Endpoint, _endpoint, StringComparison.OrdinalIgnoreCase)) { error = "transport_identity_changed"; return false; }
             if (_stopping) { error = "transport_disposed"; return false; }
             if (HasPendingSend) { error = "send_pending"; return false; }
+            ObservationSnapshot snapshot = CurrentSnapshotOrNew();
             HealthPayload health;
-            if (!TryGetHealth(rule.Endpoint, out health, out error) || health == null || String.IsNullOrEmpty(health.Version) || !health.Version.StartsWith(SupportedVersionPrefix, StringComparison.Ordinal)) { error = error ?? "unknown_opencode_version"; return false; }
+            if (!TryGetHealthCached(snapshot, rule.Endpoint, out health, out error) || health == null || String.IsNullOrEmpty(health.Version) || !health.Version.StartsWith(SupportedVersionPrefix, StringComparison.Ordinal)) { error = error ?? "unknown_opencode_version"; return false; }
             if (!String.Equals(observation.EndpointIdentity, CanonicalEndpoint(rule.Endpoint) + "|" + health.Version, StringComparison.OrdinalIgnoreCase)) { error = "runtime_generation_changed"; return false; }
             SessionSummary fresh;
-            if (!TryGetSession(rule, observation.SessionIdentity, out fresh, out error)) return false;
+            if (!TryGetSessionCached(snapshot, rule, observation.SessionIdentity, out fresh, out error)) return false;
             if (!String.Equals(NormalizePath(fresh.Directory), NormalizePath(rule.ProjectDirectory), StringComparison.OrdinalIgnoreCase)) { error = "project_mismatch"; return false; }
             if (String.IsNullOrWhiteSpace(fresh.Agent) || String.IsNullOrWhiteSpace(fresh.Provider) || String.IsNullOrWhiteSpace(fresh.Model)) { error = "model_or_agent_context_missing"; return false; }
             if (!String.Equals(fresh.Agent, observation.ActiveAgent, StringComparison.Ordinal) || !String.Equals(fresh.Provider, observation.ModelProvider, StringComparison.Ordinal) || !String.Equals(fresh.Model, observation.ModelId, StringComparison.Ordinal)) { error = "model_or_agent_changed"; return false; }
             Dictionary<string, OpenCodeStatusKind> statuses;
-            if (!TryGetStatuses(rule, out statuses, out error)) return false;
+            if (!TryGetStatusesCached(snapshot, rule, out statuses, out error)) return false;
             OpenCodeStatusKind apiStatus;
             if (statuses.TryGetValue(fresh.Id, out apiStatus) && (apiStatus == OpenCodeStatusKind.Busy || apiStatus == OpenCodeStatusKind.Retry)) { error = "session_busy_on_recheck"; return false; }
             lock (_gate)
             {
                 OpenCodeRuntimeSession runtime = GetRuntimeSessionLocked(fresh.Id);
                 if (runtime.Status == OpenCodeStatusKind.Busy || runtime.Status == OpenCodeStatusKind.Retry) { error = "sse_busy_on_recheck"; return false; }
-                if (runtime.Status == OpenCodeStatusKind.Error || _malformedEvent || !_connected || _reconcileRequired) { error = "live_signal_not_send_safe"; return false; }
+                if (runtime.Status == OpenCodeStatusKind.Error || _ambiguousGeneration >= 0 || !_connected || _reconcileRequired) { error = "live_signal_not_send_safe"; return false; }
+                // PERF-001: record that this exact candidate passed validation in
+                // this snapshot generation, so Send does not repeat the same three
+                // REST calls. The ticket is single-use and dies with the snapshot;
+                // the independent pre-POST ValidateCommitIdentity is untouched.
+                _validationTicketSequence = snapshot.Sequence;
+                _validationTicketSession = fresh.Id;
+                _validationTicketEndpointIdentity = observation.EndpointIdentity;
             }
             return true;
         }
@@ -270,13 +491,22 @@ namespace SaiCont
         {
             error = null;
             if (String.IsNullOrWhiteSpace(command) || command.IndexOf('\r') >= 0 || command.IndexOf('\n') >= 0) { error = "invalid_command"; return new SendOutcome { Disposition = SendDisposition.AmbiguousOrPartialInput }; }
-            if (!ValidatePreSend(observation, rule, out error)) return new SendOutcome { Disposition = SendDisposition.NoInputCommitted };
+            if (!TryConsumeValidationTicket(observation) && !ValidatePreSend(observation, rule, out error)) return new SendOutcome { Disposition = SendDisposition.NoInputCommitted };
             if (commitAllowed == null || !commitAllowed()) { error = "authorization_revoked_before_http_commit"; return new SendOutcome { Disposition = SendDisposition.NoInputCommitted }; }
             lock (_gate)
             {
                 if (_send != null && !_send.Completed) { error = "send_pending"; return new SendOutcome { Disposition = SendDisposition.NoInputCommitted }; }
                 _send = new SendOperation
                 {
+                    // CORE-004: the owner identity of an asynchronous send. Session
+                    // identity ALONE is not ownership: two rules can legally share
+                    // endpoint+project+session, and the completion would then be
+                    // consumable by whichever rule polled next. Rule name plus
+                    // state key plus a per-transport monotonic generation makes
+                    // consumption exact.
+                    OwnerRule = rule == null ? null : rule.Name,
+                    OwnerStateKey = observation.OwnerStateKey,
+                    OperationGeneration = ++_sendGeneration,
                     SessionId = observation.SessionIdentity,
                     EndpointIdentity = observation.EndpointIdentity,
                     Command = command,
@@ -292,16 +522,39 @@ namespace SaiCont
             return new SendOutcome { Disposition = SendDisposition.Pending, IdentityChecked = observation.SessionIdentity };
         }
 
-        public bool TryTakeCompletedSend(string sessionIdentity, out SendOutcome outcome)
+        /// <summary>
+        /// CORE-004: completion belongs to the operation's owner and to nobody
+        /// else. The owner is (rule, state key, session, generation); a caller
+        /// that cannot name all four cannot consume the result. Sharing one
+        /// transport for connection/observation is fine, but send ownership is
+        /// per-rule.
+        /// </summary>
+        public bool TryTakeCompletedSend(SendOwner owner, out SendOutcome outcome)
         {
             outcome = null;
+            if (owner == null) return false;
             lock (_gate)
             {
-                if (_send == null || !_send.Completed || !String.Equals(_send.SessionId, sessionIdentity, StringComparison.Ordinal)) return false;
+                if (_send == null || !_send.Completed) return false;
+                if (!String.Equals(_send.SessionId, owner.SessionIdentity, StringComparison.Ordinal)) return false;
+                if (!String.Equals(_send.OwnerRule, owner.RuleName, StringComparison.Ordinal)) return false;
+                if (!String.Equals(_send.OwnerStateKey ?? String.Empty, owner.StateKey ?? String.Empty, StringComparison.Ordinal)) return false;
                 outcome = _send.Outcome;
                 _send = null;
                 return true;
             }
+        }
+
+        public void CancelInFlight()
+        {
+            // W2L1-004: abort the outstanding REST/SSE requests so a poll worker
+            // blocked inside them can return. The transport stays usable; only
+            // the current requests die. Dispose() is the terminal operation.
+            HttpWebRequest request;
+            HttpWebRequest sendRequest;
+            lock (_gate) { request = _activeRequest; sendRequest = _activeSendRequest; }
+            if (request != null) { try { request.Abort(); } catch { } }
+            if (sendRequest != null) { try { sendRequest.Abort(); } catch { } }
         }
 
         public void Dispose()
@@ -315,7 +568,39 @@ namespace SaiCont
             if (_eventThread != null && _eventThread.IsAlive) _eventThread.Join(1000);
         }
 
+        private bool TryConsumeValidationTicket(TargetObservation observation)
+        {
+            if (observation == null || String.IsNullOrEmpty(observation.SessionIdentity)) return false;
+            lock (_gate)
+            {
+                if (_validationTicketSequence < 0) return false;
+                ObservationSnapshot snapshot = _snapshot;
+                if (snapshot == null || snapshot.Sequence != _validationTicketSequence) { InvalidateValidationTicketLocked(); return false; }
+                if (!String.Equals(_validationTicketSession, observation.SessionIdentity, StringComparison.Ordinal)) return false;
+                if (!String.Equals(_validationTicketEndpointIdentity, observation.EndpointIdentity, StringComparison.OrdinalIgnoreCase)) return false;
+                if (_stopping || _ambiguousGeneration >= 0 || !_connected || _reconcileRequired) { InvalidateValidationTicketLocked(); return false; }
+                if (_send != null && !_send.Completed) return false;
+                InvalidateValidationTicketLocked();
+                return true;
+            }
+        }
+
+        private void InvalidateValidationTicketLocked()
+        {
+            _validationTicketSequence = -1;
+            _validationTicketSession = null;
+            _validationTicketEndpointIdentity = null;
+        }
+
         internal static bool TryParseSseFrame(string frame, out OpenCodeSseEvent parsed, out string error)
+        {
+            return TryParseSseFrame(frame, null, out parsed, out error);
+        }
+
+        // PERF-002: accept an existing serializer so the single event thread
+        // stops constructing one per frame. A null serializer keeps the old
+        // allocate-per-call behaviour for the static test/utility entry point.
+        internal static bool TryParseSseFrame(string frame, JavaScriptSerializer serializer, out OpenCodeSseEvent parsed, out string error)
         {
             parsed = null;
             error = null;
@@ -326,7 +611,8 @@ namespace SaiCont
             if (data.Length == 0) { error = "sse_frame_has_no_data"; return false; }
             try
             {
-                Dictionary<string, object> root = new JavaScriptSerializer().DeserializeObject(data.ToString()) as Dictionary<string, object>;
+                JavaScriptSerializer json = serializer ?? new JavaScriptSerializer();
+                Dictionary<string, object> root = json.DeserializeObject(data.ToString()) as Dictionary<string, object>;
                 if (root == null) { error = "sse_json_not_object"; return false; }
                 Dictionary<string, object> payload = GetMap(root, "payload") ?? root;
                 string type = GetString(payload, "type");
@@ -407,17 +693,37 @@ namespace SaiCont
                     using (Stream stream = response.GetResponseStream())
                     using (var reader = new StreamReader(stream, Encoding.UTF8))
                     {
-                        _connected = true; _reconcileRequired = false;
+                        lock (_gate)
+                        {
+                            // CORE-002: a NEW stream generation. This alone is not
+                            // reconciliation -- Poll must still see authoritative
+                            // REST/SSE agreement before ambiguity clears -- but it
+                            // is the precondition, so record it.
+                            _streamGeneration++;
+                            _connected = true;
+                            _reconcileRequired = false;
+                            _ambiguityDisconnectRequested = false;
+                        }
                         connectedThisRound = true;
                         reconnectDelayMs = MinReconnectDelayMs;
                         var frame = new StringBuilder();
-                        while (!_stopping)
+                        while (!_stopping && !_ambiguityDisconnectRequested)
                         {
-                            string line = reader.ReadLine();
-                            if (line == null) break;
+                            string line;
+                            bool lineOverflow;
+                            if (!TryReadBoundedLine(reader, out line, out lineOverflow)) break;
+                            if (lineOverflow)
+                            {
+                                // PERF-002: the input line itself exceeded the
+                                // bound, so it was discarded WHILE reading rather
+                                // than materialized in full. Fail closed.
+                                MarkAmbiguous("oversized_sse_line");
+                                frame.Length = 0;
+                                continue;
+                            }
                             if (line.Length == 0) { ProcessFrame(frame.ToString()); frame.Length = 0; }
                             else if (frame.Length < MaxBodyBytes) frame.Append(line).Append('\n');
-                            else { _malformedEvent = true; frame.Length = 0; }
+                            else { MarkAmbiguous("oversized_sse_frame"); frame.Length = 0; }
                         }
                         ProcessFrame(frame.ToString());
                     }
@@ -434,11 +740,55 @@ namespace SaiCont
             }
         }
 
+        /// <summary>
+        /// PERF-002: read one SSE line with a hard character bound enforced
+        /// WHILE consuming input. StreamReader.ReadLine() would allocate the
+        /// whole line first, so a hostile//broken producer could force an
+        /// arbitrary allocation before any frame guard ran. Returns false at
+        /// end of stream; sets <paramref name="overflow"/> when the line was
+        /// too long, in which case the remainder is drained and discarded.
+        /// </summary>
+        private static bool TryReadBoundedLine(StreamReader reader, out string line, out bool overflow)
+        {
+            line = null;
+            overflow = false;
+            int first = reader.Read();
+            if (first < 0) return false;
+            var builder = new StringBuilder(128);
+            int current = first;
+            while (current >= 0)
+            {
+                char c = (char)current;
+                if (c == '\n') break;
+                if (c == '\r')
+                {
+                    if (reader.Peek() == '\n') reader.Read();
+                    break;
+                }
+                if (builder.Length >= MaxLineChars)
+                {
+                    overflow = true;
+                    // Drain to the end of this line without retaining it.
+                    while ((current = reader.Read()) >= 0)
+                    {
+                        if (current == '\n') break;
+                        if (current == '\r') { if (reader.Peek() == '\n') reader.Read(); break; }
+                    }
+                    line = String.Empty;
+                    return true;
+                }
+                builder.Append(c);
+                current = reader.Read();
+            }
+            line = builder.ToString();
+            return true;
+        }
+
         private void ProcessFrame(string frame)
         {
             if (String.IsNullOrWhiteSpace(frame)) return;
             OpenCodeSseEvent item; string error;
-            if (!TryParseSseFrame(frame, out item, out error)) { _malformedEvent = true; _reconcileRequired = true; return; }
+            if (!TryParseSseFrame(frame, _json, out item, out error)) { MarkAmbiguous("malformed_sse_frame: " + error); return; }
             lock (_gate)
             {
                 if (!String.IsNullOrEmpty(item.Id))
@@ -450,8 +800,7 @@ namespace SaiCont
                 if (String.IsNullOrEmpty(item.SessionId)) return;
                 if (!String.IsNullOrEmpty(item.Directory) && !String.Equals(NormalizePath(item.Directory), NormalizePath(_projectDirectory), StringComparison.OrdinalIgnoreCase))
                 {
-                    _malformedEvent = true;
-                    _reconcileRequired = true;
+                    MarkAmbiguousLocked("project_directory_mismatch");
                     return;
                 }
                 OpenCodeRuntimeSession state = GetRuntimeSessionLocked(item.SessionId);
@@ -466,9 +815,13 @@ namespace SaiCont
                 }
                 if (item.Status != OpenCodeStatusKind.Unknown) state.Status = item.Status;
                 if (item.RetryAtUtc != DateTime.MinValue) state.RetryAtUtc = item.RetryAtUtc;
-                if (!String.IsNullOrEmpty(item.Text)) state.Text = Limit(JoinText(state.Text, item.Text), MaxTextChars);
+                // PERF-002: rolling bounded buffer -- discard the oldest content
+                // BEFORE appending instead of concatenating the whole retained
+                // string and trimming the result.
+                if (!String.IsNullOrEmpty(item.Text)) state.AppendText(item.Text, MaxTextChars);
                 if (!String.IsNullOrEmpty(item.FailureCode)) { state.FailureCode = item.FailureCode; state.Status = OpenCodeStatusKind.Error; BindSessionLocked(item.SessionId); }
                 if (item.Type == "session.status" && (item.Status == OpenCodeStatusKind.Busy || item.Status == OpenCodeStatusKind.Retry)) BindSessionLocked(item.SessionId);
+                state.EvidenceSequence++;
             }
         }
 
@@ -520,7 +873,7 @@ namespace SaiCont
             lock (_gate)
             {
                 OpenCodeRuntimeSession runtime = GetRuntimeSessionLocked(operation.SessionId);
-                if (runtime.Status != OpenCodeStatusKind.Idle || _malformedEvent || !_connected || _reconcileRequired) { error = "live_signal_not_send_safe_before_commit"; return false; }
+                if (runtime.Status != OpenCodeStatusKind.Idle || _ambiguousGeneration >= 0 || !_connected || _reconcileRequired) { error = "live_signal_not_send_safe_before_commit"; return false; }
             }
             return !_stopping && (operation.CommitAllowed == null || operation.CommitAllowed());
         }
@@ -536,7 +889,177 @@ namespace SaiCont
             error = "stale_session_disappeared"; return false;
         }
         private void BindSession(string id) { lock (_gate) { BindSessionLocked(id); } }
-        private void BindSessionLocked(string id) { if (String.IsNullOrEmpty(_boundSessionId)) _boundSessionId = id; else if (!String.Equals(_boundSessionId, id, StringComparison.Ordinal)) _malformedEvent = true; }
+        private void BindSessionLocked(string id)
+        {
+            if (String.IsNullOrEmpty(_boundSessionId)) _boundSessionId = id;
+            else if (!String.Equals(_boundSessionId, id, StringComparison.Ordinal)) MarkAmbiguousLocked("session_binding_conflict");
+        }
+
+        // CORE-002: guard against clearing ambiguity from a session whose
+        // directory is not this transport's pinned project.
+        private static bool ClearedByForeignProject(SessionSummary session, TargetRule rule)
+        {
+            return session == null || rule == null ||
+                !String.Equals(NormalizePath(session.Directory), NormalizePath(rule.ProjectDirectory), StringComparison.OrdinalIgnoreCase);
+        }
+
+        // PERF-001: begin (or reuse) the bounded per-generation REST snapshot.
+        private ObservationSnapshot BeginSnapshot(DateTime nowUtc)
+        {
+            lock (_gate)
+            {
+                if (_snapshot != null && (nowUtc - _snapshot.TakenUtc).TotalMilliseconds < SnapshotLifetimeMs && _snapshot.StreamGeneration == _streamGeneration)
+                {
+                    return _snapshot;
+                }
+                return NewSnapshotLocked(nowUtc);
+            }
+        }
+
+        /// <summary>
+        /// PERF-001: candidate validation always opens a FRESH generation. Reusing
+        /// the poll's evidence here would make the poll itself the authorization,
+        /// which is a safety change, not an optimization. The saving comes from
+        /// Send consuming this validation's ticket instead of repeating it.
+        /// </summary>
+        private ObservationSnapshot CurrentSnapshotOrNew()
+        {
+            lock (_gate)
+            {
+                return NewSnapshotLocked(DateTime.UtcNow);
+            }
+        }
+
+        private ObservationSnapshot NewSnapshotLocked(DateTime nowUtc)
+        {
+            _snapshot = new ObservationSnapshot
+            {
+                Sequence = ++_snapshotSequence,
+                TakenUtc = nowUtc,
+                StreamGeneration = _streamGeneration
+            };
+            InvalidateValidationTicketLocked();
+            return _snapshot;
+        }
+
+        private bool TryGetHealthCached(ObservationSnapshot snapshot, string endpoint, out HealthPayload health, out string error)
+        {
+            if (snapshot != null && snapshot.HealthChecked)
+            {
+                health = snapshot.Health;
+                error = snapshot.HealthError;
+                return snapshot.HealthOk;
+            }
+            bool ok = TryGetHealth(endpoint, out health, out error);
+            if (snapshot != null)
+            {
+                snapshot.HealthChecked = true;
+                snapshot.HealthOk = ok;
+                snapshot.Health = health;
+                snapshot.HealthError = error;
+            }
+            return ok;
+        }
+
+        private bool TryGetSessionsCached(ObservationSnapshot snapshot, TargetRule rule, out IList<SessionSummary> sessions, out string error)
+        {
+            if (snapshot != null && snapshot.SessionsChecked)
+            {
+                sessions = snapshot.Sessions;
+                error = snapshot.SessionsError;
+                return snapshot.SessionsOk;
+            }
+            bool ok = TryGetSessions(rule, out sessions, out error);
+            if (snapshot != null)
+            {
+                snapshot.SessionsChecked = true;
+                snapshot.SessionsOk = ok;
+                snapshot.Sessions = sessions;
+                snapshot.SessionsError = error;
+            }
+            return ok;
+        }
+
+        private bool TryGetStatusesCached(ObservationSnapshot snapshot, TargetRule rule, out Dictionary<string, OpenCodeStatusKind> statuses, out string error)
+        {
+            if (snapshot != null && snapshot.StatusesChecked)
+            {
+                statuses = snapshot.Statuses;
+                error = snapshot.StatusesError;
+                return snapshot.StatusesOk;
+            }
+            bool ok = TryGetStatuses(rule, out statuses, out error);
+            if (snapshot != null)
+            {
+                snapshot.StatusesChecked = true;
+                snapshot.StatusesOk = ok;
+                snapshot.Statuses = statuses;
+                snapshot.StatusesError = error;
+            }
+            return ok;
+        }
+
+        private bool TryGetSessionCached(ObservationSnapshot snapshot, TargetRule rule, string sessionId, out SessionSummary session, out string error)
+        {
+            if (snapshot != null && snapshot.SingleSessionChecked && String.Equals(snapshot.SingleSessionId, sessionId, StringComparison.Ordinal))
+            {
+                session = snapshot.SingleSession;
+                error = snapshot.SingleSessionError;
+                return snapshot.SingleSessionOk;
+            }
+            bool ok = TryGetSession(rule, sessionId, out session, out error);
+            if (snapshot != null)
+            {
+                snapshot.SingleSessionChecked = true;
+                snapshot.SingleSessionId = sessionId;
+                snapshot.SingleSessionOk = ok;
+                snapshot.SingleSession = session;
+                snapshot.SingleSessionError = error;
+            }
+            return ok;
+        }
+
+        /// <summary>
+        /// PERF-001: message history is failure EVIDENCE, not a lifecycle fact,
+        /// so it is refetched only when the live SSE evidence for this session
+        /// actually advanced (or the stream generation changed, or nothing has
+        /// been fetched yet). An idle bound session no longer pulls 20 messages
+        /// every two seconds.
+        /// </summary>
+        private bool TryGetMessagesCached(
+            ObservationSnapshot snapshot,
+            TargetRule rule,
+            string sessionId,
+            int streamGeneration,
+            long evidenceSequence,
+            out MessageReconciliation messages,
+            out string error)
+        {
+            lock (_gate)
+            {
+                if (_messageCacheSession != null &&
+                    String.Equals(_messageCacheSession, sessionId, StringComparison.Ordinal) &&
+                    _messageCacheStreamGeneration == streamGeneration &&
+                    _messageCacheEvidenceSequence == evidenceSequence &&
+                    _messageCacheValid)
+                {
+                    messages = _messageCache;
+                    error = null;
+                    return true;
+                }
+            }
+            bool ok = TryGetMessages(rule, sessionId, out messages, out error);
+            lock (_gate)
+            {
+                _messageCacheSession = sessionId;
+                _messageCacheStreamGeneration = streamGeneration;
+                _messageCacheEvidenceSequence = evidenceSequence;
+                _messageCacheValid = ok;
+                _messageCache = ok ? messages : null;
+            }
+            if (snapshot != null) snapshot.MessagesFetched = true;
+            return ok;
+        }
 
         private bool TryGetSessions(TargetRule rule, out IList<SessionSummary> sessions, out string error)
         {
@@ -605,17 +1128,79 @@ namespace SaiCont
         {
             if (map == null) return null; var result = new SessionSummary { Id = GetString(map, "id"), Directory = GetString(map, "directory"), Agent = GetString(map, "agent") }; Dictionary<string, object> model = GetMap(map, "model"); result.Provider = GetString(model, "providerID"); result.Model = GetString(model, "id"); return result;
         }
-        private OpenCodeRuntimeSession GetRuntimeSessionLocked(string id) { OpenCodeRuntimeSession state; if (!_sessions.TryGetValue(id, out state)) { state = new OpenCodeRuntimeSession(); _sessions[id] = state; } return state; }
+        /// <summary>
+        /// PERF-002: retrieve or create the runtime record, then bound the table.
+        /// Never evicts the bound session, a session with a live/pending send, or
+        /// a session still carrying failure/ambiguity authority.
+        /// </summary>
+        private OpenCodeRuntimeSession GetRuntimeSessionLocked(string id)
+        {
+            OpenCodeRuntimeSession state;
+            if (!_sessions.TryGetValue(id, out state))
+            {
+                state = new OpenCodeRuntimeSession();
+                _sessions[id] = state;
+                _sessionOrder.Enqueue(id);
+                EvictExcessSessionsLocked();
+            }
+            return state;
+        }
+
+        private void EvictExcessSessionsLocked()
+        {
+            int guard = 0;
+            while (_sessions.Count > MaxRetainedSessions && _sessionOrder.Count > 0 && guard++ <= _sessionOrder.Count + MaxRetainedSessions)
+            {
+                string candidate = _sessionOrder.Dequeue();
+                OpenCodeRuntimeSession existing;
+                if (!_sessions.TryGetValue(candidate, out existing)) continue;
+                if (IsProtectedSessionLocked(candidate, existing))
+                {
+                    // Re-queue: protected records stay, but they must not block
+                    // eviction of the remaining unprotected ones forever.
+                    _sessionOrder.Enqueue(candidate);
+                    continue;
+                }
+                _sessions.Remove(candidate);
+            }
+        }
+
+        private bool IsProtectedSessionLocked(string id, OpenCodeRuntimeSession state)
+        {
+            if (String.Equals(_boundSessionId, id, StringComparison.Ordinal)) return true;
+            if (_send != null && String.Equals(_send.SessionId, id, StringComparison.Ordinal)) return true;
+            if (state == null) return false;
+            if (!String.IsNullOrEmpty(state.FailureCode)) return true;
+            if (state.Status == OpenCodeStatusKind.Error || state.Status == OpenCodeStatusKind.Retry || state.Status == OpenCodeStatusKind.Busy) return true;
+            return false;
+        }
+
+        internal int RetainedSessionCount { get { lock (_gate) { return _sessions.Count; } } }
+
         private Uri BuildUri(string path, bool projectQuery) { string value = (_endpoint ?? String.Empty).TrimEnd('/') + path; if (projectQuery) value += "?directory=" + Uri.EscapeDataString(_projectDirectory ?? String.Empty); return new Uri(value, UriKind.Absolute); }
 
         private bool TryHttp(string method, string endpoint, string path, string projectDirectory, string body, int timeoutMs, out int status, out string responseBody, out string error)
         {
             status = 0; responseBody = String.Empty; error = null;
+            // PERF-001 / CORE-002 test seam: a deterministic in-process HTTP
+            // layer with request counting. Production leaves this null and uses
+            // the real HttpWebRequest path below.
+            OpenCodeHttpInvoke over = HttpInvokeForTests;
+            if (over != null)
+            {
+                return over(method, path, body, out status, out responseBody, out error);
+            }
             bool isSend = String.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path.IndexOf("/message", StringComparison.OrdinalIgnoreCase) >= 0;
             try
             {
                 string url = endpoint.TrimEnd('/') + path; if (!String.IsNullOrEmpty(projectDirectory)) url += (path.IndexOf('?') >= 0 ? "&" : "?") + "directory=" + Uri.EscapeDataString(projectDirectory);
-                var request = (HttpWebRequest)WebRequest.Create(new Uri(url, UriKind.Absolute)); request.Method = method; request.Accept = "application/json"; request.ContentType = "application/json"; request.Timeout = timeoutMs; request.ReadWriteTimeout = timeoutMs; request.KeepAlive = false;
+                var request = (HttpWebRequest)WebRequest.Create(new Uri(url, UriKind.Absolute)); request.Method = method; request.Accept = "application/json"; request.ContentType = "application/json"; request.Timeout = timeoutMs; request.ReadWriteTimeout = timeoutMs;
+                // PERF-001: allow connection reuse. KeepAlive=false forced a full
+                // TCP setup/teardown for every REST call in a 2-second poll, which
+                // is pure overhead against a loopback OpenCode server. Timeout and
+                // abort semantics are unchanged; ServicePoint limits still bound
+                // the pool.
+                request.KeepAlive = true;
                 if (isSend) lock (_gate) { _activeSendRequest = request; }
                 if (body != null) { byte[] bytes = Encoding.UTF8.GetBytes(body); request.ContentLength = bytes.Length; using (Stream stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length); }
                 using (WebResponse response = request.GetResponse()) { HttpWebResponse http = response as HttpWebResponse; status = http == null ? 200 : (int)http.StatusCode; responseBody = ReadBounded(response.GetResponseStream(), MaxBodyBytes); return true; }
@@ -676,8 +1261,76 @@ namespace SaiCont
 
         private sealed class HealthPayload { public bool Healthy; public string Version; }
         private sealed class SessionSummary { public string Id; public string Directory; public string Agent; public string Provider; public string Model; }
-        private sealed class OpenCodeRuntimeSession { public OpenCodeStatusKind Status; public DateTime RetryAtUtc; public string Text; public string FailureCode; public string LastEventId; }
+
+        // PERF-002: the retained text is a rolling window. Appending used to be
+        // first + "\n" + second followed by a tail Substring, so every streamed
+        // delta copied the whole 16K buffer twice.
+        private sealed class OpenCodeRuntimeSession
+        {
+            private readonly StringBuilder _text = new StringBuilder();
+            public OpenCodeStatusKind Status;
+            public DateTime RetryAtUtc;
+            public string FailureCode;
+            public string LastEventId;
+            public long EvidenceSequence;
+
+            public void AppendText(string value, int maxChars)
+            {
+                if (String.IsNullOrEmpty(value)) return;
+                if (_text.Length > 0) _text.Append('\n');
+                _text.Append(value);
+                int excess = _text.Length - maxChars;
+                if (excess > 0) _text.Remove(0, excess);
+            }
+
+            public string TextSnapshot() { return _text.ToString(); }
+        }
+
         private sealed class MessageReconciliation { public string Text; public string FailureCode; }
-        private sealed class SendOperation { public string SessionId; public string EndpointIdentity; public string Command; public TargetRule Rule; public string Agent; public string Provider; public string Model; public Func<bool> CommitAllowed; public volatile bool Completed; public SendOutcome Outcome; public string Error; }
+
+        // PERF-001: one bounded authoritative REST snapshot per poll generation.
+        private sealed class ObservationSnapshot
+        {
+            public long Sequence;
+            public DateTime TakenUtc;
+            public int StreamGeneration;
+
+            public bool HealthChecked, HealthOk;
+            public HealthPayload Health;
+            public string HealthError;
+
+            public bool SessionsChecked, SessionsOk;
+            public IList<SessionSummary> Sessions;
+            public string SessionsError;
+
+            public bool StatusesChecked, StatusesOk;
+            public Dictionary<string, OpenCodeStatusKind> Statuses;
+            public string StatusesError;
+
+            public bool SingleSessionChecked, SingleSessionOk;
+            public string SingleSessionId;
+            public SessionSummary SingleSession;
+            public string SingleSessionError;
+
+            public bool MessagesFetched;
+        }
+
+        private sealed class SendOperation
+        {
+            public string OwnerRule;
+            public string OwnerStateKey;
+            public long OperationGeneration;
+            public string SessionId;
+            public string EndpointIdentity;
+            public string Command;
+            public TargetRule Rule;
+            public string Agent;
+            public string Provider;
+            public string Model;
+            public Func<bool> CommitAllowed;
+            public volatile bool Completed;
+            public SendOutcome Outcome;
+            public string Error;
+        }
     }
 }

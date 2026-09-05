@@ -110,22 +110,22 @@ namespace SaiCont
 
             if (options.Mode == "--app" || options.Mode == "--win-gui")
             {
-                return RunInteractiveWithLifecycle(configuration, options, (stateStore, shouldStop) =>
-                    SaiContGuiForm.RunDesktopGui(configuration, options.ConfigurationPath, options.Mode, stateStore, shouldStop));
+                return RunInteractiveWithLifecycle(configuration, options, (stateStore, shouldStop, health) =>
+                    SaiContGuiForm.RunDesktopGui(configuration, options.ConfigurationPath, options.Mode, stateStore, shouldStop, health));
             }
 
             if (options.Mode == "--terminal")
             {
                 // SAICONT TERMINAL: one console window that monitors the discovered
                 // agent sessions and dispatches guarded continuation on demand.
-                return RunInteractiveWithLifecycle(configuration, options, (stateStore, shouldStop) =>
-                    TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath, options.Mode, stateStore, shouldStop));
+                return RunInteractiveWithLifecycle(configuration, options, (stateStore, shouldStop, health) =>
+                    TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath, options.Mode, stateStore, shouldStop, health));
             }
 
             if (options.Mode == "--gui")
             {
-                return RunInteractiveWithLifecycle(configuration, options, (stateStore, shouldStop) =>
-                    TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath, options.Mode, stateStore, shouldStop));
+                return RunInteractiveWithLifecycle(configuration, options, (stateStore, shouldStop, health) =>
+                    TerminalUi.RunInteractiveTui(configuration, options.ConfigurationPath, options.Mode, stateStore, shouldStop, health));
             }
 
             if (options.Mode == "--validate-config")
@@ -322,7 +322,71 @@ namespace SaiCont
             try { instanceMutex.Dispose(); } catch (Exception exception) { try { Console.Error.WriteLine("Instance mutex release warning: " + exception.Message); } catch { } }
         }
 
+        // CORE-005: one place that builds the lifecycle health identity. The raw
+        // instance token never leaves this method; only a short non-secret hash
+        // of it is published.
+        internal static LifecycleHealthContext BuildLifecycleHealthContext(
+            string healthFilePath,
+            int processId,
+            DateTime processStartUtc,
+            string mode,
+            string instanceToken,
+            bool stateStoreApplicable)
+        {
+            return new LifecycleHealthContext
+            {
+                HealthFilePath = healthFilePath,
+                ProcessId = processId,
+                ProcessStartUtc = processStartUtc,
+                Mode = mode,
+                InstanceShortId = LifecycleHealthContext.DeriveInstanceShortId(instanceToken),
+                StateStoreApplicable = stateStoreApplicable
+            };
+        }
+
+        /// <summary>
+        /// CORE-006: publish the first health snapshot BEFORE the PID file becomes
+        /// observable. scripts\status.ps1 treats a verified live instance without a
+        /// readable health snapshot as UNVERIFIABLE, and every lifecycle consumer
+        /// discovers the instance through the PID file, so writing health first
+        /// makes that classification deterministic instead of a startup race.
+        /// Failure is non-authoritative: health never gates safety.
+        /// </summary>
+        internal static void TryPublishInitialHealth(LifecycleHealthContext lifecycle, WatcherConfiguration configuration)
+        {
+            if (lifecycle == null || String.IsNullOrEmpty(lifecycle.HealthFilePath)) return;
+            try
+            {
+                var report = new HealthReport
+                {
+                    ProductVersion = "1.2",
+                    ProcessId = lifecycle.ProcessId,
+                    ProcessStartUtc = lifecycle.ProcessStartUtc == DateTime.MinValue ? (DateTime?)null : lifecycle.ProcessStartUtc,
+                    InstanceShortId = lifecycle.InstanceShortId,
+                    Mode = lifecycle.Mode,
+                    PolicyRevision = 0,
+                    ConfigFingerprint = "starting",
+                    StateStoreDisposition = lifecycle.StateStoreApplicable ? "unknown" : "not_applicable",
+                    StateStoreHealthy = false,
+                    HealthUpdatedUtc = DateTime.UtcNow
+                };
+                string error;
+                report.TryWrite(lifecycle.HealthFilePath, out error);
+            }
+            catch
+            {
+            }
+        }
+
         private static int RunInteractiveWithLifecycle(WatcherConfiguration configuration, RuntimeOptions options, Func<DurableStateStore, Func<bool>, int> uiRunner)
+        {
+            return RunInteractiveWithLifecycle(configuration, options, delegate(DurableStateStore stateStore, Func<bool> shouldStop, LifecycleHealthContext health) { return uiRunner(stateStore, shouldStop); });
+        }
+
+        private static int RunInteractiveWithLifecycle(
+            WatcherConfiguration configuration,
+            RuntimeOptions options,
+            Func<DurableStateStore, Func<bool>, LifecycleHealthContext, int> uiRunner)
         {
             bool isNewMutex;
             InstanceMutexLease instanceMutex = null;
@@ -343,6 +407,7 @@ namespace SaiCont
 
             string instanceToken = Guid.NewGuid().ToString("N");
             DurableStateStore sharedStateStore = null;
+            LifecycleHealthContext lifecycleHealth = null;
             try
             {
                 Process currentProcess = Process.GetCurrentProcess();
@@ -350,6 +415,17 @@ namespace SaiCont
                 try { procStartUtc = currentProcess.StartTime.ToUniversalTime(); } catch { procStartUtc = DateTime.UtcNow; }
                 string exePath = Assembly.GetExecutingAssembly().Location;
                 TryDelete(options.StopFilePath);
+                // CORE-005 / CORE-006: build the identity and publish health BEFORE
+                // the PID file exists, so a consumer that discovers this instance
+                // always finds a joinable snapshot.
+                lifecycleHealth = BuildLifecycleHealthContext(
+                    Path.Combine(Path.GetDirectoryName(options.StateFilePath), "SAICONT.health.json"),
+                    currentProcess.Id,
+                    procStartUtc,
+                    options.Mode,
+                    instanceToken,
+                    true);
+                TryPublishInitialHealth(lifecycleHealth, configuration);
                 string instanceError;
                 if (!TryWriteInstanceFile(options.InstanceFilePath, currentProcess.Id, procStartUtc, options.Mode, exePath, instanceToken, out instanceError))
                 {
@@ -404,7 +480,7 @@ namespace SaiCont
 
             try
             {
-                return uiRunner(sharedStateStore, shouldStop);
+                return uiRunner(sharedStateStore, shouldStop, lifecycleHealth);
             }
             finally
             {
@@ -479,6 +555,18 @@ namespace SaiCont
             string exePath = Assembly.GetExecutingAssembly().Location;
             // Ownership is already held; remove only a request that predates this new token.
             TryDelete(options.StopFilePath);
+            // CORE-005 / CORE-006: the health identity is authoritative from here
+            // on, and the first snapshot is published before the PID file becomes
+            // observable so status.ps1 can always join them.
+            string continuousHealthPath = Path.Combine(Path.GetDirectoryName(options.StateFilePath), "SAICONT.health.json");
+            LifecycleHealthContext continuousHealth = BuildLifecycleHealthContext(
+                continuousHealthPath,
+                currentProcess.Id,
+                procStartUtc,
+                options.Mode,
+                instanceToken,
+                allowInput && !String.IsNullOrEmpty(options.StateFilePath));
+            TryPublishInitialHealth(continuousHealth, configuration);
             string instanceError;
             if (!TryWriteInstanceFile(options.InstanceFilePath, currentProcess.Id, procStartUtc, options.Mode, exePath, instanceToken, out instanceError))
             {
@@ -526,9 +614,10 @@ namespace SaiCont
             {
                 DurableStateStore stateStore = (!String.IsNullOrEmpty(options.StateFilePath) && allowInput) ? new DurableStateStore(options.StateFilePath) : null;
                 var engine = new WatcherEngine(configuration, stateStore);
-                // T-139: enable local health contract for lifecycle modes.
-                string healthPath = Path.Combine(Path.GetDirectoryName(options.StateFilePath), "SAICONT.health.json");
-                engine.HealthFilePath = healthPath;
+                // T-139 / CORE-005: publish health bound to the SAME lifecycle
+                // identity that was written to run/SAICONT.instance.xml, so a
+                // consumer can reject a dead or reused process.
+                engine.LifecycleHealth = continuousHealth;
                 bool loggingHealthy = true;
                 engine.Run(
                     allowInput,

@@ -13,7 +13,16 @@ namespace SaiCont
     {
         private readonly string configPath;
         private WatcherConfiguration draftConfig;
-        private readonly WatcherConfiguration onDiskSnapshot;
+        // W2L1-001: the baseline Reset returns to. It is NOT readonly on
+        // purpose: after a successful Reload from disk the reset baseline has to
+        // become that newly loaded configuration, otherwise Reset resurrects
+        // constructor-era values the user never asked for.
+        private WatcherConfiguration resetBaseline;
+        // W2L1-001: the target whose editor controls are currently loaded.
+        // Selection changes must capture THIS index before loading another, and
+        // programmatic list rebuilds must not run that capture.
+        private int loadedTargetIndex = -1;
+        private bool suppressTargetCapture;
 
         private TabControl tabs;
         private TabPage tabGlobal;
@@ -80,7 +89,7 @@ namespace SaiCont
         public SettingsDialog(WatcherConfiguration current, string configurationFilePath)
         {
             configPath = configurationFilePath;
-            onDiskSnapshot = current;
+            resetBaseline = CloneConfig(current);
             draftConfig = CloneConfig(current);
             InitializeComponents();
             PopulateFromDraft();
@@ -211,7 +220,7 @@ namespace SaiCont
                 BorderStyle = BorderStyle.None,
                 IntegralHeight = false
             };
-            lstTargets.SelectedIndexChanged += (s, e) => LoadSelectedTarget();
+            lstTargets.SelectedIndexChanged += (s, e) => OnTargetSelectionChanged();
             split.Panel1.Controls.Add(lstTargets);
 
             var form = new TableLayoutPanel
@@ -456,13 +465,41 @@ namespace SaiCont
 
         private void BindTargetList()
         {
-            lstTargets.BeginUpdate();
-            lstTargets.Items.Clear();
-            for (int i = 0; i < draftConfig.Targets.Count; i++)
+            // W2L1-001: a programmatic rebuild raises SelectedIndexChanged while
+            // the list contents are inconsistent with loadedTargetIndex. Suppress
+            // the capture across the rebuild, and forget the loaded index so the
+            // next selection loads rather than captures.
+            suppressTargetCapture = true;
+            try
             {
-                lstTargets.Items.Add(draftConfig.Targets[i].Name);
+                lstTargets.BeginUpdate();
+                lstTargets.Items.Clear();
+                for (int i = 0; i < draftConfig.Targets.Count; i++)
+                {
+                    lstTargets.Items.Add(draftConfig.Targets[i].Name);
+                }
+                lstTargets.EndUpdate();
             }
-            lstTargets.EndUpdate();
+            finally
+            {
+                suppressTargetCapture = false;
+            }
+            loadedTargetIndex = -1;
+        }
+
+        // W2L1-001: the draft synchronization boundary. Capture the OUTGOING
+        // target's editors into its draft record, then load the incoming one.
+        // Without this, editing target A and selecting B silently discarded A's
+        // edits, and Apply only ever captured whichever target was selected last.
+        private void OnTargetSelectionChanged()
+        {
+            if (suppressTargetCapture) return;
+            int incoming = lstTargets.SelectedIndex;
+            if (loadedTargetIndex >= 0 && loadedTargetIndex != incoming)
+            {
+                CaptureTargetEditors(loadedTargetIndex);
+            }
+            LoadSelectedTarget();
         }
 
         private void LoadSelectedTarget()
@@ -471,6 +508,7 @@ namespace SaiCont
             if (idx < 0 || idx >= draftConfig.Targets.Count)
             {
                 lblTargetName.Text = "-";
+                loadedTargetIndex = -1;
                 return;
             }
             TargetRule t = draftConfig.Targets[idx];
@@ -495,6 +533,7 @@ namespace SaiCont
             UpdatePatternCounts();
             lblTargetError.Text = String.Empty;
             lblPatternsError.Text = String.Empty;
+            loadedTargetIndex = idx;
         }
 
         private void UpdatePatternCounts()
@@ -529,6 +568,12 @@ namespace SaiCont
         // T-152: the Apply gate, callable without a Form. OnApply must never
         // write a configuration that this rejects -- that IS the rollback:
         // the on-disk file is left byte-identical when validation fails.
+        //
+        // W2L1-002: target validation alone was NOT the loader's contract. An
+        // empty Log path serialized as path="" and WatcherConfiguration.ReadString
+        // rejects an empty attribute, so Apply reported success and left a file
+        // the next start could not load. The authoritative check is therefore the
+        // loader itself, run against the exact bytes Apply is about to commit.
         internal static bool ValidateDraftConfig(WatcherConfiguration config, out string error)
         {
             error = null;
@@ -550,7 +595,43 @@ namespace SaiCont
                     return false;
                 }
             }
-            return true;
+            return ValidateThroughLoader(config, out error);
+        }
+
+        /// <summary>
+        /// W2L1-002: serialize the draft and parse it back through
+        /// WatcherConfiguration.Load -- the same routine the watcher, GUI and TUI
+        /// use at startup. Anything the loader refuses is refused here, before any
+        /// byte of the destination file is touched. The probe writes to a private
+        /// temp directory so relative-path semantics still resolve the way the
+        /// real file's directory would, and it is deleted either way.
+        /// </summary>
+        internal static bool ValidateThroughLoader(WatcherConfiguration config, out string error)
+        {
+            error = null;
+            string probeDirectory = null;
+            try
+            {
+                string xml = SerializeConfig(config);
+                probeDirectory = Path.Combine(Path.GetTempPath(), "SAICONT.cfgprobe." + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(probeDirectory);
+                string probePath = Path.Combine(probeDirectory, "SAICONT.config.xml");
+                File.WriteAllText(probePath, xml, new UTF8Encoding(false));
+                WatcherConfiguration.Load(probePath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "Configuration would not load: " + ex.Message;
+                return false;
+            }
+            finally
+            {
+                if (probeDirectory != null)
+                {
+                    try { Directory.Delete(probeDirectory, true); } catch { }
+                }
+            }
         }
 
         private void OnApply()
@@ -582,9 +663,14 @@ namespace SaiCont
             {
                 WatcherConfiguration fromDisk = WatcherConfiguration.Load(configPath);
                 draftConfig = fromDisk;
+                // W2L1-001: rebase BOTH the working draft and the reset baseline
+                // on the newly loaded file. Leaving the baseline behind made
+                // Reset restore the configuration that existed when the dialog
+                // opened, undoing a reload the user explicitly asked for.
+                resetBaseline = CloneConfig(fromDisk);
                 PopulateFromDraft();
                 BindTargetList();
-                lstTargets.SelectedIndex = 0;
+                if (lstTargets.Items.Count > 0) lstTargets.SelectedIndex = 0;
                 lblGlobalError.Text = "Reloaded from disk.";
             }
             catch (Exception ex)
@@ -595,10 +681,10 @@ namespace SaiCont
 
         private void OnResetDraft()
         {
-            draftConfig = CloneConfig(onDiskSnapshot);
+            draftConfig = CloneConfig(resetBaseline);
             PopulateFromDraft();
             BindTargetList();
-            lstTargets.SelectedIndex = 0;
+            if (lstTargets.Items.Count > 0) lstTargets.SelectedIndex = 0;
             lblGlobalError.Text = String.Empty;
             lblTargetError.Text = String.Empty;
             lblPatternsError.Text = String.Empty;
@@ -618,7 +704,14 @@ namespace SaiCont
             draftConfig.LogRetainedFiles = (int)numLogRetained.Value;
             draftConfig.LogDuplicateWindowSeconds = (int)numLogDuplicateWindow.Value;
 
-            int idx = lstTargets.SelectedIndex;
+            CaptureTargetEditors(loadedTargetIndex >= 0 ? loadedTargetIndex : lstTargets.SelectedIndex);
+        }
+
+        // W2L1-001: copy the target editor controls into ONE draft record. The
+        // index is explicit so the selection handler can flush the outgoing
+        // target rather than whichever one happens to be selected now.
+        private void CaptureTargetEditors(int idx)
+        {
             if (idx >= 0 && idx < draftConfig.Targets.Count)
             {
                 TargetRule t = draftConfig.Targets[idx];

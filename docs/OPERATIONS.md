@@ -133,15 +133,36 @@ OpenCode versions, and conflicting SSE/REST state block input. The continuation
 is sent to `POST /session/:id/message` with the observed agent/model context;
 TUI prompt endpoints and keyboard/clipboard injection are never used.
 
+Malformed frames, a project-directory mismatch, a session-binding conflict, and
+a restored ambiguous session all enter one RESOLVABLE ambiguity state rather
+than permanently disabling the transport. It clears only when a strictly newer
+live SSE stream plus authoritative REST evidence agree on a single idle bound
+session in this project; a reconnect alone never clears it, and the immediate
+pre-POST revalidation is unchanged.
+
+A bound idle poll issues three REST requests (health, session list, status);
+message history is failure evidence and is refetched only when the live SSE
+evidence for that session advanced. An authorized send performs one candidate
+validation phase and then one independent commit-window validation immediately
+before the POST. Because several rules may legally share one endpoint and
+project, an asynchronous send is owned by (rule, durable state key, session,
+operation generation) and can be consumed only by that exact owner.
+
+Process discovery is a CONSOLE prerequisite: when the Win32 snapshot fails,
+console targets fail closed with `process_discovery_unavailable` while enabled
+`opencode-http` targets are still polled.
+
 The watcher logs startup, shutdown, limit states, failed console reads, dry-run decisions, and sent commands. Ordinary no-trigger polls produce no log line.
 
 ## Runtime control and machine status
 
 `WATCH` permits guarded continuation writes. `DRY-RUN` keeps polling but forbids input. `PAUSE` stops continuous polling. Every transition revokes the current control generation before worker shutdown, so a poll that began under an older mode cannot write afterward.
 
-`run\SAICONT.health.json` is an atomic schema-v1 heartbeat written at most once per meaningful change or 45 seconds. Treat it as stale when `health_updated_utc` stops advancing beyond the consumer's chosen allowance; process start time and PID let consumers reject a dead/reused process. The file contains bounded counters/codes only—never console, prompt, command, token, or credential text.
+`run\SAICONT.health.json` is an atomic schema-v1 heartbeat written at most once per meaningful change or 45 seconds. "Meaningful change" is a change in the semantic snapshot — every contract field except `health_updated_utc` — so an unchanged idle poll writes nothing regardless of poll cadence. Treat it as stale when `health_updated_utc` stops advancing beyond the consumer's chosen allowance; process start time and PID let consumers reject a dead/reused process. Every lifecycle mode publishes it, including `--app`, `--terminal` and `--gui`, and `config_fingerprint` is a semantic digest of the whole configuration, not a target count. `instance_short_id` is a short non-secret hash of the instance token, never the token itself. In `--dry-run`, where no durable store exists, `state_store_disposition` is `not_applicable` and `state_store_healthy` is `false`. The file contains bounded counters/codes only—never console, prompt, command, token, or credential text.
 
-`scripts\status.ps1 -Json` emits one read-only schema-v1 JSON object and preserves the normal command's exit semantics (`0` running, `1` stopped/stale, `2` unverifiable). Only explicit `-Repair` may remove positively stale lifecycle artifacts.
+`scripts\status.ps1 -Json` emits one read-only schema-v1 JSON object that JOINS the verified lifecycle identity with that health snapshot, and preserves the normal command's exit semantics (`0` running, `1` stopped/stale, `2` unverifiable). Its `status` is one of `RUNNING_VERIFIED`, `STOPPED_VERIFIED`, `POSITIVELY_STALE`, `STOPPED_REPAIRED` or `UNVERIFIABLE`: a live verified process whose health snapshot is missing, malformed, of an unsupported schema, stale, or bound to a different PID/start time is `UNVERIFIABLE` (exit 2), never `RUNNING_VERIFIED`. The object also carries `health_disposition`, `health_age_seconds`, `health_fresh`, `health_matches_instance`, `state_store_disposition`, `next_due_utc`, and the last poll/error/write timestamps in round-trip UTC. Only explicit `-Repair` may remove positively stale lifecycle artifacts; `-Json` never mutates anything.
+
+`scripts\stop.ps1` prints `STOPPED_DEGRADED` (exit 1) instead of `STOPPED` when a forced or graceful stop cannot remove a lifecycle artifact it owns. Dead-owner cleanup matches the captured PID, process start time and instance token, so a record belonging to a new owner is never deleted.
 
 ## Console boundary
 
@@ -163,4 +184,7 @@ For Cline, SAICONT relies only on the empty input prompt and normal Enter submis
 - `Configuration error`: stop the watcher, repair the named XML field or regular expression, then run `--probe`.
 - `SAICONT is already running`: use `scripts\status.ps1`; do not launch a duplicate watcher.
 - `console unavailable`: keep the target in a classic Windows console; redirected or unsupported terminal surfaces cannot be read through the Win32 screen-buffer API.
+- `state_ledger_ambiguous`: the durable ledger could not be read (corrupt or a future schema) and the invalid document was quarantined next to it. The watcher stays fail-closed and, after the safe initial delay, commits a fresh authoritative ledger and clears the recovery marker by itself. Persistent failure keeps the marker and reports `state_reconciliation_failed`; the quarantined file is never deleted automatically.
+- `malformed_sse_event_requires_reconciliation`: the OpenCode transport saw untrustworthy evidence. It recovers on its own once a new SSE stream plus REST agree on one idle bound session; a permanent block means the endpoint keeps contradicting itself.
+- `STOPPED_DEGRADED`: the process exited but a lifecycle artifact it owned could not be removed. Inspect `run\`, then rerun `scripts\status.ps1 -Repair`.
 - no Cline result during smoke: open a Cline console and rerun `--probe`; deterministic self-tests remain valid without a live session.

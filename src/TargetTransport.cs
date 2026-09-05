@@ -27,11 +27,27 @@ namespace SaiCont
         public int CursorRow;
         public int StartRow;
 
+        // CORE-004: the engine stamps the owning rule's durable state key onto
+        // the observation before it authorizes a send, so an asynchronous
+        // completion can be matched back to exactly one owner even when several
+        // rules legally share one endpoint+project transport.
+        public string OwnerStateKey;
+
         public bool Ready;
         public bool Busy;
         public bool CanSend;
         public string BlockReason;
         public string Diagnostic;
+    }
+
+    // CORE-004: identity required to consume an asynchronous send completion.
+    // All three parts must match the operation that was started; session
+    // identity alone is NOT ownership.
+    internal sealed class SendOwner
+    {
+        public string RuleName;
+        public string StateKey;
+        public string SessionIdentity;
     }
 
     // SRC-022: minimum surface the engine needs from any transport. Three
@@ -51,9 +67,15 @@ namespace SaiCont
 
         SendOutcome Send(TargetObservation observation, TargetRule rule, string command, Func<bool> commitAllowed, out string error);
 
-        bool TryTakeCompletedSend(string sessionIdentity, out SendOutcome outcome);
+        bool TryTakeCompletedSend(SendOwner owner, out SendOutcome outcome);
 
         bool HasPendingSend { get; }
+
+        // W2L1-004: abort in-flight blocking work WITHOUT disposing. Shutdown and
+        // reload must be able to unblock a poll worker that is sitting inside a
+        // synchronous REST sequence, then prove the worker exited, before the
+        // engine is disposed or the installation mutex is released.
+        void CancelInFlight();
 
         void Dispose();
     }

@@ -46,8 +46,18 @@ $jsonStatus = $jsonStatusText | ConvertFrom-Json
 $humanStatusText = (& (Join-Path $PSScriptRoot 'status.ps1') 2>&1 | Out-String).Trim()
 $humanStatusExit = $LASTEXITCODE
 $statusTreeAfter = Get-StatusReadOnlyFingerprint
-if ($jsonStatusExit -ne 1 -or $jsonStatus.schema_version -ne 1 -or $jsonStatus.status -ne 'STOPPED') {
+if ($jsonStatusExit -ne 1 -or $jsonStatus.schema_version -ne 1 -or $jsonStatus.status -ne 'STOPPED_VERIFIED') {
     throw "status.ps1 -Json stopped-state contract failed: exit=$jsonStatusExit output=$jsonStatusText"
+}
+# CORE-006: the integration seam must expose the health join even when stopped,
+# so a consumer can distinguish "stopped" from "stopped but health looks live".
+foreach ($requiredField in @('health_disposition', 'health_fresh', 'health_matches_instance', 'next_due_utc', 'state_store_disposition')) {
+    if (-not ($jsonStatus.PSObject.Properties.Name -contains $requiredField)) {
+        throw "status.ps1 -Json is missing the required health field '$requiredField': $jsonStatusText"
+    }
+}
+if ($jsonStatus.health_matches_instance -ne $false) {
+    throw "status.ps1 -Json must not claim a health/instance match while stopped: $jsonStatusText"
 }
 if ($humanStatusExit -ne 1 -or $humanStatusText -ne 'STOPPED') {
     throw "status.ps1 human compatibility failed: exit=$humanStatusExit output=$humanStatusText"

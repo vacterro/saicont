@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 
 namespace SaiCont
@@ -97,6 +99,9 @@ namespace SaiCont
         private readonly DurableStateStore _stateStore;
         private readonly ConsoleMembershipCheck _membershipChecker;
         private readonly Dictionary<string, ITargetTransport> _targetTransports = new Dictionary<string, ITargetTransport>(StringComparer.Ordinal);
+        // W2L1-004: CancelInFlight() is called from the shutdown/reload thread
+        // while the poll worker may be mutating the transport table.
+        private readonly object _transportCancelLock = new object();
         private readonly Dictionary<string, string> _restoredOpenCodeSessions = new Dictionary<string, string>(StringComparer.Ordinal);
         // T-158: console-resolution failure backoff. When a matched process
         // cannot be bound to an attachable console (headless-host cline,
@@ -113,15 +118,28 @@ namespace SaiCont
         private bool _stateLoaded;
         private bool _stateStoreHealthy = true;
         private bool _stateLedgerAmbiguous;
+        // CORE-001: a corrupt/unsupported durable ledger arms one bounded
+        // reconciliation instead of wedging the installation forever.
+        private bool _stateReconciliationRequired;
+        private int _stateReconciliationFailures;
+        private const int MaximumStateReconciliationAttempts = 5;
         private DateTime _stateRecoveryNotBeforeUtc = DateTime.MinValue;
         // PERF-004: track durable-state mutations per RetrySessionState
         // (IsDurableDirty) to skip full rebuild when no safety-relevant
         // change happened, while keeping a bounded checkpoint cadence for
         // LastObservedUtc retention semantics.
         private DateTime _lastDurableCheckpointUtc = DateTime.MinValue;
+        // W2L1-003: pruning removes records from memory and must be persisted
+        // with the same discipline as any other safety-relevant mutation.
+        private bool _pruneDurableDirty;
         // T-139: health contract tracking. Health is written atomically to
         // run/SAICONT.health.json and is non-authoritative for safety/retry.
         private string _healthFilePath;
+        // CORE-005: authoritative lifecycle identity, injected by Program.
+        private LifecycleHealthContext _lifecycleHealth;
+        // CORE-007: semantic snapshot of the last published health state.
+        private string _lastHealthFingerprint;
+        private int _healthWriteCount;
         private int _policyRevision;
         private DateTime _lastPollUtc = DateTime.MinValue;
         private DateTime _lastSuccessfulPollUtc = DateTime.MinValue;
@@ -217,6 +235,7 @@ namespace SaiCont
                 // authority are reconciled again -- no manual restart required.
                 TryRecoverStateStore(nowUtc, ref stateDiagnostic);
             }
+
             if (!_stateLoaded && _stateStore != null)
             {
                 _stateLoaded = true;
@@ -257,10 +276,29 @@ namespace SaiCont
                         : _configuration.Targets.Max(t => t.SafeInitialDelaySeconds);
                     _stateRecoveryNotBeforeUtc = nowUtc.AddSeconds(Math.Max(60, delaySeconds));
                     stateDiagnostic = "state_" + _stateStore.LastLoadDisposition.ToString().ToLowerInvariant() + ": " + _stateStore.LastError;
+                    // CORE-001: this classification -- writeable store, but an
+                    // unreadable/foreign-schema ledger -- is the one that used
+                    // to be terminal. TryRecoverStateStore() is only entered
+                    // when the store is UNHEALTHY, and preflight reports a
+                    // corrupt-but-writeable store as healthy, so nothing ever
+                    // reconciled it. Arm the reconciliation instead; it runs
+                    // after the safe initial delay above, not inside this load.
+                    _stateReconciliationRequired = true;
                 }
             }
 
+            if (_stateStore != null && _stateReconciliationRequired)
+            {
+                TryReconcileStateLedger(nowUtc, ref stateDiagnostic);
+            }
+
             var results = new List<PollResult>();
+            // CORE-003: process discovery is a CONSOLE prerequisite, not a
+            // global one. An opencode-http rule observes through HTTP/SSE and
+            // never touches the Win32 snapshot, so a Toolhelp failure must fail
+            // console targets closed WITHOUT taking down the independent HTTP
+            // continuation path. Only when every enabled target depends on the
+            // snapshot is the global early return still correct.
             if (!snapshotSucceeded)
             {
                 results.Add(new PollResult
@@ -269,7 +307,10 @@ namespace SaiCont
                     Error = "process_discovery_unavailable",
                     Reason = "send_blocked=process_discovery_unavailable"
                 });
-                return results;
+                if (!HasEnabledSnapshotIndependentTarget())
+                {
+                    return results;
+                }
             }
             if (!String.IsNullOrEmpty(stateDiagnostic))
             {
@@ -287,6 +328,27 @@ namespace SaiCont
             // and reuse it for every enabled rule, avoiding redundant per-rule
             // dictionary reconstruction.
             ProcessSnapshotIndex snapshotIndex = processes != null ? new ProcessSnapshotIndex(processes) : null;
+
+            // PERF-003: one console observation cache for the whole poll
+            // generation, plus ONE shared refreshed snapshot instead of one per
+            // rule. Console contents are a poll-generation fact; re-reading them
+            // per rule scaled cost with rule count rather than console count.
+            var observationCache = new PollConsoleObservationCache();
+            int deepestScan = 0;
+            if (_configuration.Targets != null)
+            {
+                foreach (TargetRule scanRule in _configuration.Targets)
+                {
+                    if (scanRule == null || !scanRule.Enabled || IsSnapshotIndependentTransport(scanRule)) continue;
+                    if (scanRule.ScanLines > deepestScan) deepestScan = scanRule.ScanLines;
+                }
+            }
+            IList<ProcessEntry> sharedRefreshedProcesses = null;
+            ProcessSnapshotIndex sharedRefreshedIndex = null;
+            bool sharedRefreshTaken = false;
+            // PERF-004: one rule-independent failure assessment per console
+            // snapshot instance, shared across every rule that observes it.
+            var failureBySnapshot = new Dictionary<ConsoleSnapshot, FailureAssessment>();
 
             foreach (TargetRule rule in _configuration.Targets)
             {
@@ -314,19 +376,29 @@ namespace SaiCont
                     targetNameSet = rule.ProcessNameSet;
                 }
 
+                // CORE-003: a console rule genuinely needs the snapshot. When
+                // it is missing, this rule alone fails closed while HTTP rules
+                // above continue.
+                if (!snapshotSucceeded)
+                {
+                    results.Add(new PollResult
+                    {
+                        Target = rule.Name,
+                        Error = "process_discovery_unavailable",
+                        Reason = "send_blocked=process_discovery_unavailable"
+                    });
+                    continue;
+                }
+
                 // PERF-006: use the pre-built index when available; fall back
                 // to per-call construction only when the snapshot failed.
                 IList<ConsoleCandidate> candidates = snapshotIndex != null
                     ? ProcessDiscovery.FindCandidates(snapshotIndex, targetNameSet, _sessionResolver)
                     : ProcessDiscovery.FindCandidates(processes, targetNameSet, _sessionResolver);
 
-                // PERF-007: share one refreshed snapshot across all candidates
-                // that fail the initial read, instead of each candidate taking
-                // an independent snapshot.  Only one refresh is performed per
-                // rule even when many candidates fail.
-                 IList<ProcessEntry> sharedRefreshedProcesses = null;
-                 ProcessSnapshotIndex sharedRefreshedIndex = null;
-                 bool sharedRefreshTaken = false;
+                // PERF-003: the shared refreshed snapshot is now poll-scoped
+                // (declared above), so a resolution failure in rule A does not make
+                // rule B take another Toolhelp snapshot in the same poll.
 
                 foreach (ConsoleCandidate candidate in candidates)
                 {
@@ -362,7 +434,7 @@ namespace SaiCont
                         });
                         continue;
                     }
-                    if (!TryReadTarget(rule, candidate, shouldStop, out resolvedConsole, out readError, ref sharedRefreshedProcesses, ref sharedRefreshedIndex, ref sharedRefreshTaken))
+                    if (!TryReadTarget(rule, candidate, shouldStop, observationCache, deepestScan, out resolvedConsole, out readError, ref sharedRefreshedProcesses, ref sharedRefreshedIndex, ref sharedRefreshTaken))
                     {
                         // T-158: console could not be resolved (AttachConsole
                         // invalid-handle, "console does not contain matched
@@ -393,7 +465,15 @@ namespace SaiCont
                     // future transient failure starts a fresh backoff ladder.
                     ClearResolutionBackoff(resolutionKey);
 
-                    RuleObservation observation = RuleMatcher.Inspect(rule, resolvedConsole.Snapshot, nowUtc);
+                    // PERF-004: classify this immutable snapshot once, then share
+                    // the result with every rule that observes it this poll.
+                    FailureAssessment sharedFailure;
+                    if (!failureBySnapshot.TryGetValue(resolvedConsole.Snapshot, out sharedFailure))
+                    {
+                        sharedFailure = FailureIntelligence.Classify(resolvedConsole.Snapshot.Text);
+                        failureBySnapshot[resolvedConsole.Snapshot] = sharedFailure;
+                    }
+                    RuleObservation observation = RuleMatcher.Inspect(rule, resolvedConsole.Snapshot, nowUtc, sharedFailure);
                     // CORE-005: an evaluation failure (regex timeout / rule
                     // evaluation error) must NEVER mutate semantic safety state.
                     // Short-circuit before any Observe/capacity transition so a
@@ -538,7 +618,11 @@ namespace SaiCont
                                  IList<ProcessEntry> preSendRefreshed = null;
                                  ProcessSnapshotIndex preSendRefreshedIndex = null;
                                  bool preSendRefreshTaken = false;
-                                 if (!TryReadTarget(rule, freshTarget, shouldStop, out freshResolved, out freshError, ref preSendRefreshed, ref preSendRefreshedIndex, ref preSendRefreshTaken))
+                                 // PERF-003: null cache -- the transactional
+                                 // pre-send reread must be FRESH, never served
+                                 // from the poll observation cache.
+                                 if (!TryReadTarget(rule, freshTarget, shouldStop, null, 0, out freshResolved, out freshError, ref preSendRefreshed, ref preSendRefreshedIndex, ref preSendRefreshTaken))
+
                                 {
                                     result.Error = freshError;
                                     result.Reason = "send_blocked=re-resolution_failed: " + freshError;
@@ -656,6 +740,12 @@ namespace SaiCont
                         break;
                     }
                 }
+                // W2L1-003: a prune removed records from memory, so the persisted
+                // ledger no longer matches. Treat it as a first-class mutation.
+                if (_pruneDurableDirty)
+                {
+                    anyDirty = true;
+                }
                 bool checkpointDue = _lastDurableCheckpointUtc == DateTime.MinValue
                     || (nowUtc - _lastDurableCheckpointUtc).TotalSeconds >= DurableCheckpointIntervalSeconds;
                 if (anyDirty || checkpointDue)
@@ -679,6 +769,7 @@ namespace SaiCont
                         {
                             _lastDurableCheckpointUtc = nowUtc;
                         }
+                        _pruneDurableDirty = false;
                         foreach (var pair in _states)
                         {
                             if (pair.Value != null) pair.Value.ClearDurableDirty();
@@ -751,7 +842,10 @@ namespace SaiCont
                 string restoredSessionId;
                 bool restoredSessionKnown = TryGetRestoredOpenCodeSession(rule, out restoredSessionId);
                 transport = new OpenCodeHttpTransport(rule.Endpoint, rule.ProjectDirectory, restoredSessionKnown ? restoredSessionId : null, restoredSessionKnown && String.IsNullOrEmpty(restoredSessionId));
-                _targetTransports[transportKey] = transport;
+                lock (_transportCancelLock)
+                {
+                    _targetTransports[transportKey] = transport;
+                }
             }
             string pollError;
             TargetObservation observation = transport.Poll(rule, nowUtc, out pollError);
@@ -841,6 +935,10 @@ namespace SaiCont
                 _states[stateKey] = state;
             }
             state.SetTransportIdentity(observation);
+            // CORE-004: bind this observation to the owning rule's durable state
+            // key so an asynchronous completion cannot be consumed by a sibling
+            // rule that happens to share endpoint+project+session.
+            observation.OwnerStateKey = stateKey;
             if (identity.IsStrong)
             {
                 _stateIdentities[stateKey] = identity;
@@ -870,7 +968,13 @@ namespace SaiCont
             };
 
             SendOutcome completedOutcome;
-            if (transport.TryTakeCompletedSend(observation.SessionIdentity, out completedOutcome))
+            var sendOwner = new SendOwner
+            {
+                RuleName = rule.Name,
+                StateKey = stateKey,
+                SessionIdentity = observation.SessionIdentity
+            };
+            if (transport.TryTakeCompletedSend(sendOwner, out completedOutcome))
             {
                 state.CommitAttempt(MapOutcome(completedOutcome), rule, nowUtc);
                 result.Sent = completedOutcome != null && completedOutcome.Disposition == SendDisposition.CompleteInputCommitted;
@@ -1083,6 +1187,74 @@ namespace SaiCont
             _transportUnavailableUntilUtc.Remove(ruleName);
         }
 
+        // CORE-003: opencode-http observes through HTTP/SSE, so it does not
+        // depend on the Win32 process snapshot. Console rules do.
+        internal static bool IsSnapshotIndependentTransport(TargetRule rule)
+        {
+            return rule != null && String.Equals(rule.Transport ?? "console", "opencode-http", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool HasEnabledSnapshotIndependentTarget()
+        {
+            if (_configuration == null || _configuration.Targets == null) return false;
+            foreach (TargetRule rule in _configuration.Targets)
+            {
+                if (rule != null && rule.Enabled && IsSnapshotIndependentTransport(rule)) return true;
+            }
+            return false;
+        }
+
+        // CORE-001: the reachable exit from conservative recovery. The store is
+        // WRITEABLE (preflight passed) but its ledger could not be read, so the
+        // in-memory authority is all that exists. Order is the safety argument:
+        // commit a fresh authoritative ledger atomically FIRST, clear the
+        // recovery marker only after that commit, and clear _stateLedgerAmbiguous
+        // only after both. Any failure leaves marker + ambiguity intact, so the
+        // watcher stays fail-closed exactly as it was before the attempt.
+        private bool TryReconcileStateLedger(DateTime nowUtc, ref string stateDiagnostic)
+        {
+            if (_stateStore == null || !_stateReconciliationRequired)
+            {
+                return true;
+            }
+            if (nowUtc < _stateRecoveryNotBeforeUtc)
+            {
+                stateDiagnostic = "state_ledger_ambiguous (reconciliation cooldown)";
+                return false;
+            }
+            if (_stateReconciliationFailures >= MaximumStateReconciliationAttempts)
+            {
+                stateDiagnostic = "state_ledger_ambiguous (reconciliation attempts exhausted: " + (_stateStore.LastError ?? "unknown") + ")";
+                return false;
+            }
+
+            string preflightError;
+            if (!_stateStore.TryPreflight(out preflightError))
+            {
+                _stateStoreHealthy = false;
+                _stateRecoveryNotBeforeUtc = nowUtc.AddSeconds(30);
+                stateDiagnostic = "state_preflight_failed: " + preflightError;
+                return false;
+            }
+
+            string reconcileError;
+            if (!_stateStore.TryReconcile(ExportAllStates(nowUtc), nowUtc, out reconcileError))
+            {
+                _stateReconciliationFailures++;
+                _stateRecoveryNotBeforeUtc = nowUtc.AddSeconds(30);
+                stateDiagnostic = "state_reconciliation_failed: " + reconcileError;
+                return false;
+            }
+
+            _stateReconciliationRequired = false;
+            _stateReconciliationFailures = 0;
+            _stateLedgerAmbiguous = false;
+            _stateStoreHealthy = true;
+            _stateRecoveryNotBeforeUtc = DateTime.MinValue;
+            stateDiagnostic = null;
+            return true;
+        }
+
         private bool TryRecoverStateStore(DateTime nowUtc, ref string stateDiagnostic)
         {
             if (_stateStore == null || _stateStoreHealthy)
@@ -1118,6 +1290,8 @@ namespace SaiCont
             if (_stateStore.LastLoadDisposition == StateLoadDisposition.Corrupt || _stateStore.LastLoadDisposition == StateLoadDisposition.UnsupportedSchema)
             {
                 _stateLedgerAmbiguous = true;
+                // CORE-001: arm the reconciliation instead of latching forever.
+                _stateReconciliationRequired = true;
             }
             foreach (StateRecord rec in saved)
             {
@@ -1155,6 +1329,8 @@ namespace SaiCont
             TargetRule rule,
             ConsoleCandidate candidate,
             Func<bool> shouldStop,
+            PollConsoleObservationCache observationCache,
+            int captureLines,
             out ResolvedConsoleSession session,
             out string error,
              ref IList<ProcessEntry> sharedRefreshedProcesses,
@@ -1163,10 +1339,16 @@ namespace SaiCont
         {
             session = null;
             error = null;
-            ConsoleReadAttempt readAttempt = delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e)
+            ConsoleReadAttempt directRead = delegate(int pid, int lineCount, out ConsoleSnapshot s, out string e)
             {
                 return _consoleReader(pid, lineCount, out s, out e);
             };
+            // PERF-003: ordinary rule evaluation reads through the poll cache.
+            // The transactional pre-send reread deliberately passes null so it
+            // always observes the console as it is at that instant.
+            ConsoleReadAttempt readAttempt = observationCache == null
+                ? directRead
+                : observationCache.Wrap(directRead, captureLines);
 
             if (ProcessDiscovery.TryResolveConsoleSession(candidate, readAttempt, rule.ScanLines, _membershipChecker, out session, out error))
             {
@@ -1291,7 +1473,15 @@ namespace SaiCont
                 // snapshot, retire it conservatively. Ambiguous/post-write
                 // states keep a longer grace; idle/backoff states retire sooner
                 // to free capacity for new sessions.
-                if (livePids != null)
+                //
+                // W2L1-003: OS-PID liveness is CONSOLE evidence only. An
+                // opencode-http record's ProcessId is a synthetic hash of
+                // endpoint+session, so "not in livePids" is true by construction
+                // and an endpoint outage (which also stops LastObservedUtc from
+                // advancing) would age anti-replay authority out of existence for
+                // a session that never disappeared. HTTP records are retired only
+                // by transport-specific evidence, never by this path.
+                if (livePids != null && !IsHttpStateRecord(pair.Key, pair.Value))
                 {
                     ProcessSessionIdentity identity;
                     if (_stateIdentities.TryGetValue(pair.Key, out identity) && identity != null && identity.IsStrong)
@@ -1300,7 +1490,13 @@ namespace SaiCont
                         {
                             bool isCritical = pair.Value.State == RecoveryState.AttemptInFlightReserved ||
                                 pair.Value.State == RecoveryState.AmbiguousFailClosed ||
-                                pair.Value.State == RecoveryState.CommandWrittenAwaitingOutcome;
+                                pair.Value.State == RecoveryState.CommandWrittenAwaitingOutcome ||
+                                // W2L1-003: RecoveryConfirmed carries the
+                                // SuppressedToken anti-replay authority that
+                                // TryMakeStateCapacity already refuses to evict;
+                                // giving it only the short grace here contradicted
+                                // that and could authorize a duplicate write.
+                                !String.IsNullOrEmpty(pair.Value.SuppressedToken);
                             TimeSpan grace = isCritical ? vanishedGrace : TimeSpan.FromMinutes(15);
                             if (nowUtc - pair.Value.LastObservedUtc > grace)
                             {
@@ -1316,6 +1512,29 @@ namespace SaiCont
                 _states.Remove(expiredKeys[i]);
                 _stateIdentities.Remove(expiredKeys[i]);
             }
+            // W2L1-003: pruning is a real durable mutation. Without marking it,
+            // memory could diverge from the persisted ledger until an unrelated
+            // mutation or the 60s checkpoint happened to save.
+            if (expiredKeys.Count > 0)
+            {
+                _pruneDurableDirty = true;
+            }
+        }
+
+        // W2L1-003: identify records owned by the opencode-http transport. The
+        // record's own transport kind is authoritative; the state-key prefix is a
+        // fallback for records restored before the transport kind was persisted.
+        private bool IsHttpStateRecord(string stateKey, RetrySessionState state)
+        {
+            if (state != null && String.Equals(state.TransportKind, "opencode-http", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            if (String.IsNullOrEmpty(stateKey)) return false;
+            int separator = stateKey.IndexOf(':');
+            string ruleName = separator > 0 ? stateKey.Substring(0, separator) : stateKey;
+            TargetRule rule = LookupRule(ruleName);
+            return IsSnapshotIndependentTransport(rule);
         }
 
         // W2-004: only evict states that are truly safe to discard.
@@ -1403,27 +1622,63 @@ namespace SaiCont
             set { _healthFilePath = value; }
         }
 
+        /// <summary>
+        /// CORE-005: bind this engine to the lifecycle's authoritative identity.
+        /// Program calls this for --watch/--dry-run, and the GUI/TUI pass the same
+        /// context into every replacement engine they build on reload, so health
+        /// never silently stops being published or starts describing pid 0.
+        /// </summary>
+        public LifecycleHealthContext LifecycleHealth
+        {
+            get { return _lifecycleHealth; }
+            set
+            {
+                _lifecycleHealth = value;
+                if (value != null && !String.IsNullOrEmpty(value.HealthFilePath))
+                {
+                    _healthFilePath = value.HealthFilePath;
+                }
+            }
+        }
+
         /// <summary>T-139: increment policy revision when configuration is swapped.</summary>
         public void BumpPolicyRevision()
         {
             _policyRevision++;
         }
 
+        // CORE-005: a SEMANTIC configuration fingerprint. "<n>_targets" made two
+        // materially different configurations indistinguishable to a consumer as
+        // long as they had the same target count.
+        private string ComputeConfigFingerprint()
+        {
+            if (_configuration == null) return "null";
+            var builder = new StringBuilder();
+            builder.Append(_configuration.PollIntervalMilliseconds).Append('|')
+                .Append(_configuration.LogMaximumBytes).Append('|')
+                .Append(_configuration.LogRetainedFiles).Append('|')
+                .Append(_configuration.LogDuplicateWindowSeconds).Append('|');
+            if (_configuration.Targets != null)
+            {
+                foreach (TargetRule rule in _configuration.Targets)
+                {
+                    if (rule == null) continue;
+                    builder.Append(rule.SemanticFingerprint).Append('\u001f');
+                }
+            }
+            using (var sha = SHA256.Create())
+            {
+                byte[] digest = sha.ComputeHash(Encoding.UTF8.GetBytes(builder.ToString()));
+                var text = new StringBuilder(16);
+                for (int i = 0; i < 8; i++) text.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
+                return text.ToString();
+            }
+        }
+
         private void WriteHealth(DateTime nowUtc, IList<PollResult> results, bool pollSucceeded)
         {
             if (String.IsNullOrEmpty(_healthFilePath)) { return; }
-            // T-140: bounded heartbeat -- do not rewrite every poll when
-            // nothing changed. Rewrite on: meaningful transition (error,
-            // success-after-error, write), or heartbeat interval elapsed.
-            bool meaningfulTransition =
-                (nowUtc - _lastHealthWriteUtc).TotalSeconds >= HealthHeartbeatIntervalSeconds ||
-                (pollSucceeded && _lastSuccessfulPollUtc == DateTime.MinValue) ||
-                (!pollSucceeded && _LastErrorUtc == DateTime.MinValue) ||
-                (results != null && results.Count > 0);
-            if (!meaningfulTransition && _lastHealthWriteUtc != DateTime.MinValue)
-            {
-                return;
-            }
+
             int active = 0, triggered = 0, writeEligible = 0;
             DateTime nextDue = DateTime.MaxValue;
             if (results != null)
@@ -1444,21 +1699,31 @@ namespace SaiCont
                     }
                 }
             }
+
+            LifecycleHealthContext lifecycle = _lifecycleHealth;
+            bool stateStoreApplicable = lifecycle == null ? _stateStore != null : lifecycle.StateStoreApplicable;
+            // CORE-005: --dry-run builds no DurableStateStore, and the engine's
+            // default _stateStoreHealthy=true then described an absent store as
+            // healthy. Report it as not applicable instead.
+            string storeDisposition = !stateStoreApplicable
+                ? "not_applicable"
+                : (_stateStoreHealthy ? (_stateLedgerAmbiguous ? "ambiguous" : "healthy") : "unhealthy");
+
             var report = new HealthReport
             {
                 ProductVersion = ProductVersionMajor + "." + ProductVersionMinor,
-                ProcessId = 0,
-                ProcessStartUtc = null,
-                InstanceShortId = null,
-                Mode = null,
+                ProcessId = lifecycle != null ? lifecycle.ProcessId : 0,
+                ProcessStartUtc = lifecycle != null && lifecycle.ProcessStartUtc != DateTime.MinValue ? (DateTime?)lifecycle.ProcessStartUtc : null,
+                InstanceShortId = lifecycle != null ? lifecycle.InstanceShortId : null,
+                Mode = lifecycle != null ? lifecycle.Mode : null,
                 PolicyRevision = _policyRevision,
-                ConfigFingerprint = _configuration != null ? (_configuration.Targets != null ? _configuration.Targets.Count.ToString(CultureInfo.InvariantCulture) + "_targets" : "0_targets") : "null",
+                ConfigFingerprint = ComputeConfigFingerprint(),
                 LastPollUtc = _lastPollUtc == DateTime.MinValue ? (DateTime?)null : _lastPollUtc,
                 LastSuccessfulPollUtc = _lastSuccessfulPollUtc == DateTime.MinValue ? (DateTime?)null : _lastSuccessfulPollUtc,
                 LastErrorUtc = _LastErrorUtc == DateTime.MinValue ? (DateTime?)null : _LastErrorUtc,
                 LastErrorCode = _lastErrorCode,
-                StateStoreDisposition = _stateStoreHealthy ? (_stateLedgerAmbiguous ? "ambiguous" : "healthy") : "unhealthy",
-                StateStoreHealthy = _stateStoreHealthy && !_stateLedgerAmbiguous,
+                StateStoreDisposition = storeDisposition,
+                StateStoreHealthy = stateStoreApplicable && _stateStoreHealthy && !_stateLedgerAmbiguous,
                 ActiveSessions = active,
                 TriggeredSessions = triggered,
                 WriteEligibleSessions = writeEligible,
@@ -1467,13 +1732,66 @@ namespace SaiCont
                 LastWriteTarget = _lastWriteTarget,
                 HealthUpdatedUtc = nowUtc
             };
+
+            // CORE-007: bounded heartbeat driven by the SEMANTIC snapshot, not by
+            // "a result exists". results.Count > 0 is true on every ordinary poll,
+            // so the 45-second bound was defeated and health was rewritten at poll
+            // cadence (2s in the shipped configuration).
+            string fingerprint = SemanticHealthFingerprint(report, pollSucceeded);
+            bool firstPublication = _lastHealthWriteUtc == DateTime.MinValue || _lastHealthFingerprint == null;
+            bool materialChange = !String.Equals(_lastHealthFingerprint, fingerprint, StringComparison.Ordinal);
+            bool heartbeatDue = (nowUtc - _lastHealthWriteUtc).TotalSeconds >= HealthHeartbeatIntervalSeconds;
+            if (!firstPublication && !materialChange && !heartbeatDue)
+            {
+                return;
+            }
+
             string healthError;
             if (report.TryWrite(_healthFilePath, out healthError))
             {
                 _lastHealthWriteUtc = nowUtc;
+                _lastHealthFingerprint = fingerprint;
+                _healthWriteCount++;
             }
             // health write failure is non-authoritative: do not change safety/retry truth
         }
+
+        // CORE-007: every contract field EXCEPT health_updated_utc. A poll that
+        // changes nothing produces the same fingerprint and therefore no write.
+        // Timestamps that advance on every successful poll (last_poll_utc) are
+        // deliberately excluded too -- they are liveness, not state, and the
+        // bounded heartbeat is what publishes liveness.
+        internal static string SemanticHealthFingerprint(HealthReport report)
+        {
+            return SemanticHealthFingerprint(report, true);
+        }
+
+        internal static string SemanticHealthFingerprint(HealthReport report, bool pollSucceeded)
+        {
+            if (report == null) return String.Empty;
+            var builder = new StringBuilder(256);
+            builder.Append(report.ProductVersion).Append('|')
+                .Append(report.ProcessId).Append('|')
+                .Append(report.ProcessStartUtc.HasValue ? report.ProcessStartUtc.Value.ToString("o", CultureInfo.InvariantCulture) : String.Empty).Append('|')
+                .Append(report.InstanceShortId).Append('|')
+                .Append(report.Mode).Append('|')
+                .Append(report.PolicyRevision).Append('|')
+                .Append(report.ConfigFingerprint).Append('|')
+                .Append(pollSucceeded ? "ok" : "error").Append('|')
+                .Append(report.LastErrorCode).Append('|')
+                .Append(report.StateStoreDisposition).Append('|')
+                .Append(report.StateStoreHealthy).Append('|')
+                .Append(report.ActiveSessions).Append('|')
+                .Append(report.TriggeredSessions).Append('|')
+                .Append(report.WriteEligibleSessions).Append('|')
+                .Append(report.NextDueUtc.HasValue ? report.NextDueUtc.Value.ToString("o", CultureInfo.InvariantCulture) : String.Empty).Append('|')
+                .Append(report.LastWriteUtc.HasValue ? report.LastWriteUtc.Value.ToString("o", CultureInfo.InvariantCulture) : String.Empty).Append('|')
+                .Append(report.LastWriteTarget);
+            return builder.ToString();
+        }
+
+        /// <summary>CORE-007 test seam: how many health snapshots were written.</summary>
+        internal int HealthWriteCount { get { return _healthWriteCount; } }
 
         public void Run(bool allowInput, Action<PollResult> onResult, Func<bool> shouldStop)
         {
@@ -1512,11 +1830,36 @@ namespace SaiCont
 
         public void Dispose()
         {
-            foreach (ITargetTransport transport in _targetTransports.Values)
+            ITargetTransport[] transports;
+            lock (_transportCancelLock)
             {
-                try { transport.Dispose(); } catch { }
+                transports = new ITargetTransport[_targetTransports.Count];
+                _targetTransports.Values.CopyTo(transports, 0);
+                _targetTransports.Clear();
             }
-            _targetTransports.Clear();
+            for (int i = 0; i < transports.Length; i++)
+            {
+                try { transports[i].Dispose(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// W2L1-004: unblock a poll worker that is inside synchronous transport
+        /// work, WITHOUT disposing the engine. Reload and shutdown call this
+        /// between invalidating authorization and proving the worker exited.
+        /// </summary>
+        public void CancelInFlight()
+        {
+            ITargetTransport[] transports;
+            lock (_transportCancelLock)
+            {
+                transports = new ITargetTransport[_targetTransports.Count];
+                _targetTransports.Values.CopyTo(transports, 0);
+            }
+            for (int i = 0; i < transports.Length; i++)
+            {
+                try { transports[i].CancelInFlight(); } catch { }
+            }
         }
 
         private static void WaitForNextPoll(int milliseconds, Func<bool> shouldStop)

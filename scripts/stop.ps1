@@ -51,9 +51,17 @@ try {
         Start-Sleep -Milliseconds 200
         $running.Refresh()
         if ($running.HasExited) {
-            Remove-SaiContArtifactsIfOwned -Paths $paths -ProcessId $originalId -ProcessStartUtc $originalStartUtc -InstanceToken $originalToken | Out-Null
-            Write-Output "STOPPED pid=$originalId"
-            exit 0
+            # W2L1-005: the owner is dead, so cleanup must verify the RECORDS
+            # against the captured identity instead of asking a corpse to
+            # identify itself. A retained/failed artifact is reported, never
+            # swallowed behind an unconditional STOPPED.
+            $cleanup = Remove-SaiContArtifactsForDeadOwner -Paths $paths -ProcessId $originalId -ProcessStartUtc $originalStartUtc -InstanceToken $originalToken
+            if ($cleanup.Clean) {
+                Write-Output "STOPPED pid=$originalId"
+                exit 0
+            }
+            Write-Output "STOPPED_DEGRADED pid=$originalId retained=$([String]::Join('; ', $cleanup.Retained)) errors=$([String]::Join('; ', $cleanup.Errors))"
+            exit 1
         }
     } while ([DateTime]::UtcNow -lt $deadlineUtc)
 
@@ -74,8 +82,16 @@ try {
     if (-not $running.HasExited) {
         throw "Original SAICONT process did not exit after force stop: PID=$originalId"
     }
-    Remove-SaiContArtifactsIfOwned -Paths $paths -ProcessId $originalId -ProcessStartUtc $originalStartUtc -InstanceToken $originalToken | Out-Null
-    Write-Output "STOPPED forcefully pid=$originalId"
+    # W2L1-005: a force-killed process cannot run its own finally cleanup, so this
+    # is exactly the path that previously left owned artifacts behind while
+    # printing success.
+    $cleanup = Remove-SaiContArtifactsForDeadOwner -Paths $paths -ProcessId $originalId -ProcessStartUtc $originalStartUtc -InstanceToken $originalToken
+    if ($cleanup.Clean) {
+        Write-Output "STOPPED forcefully pid=$originalId"
+        exit 0
+    }
+    Write-Output "STOPPED_DEGRADED forcefully pid=$originalId retained=$([String]::Join('; ', $cleanup.Retained)) errors=$([String]::Join('; ', $cleanup.Errors))"
+    exit 1
 }
 finally {
     Exit-SaiContLifecycleLock -Mutex $operationLock

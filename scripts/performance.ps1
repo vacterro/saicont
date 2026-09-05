@@ -45,25 +45,51 @@ $perfPoll = $measureLines | Where-Object { $_ -like 'MEASURE: perf_poll*' } | Se
 $perfMulti = $measureLines | Where-Object { $_ -like 'MEASURE: perf_multi*' } | Select-Object -First 1
 $perfMem = $measureLines | Where-Object { $_ -like 'MEASURE: perf_mem*' } | Select-Object -First 1
 $soak = $measureLines | Where-Object { $_ -like 'MEASURE: soak*' } | Select-Object -First 1
+# PERF-005: the ACTIVE production paths are mandatory scenarios now. The old
+# harness was greenest exactly where production work is absent, so a regression
+# in OpenCode request amplification, same-console observation count or SSE
+# retention could not fail this gate at all.
+$perfOpenCode = $measureLines | Where-Object { $_ -like 'MEASURE: perf_opencode*' } | Select-Object -First 1
+$perfConsole = $measureLines | Where-Object { $_ -like 'MEASURE: perf_console*' } | Select-Object -First 1
+$perfSse = $measureLines | Where-Object { $_ -like 'MEASURE: perf_sse*' } | Select-Object -First 1
 
 if (-not $perfPoll) { throw 'Embedded self-test did not emit perf_poll MEASURE line.' }
 if (-not $perfMulti) { throw 'Embedded self-test did not emit perf_multi MEASURE line.' }
 if (-not $perfMem) { throw 'Embedded self-test did not emit perf_mem MEASURE line.' }
+if (-not $perfOpenCode) { throw 'Embedded self-test did not emit perf_opencode MEASURE line (OpenCode request budget scenario is mandatory).' }
+if (-not $perfConsole) { throw 'Embedded self-test did not emit perf_console MEASURE line (same-console observation scenario is mandatory).' }
+if (-not $perfSse) { throw 'Embedded self-test did not emit perf_sse MEASURE line (SSE churn scenario is mandatory).' }
 
 $pollAvg = Get-MeasureValue $perfPoll 'avg_ms'
 $pollMedian = Get-MeasureValue $perfPoll 'median_ms'
 $pollP95 = Get-MeasureValue $perfPoll 'p95_ms'
 $pollMax = Get-MeasureValue $perfPoll 'max_ms'
+# PERF-005: cpu_ms is measured processor time. one_core_cpu_pct is derived from
+# it; the previous value divided the wall clock by itself and was always 100%.
+$pollCpuMs = Get-MeasureValue $perfPoll 'cpu_ms'
 $oneCorePct = Get-MeasureValue $perfPoll 'one_core_cpu_pct'
+if ($null -eq $pollCpuMs) { throw 'perf_poll MEASURE line does not report measured cpu_ms; one_core_cpu_pct would be synthetic.' }
 
 $multiWrites = Get-MeasureValue $perfMulti 'writes'
 $multiStates = Get-MeasureValue $perfMulti 'states'
 
 $memDelta = Get-MeasureValue $perfMem 'managed_delta_bytes'
 
-Write-Output ('MEASURE: idle_scenario poll_avg_ms={0:F2} poll_median_ms={1:F2} poll_p95_ms={2:F2} poll_max_ms={3:F2} one_core_cpu_pct={4:F2}' -f $pollAvg, $pollMedian, $pollP95, $pollMax, $oneCorePct)
+$opencodeIdleRequests = Get-MeasureValue $perfOpenCode 'idle_poll_requests'
+$opencodeCandidateRequests = Get-MeasureValue $perfOpenCode 'send_candidate_requests'
+$opencodeCommitRequests = Get-MeasureValue $perfOpenCode 'send_commit_requests'
+$opencodePosts = Get-MeasureValue $perfOpenCode 'send_posts'
+$sharedConsoleRules = Get-MeasureValue $perfConsole 'shared_console_rules'
+$sharedConsoleReads = Get-MeasureValue $perfConsole 'shared_console_reads'
+$sseRetainedSessions = Get-MeasureValue $perfSse 'retained_sessions'
+$sseRetainedChars = Get-MeasureValue $perfSse 'retained_text_chars'
+
+Write-Output ('MEASURE: idle_scenario poll_avg_ms={0:F2} poll_median_ms={1:F2} poll_p95_ms={2:F2} poll_max_ms={3:F2} cpu_ms={4:F1} one_core_cpu_pct={5:F2}' -f $pollAvg, $pollMedian, $pollP95, $pollMax, $pollCpuMs, $oneCorePct)
 Write-Output ('MEASURE: active_scenario multi_writes={0} multi_states={1}' -f $multiWrites, $multiStates)
 Write-Output ('MEASURE: memory_scenario managed_delta_bytes={0}' -f $memDelta)
+Write-Output ('MEASURE: opencode_scenario idle_poll_requests={0} send_candidate_requests={1} send_commit_requests={2} send_posts={3}' -f $opencodeIdleRequests, $opencodeCandidateRequests, $opencodeCommitRequests, $opencodePosts)
+Write-Output ('MEASURE: console_scenario shared_rules={0} shared_reads={1}' -f $sharedConsoleRules, $sharedConsoleReads)
+Write-Output ('MEASURE: sse_scenario retained_sessions={0} retained_text_chars={1}' -f $sseRetainedSessions, $sseRetainedChars)
 if ($soak) {
     Write-Output ('MEASURE: soak_scenario ' + $soak.Substring('MEASURE: '.Length))
 }
@@ -151,6 +177,15 @@ try {
     if ($pollP95 -ge 150.0) { throw "P95 poll budget exceeded: $pollP95 ms" }
     if ($multiWrites -ne 5) { throw "Active scenario must produce exactly five writes, got $multiWrites" }
     if ($memDelta -ge 8MB) { throw "Memory-scenario budget exceeded: $memDelta bytes" }
+    # PERF-005: operation-count invariants for the network/Win32 boundaries,
+    # where stable timing is noise but request counts are exact.
+    if ($opencodeIdleRequests -gt 3) { throw "OpenCode idle poll request budget exceeded: $opencodeIdleRequests" }
+    if ($opencodeCandidateRequests -gt 3) { throw "OpenCode candidate-validation request budget exceeded: $opencodeCandidateRequests" }
+    if ($opencodePosts -ne 1) { throw "OpenCode send must issue exactly one POST, got $opencodePosts" }
+    if ($opencodeCommitRequests -lt 3) { throw "OpenCode commit-window validation must remain independent, got $opencodeCommitRequests requests" }
+    if ($sharedConsoleReads -ne 1) { throw "Same-console observation budget exceeded: $sharedConsoleRules rules produced $sharedConsoleReads reads" }
+    if ($sseRetainedSessions -gt 64) { throw "SSE session retention budget exceeded: $sseRetainedSessions" }
+    if ($sseRetainedChars -gt 16000) { throw "SSE retained text budget exceeded: $sseRetainedChars chars" }
     Write-Output 'STATUS: PERFORMANCE_BUDGET PASS'
 }
 finally {

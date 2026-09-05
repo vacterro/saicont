@@ -6,6 +6,41 @@ using System.Text;
 namespace SaiCont
 {
     /// <summary>
+    /// CORE-005: the immutable lifecycle identity a health snapshot must carry.
+    /// Program owns the authoritative values (they are the same ones written to
+    /// run/SAICONT.instance.xml) and injects this context into every engine it
+    /// creates, including GUI/TUI reload replacements. WriteHealth used to
+    /// hardcode ProcessId=0 and null start/mode, so a consumer could not perform
+    /// the documented PID/start-time anti-reuse cross-check, and interactive
+    /// modes published no health at all.
+    ///
+    /// InstanceShortId is a SHORT NON-SECRET hash of the instance token: it
+    /// correlates health with the instance record without ever exposing the raw
+    /// token that authorizes a stop request.
+    /// </summary>
+    internal sealed class LifecycleHealthContext
+    {
+        public string HealthFilePath;
+        public int ProcessId;
+        public DateTime ProcessStartUtc;
+        public string Mode;
+        public string InstanceShortId;
+        public bool StateStoreApplicable;
+
+        public static string DeriveInstanceShortId(string instanceToken)
+        {
+            if (String.IsNullOrEmpty(instanceToken)) return null;
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] digest = sha.ComputeHash(new UTF8Encoding(false).GetBytes(instanceToken));
+                var text = new StringBuilder(16);
+                for (int i = 0; i < 8; i++) text.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
+                return text.ToString();
+            }
+        }
+    }
+
+    /// <summary>
     /// T-139: local machine-readable health contract (schema v1).
     /// A tiny versioned snapshot another local orchestrator (TERMISAI) can
     /// read without scraping GUI text, console frames, or log prose.

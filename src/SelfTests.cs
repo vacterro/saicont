@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -1764,6 +1765,12 @@ namespace SaiCont
 
                 const int PerfPolls = 1000;
                 var pollSamples = new long[PerfPolls];
+                // PERF-005: measure REAL processor time. The previous
+                // one_core_cpu_pct divided perfTimer.ElapsedMilliseconds by
+                // itself, so it reported exactly 100% for any nonzero run and
+                // scripts/performance.ps1 republished that as a CPU metric.
+                Process perfProcess = Process.GetCurrentProcess();
+                TimeSpan cpuBefore = perfProcess.TotalProcessorTime;
                 Stopwatch perfTimer = Stopwatch.StartNew();
                 for (int i = 0; i < PerfPolls; i++)
                 {
@@ -1773,16 +1780,33 @@ namespace SaiCont
                     pollSamples[i] = sw.ElapsedTicks;
                 }
                 perfTimer.Stop();
+                TimeSpan cpuAfter = perfProcess.TotalProcessorTime;
                 double avgPollMs = (double)perfTimer.ElapsedMilliseconds / PerfPolls;
                 Array.Sort(pollSamples);
                 double medianMs = (double)pollSamples[PerfPolls / 2] * 1000.0 / Stopwatch.Frequency;
                 double p95Ms = (double)pollSamples[(int)(PerfPolls * 0.95)] * 1000.0 / Stopwatch.Frequency;
                 double maxMs = (double)pollSamples[PerfPolls - 1] * 1000.0 / Stopwatch.Frequency;
-                double oneCoreCpuMs = (double)perfTimer.ElapsedMilliseconds;
-                double oneCoreCpuPct = oneCoreCpuMs / perfTimer.ElapsedMilliseconds * 100.0;
-                failures += AssertEqual(true, avgPollMs < 50.0, "PERF-010: average idle poll < 50ms (actual=" + avgPollMs.ToString("F2") + "ms)");
-                Console.WriteLine("MEASURE: perf_poll polls=" + PerfPolls + " avg_ms=" + avgPollMs.ToString("F2") + " median_ms=" + medianMs.ToString("F2") + " p95_ms=" + p95Ms.ToString("F2") + " max_ms=" + maxMs.ToString("F2") + " total_ms=" + perfTimer.ElapsedMilliseconds + " one_core_cpu_pct=" + oneCoreCpuPct.ToString("F2"));
+                double cpuMs = (cpuAfter - cpuBefore).TotalMilliseconds;
+                double wallMs = Math.Max(1.0, (double)perfTimer.ElapsedMilliseconds);
+                double oneCoreCpuPct = cpuMs / wallMs * 100.0;
+                failures += AssertEqual(true, avgPollMs < 50.0, "PERF-010: average idle poll < 50ms (actual=" + avgPollMs.ToString("F2", CultureInfo.InvariantCulture) + "ms)");
+                // PERF-005: a metric derived from measured CPU time can be below
+                // 100% on a single core; the old synthetic value never could.
+                failures += AssertEqual(true, cpuMs >= 0.0 && cpuMs <= wallMs * Environment.ProcessorCount + 1000.0, "PERF-005: one-core CPU metric is derived from measured processor time (cpu_ms=" + cpuMs.ToString("F1", CultureInfo.InvariantCulture) + " wall_ms=" + wallMs.ToString("F1", CultureInfo.InvariantCulture) + ")");
+                // PERF-005: MEASURE lines are a machine contract for
+                // scripts/performance.ps1, so they must be culture-invariant. On an
+                // Estonian/Russian locale "0,00" silently parsed as 0 in the harness.
+                Console.WriteLine("MEASURE: perf_poll polls=" + PerfPolls.ToString(CultureInfo.InvariantCulture) +
+                    " avg_ms=" + avgPollMs.ToString("F2", CultureInfo.InvariantCulture) +
+                    " median_ms=" + medianMs.ToString("F2", CultureInfo.InvariantCulture) +
+                    " p95_ms=" + p95Ms.ToString("F2", CultureInfo.InvariantCulture) +
+                    " max_ms=" + maxMs.ToString("F2", CultureInfo.InvariantCulture) +
+                    " total_ms=" + perfTimer.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                    " cpu_ms=" + cpuMs.ToString("F1", CultureInfo.InvariantCulture) +
+                    " one_core_cpu_pct=" + oneCoreCpuPct.ToString("F2", CultureInfo.InvariantCulture));
             }
+
+
 
             // Gate 2: Multi-rule scaling. Five rules targeting distinct
             // processes/consoles must produce exactly five writes and keep
@@ -2494,11 +2518,16 @@ namespace SaiCont
                 }
             }
 
+            // T-163 (SRC-005): external-audit regressions live in their own files
+            // so this suite stays readable. They assert the audit's VERIFY clauses.
+            failures += RunAudit163SelfTests();
+
             if (failures == 0)
             {
                 Console.WriteLine("PASS: " + _selfTestCount + " self-tests");
                 return 0;
             }
+
 
             Console.Error.WriteLine("FAIL: " + failures + " self-test(s)");
             return 1;

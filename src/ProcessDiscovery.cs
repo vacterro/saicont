@@ -101,6 +101,148 @@ namespace SaiCont
 
     internal delegate bool ConsoleReadAttempt(int processId, int lineCount, out ConsoleSnapshot snapshot, out string error);
 
+    /// <summary>
+    /// PERF-003: poll-local console observation cache.
+    ///
+    /// One NativeConsole.TryRead is not a memory lookup: it serializes through
+    /// the console lock, detaches/attaches a console, opens CONOUT$, reads the
+    /// screen in 64-row Win32 blocks (three blocks at the shipped scanLines=180),
+    /// queries the title and the console process list, then restores the host
+    /// console. Console contents are ONE poll-generation fact, but the engine
+    /// evaluated each rule independently, so N rules covering one console paid
+    /// that cost N times -- scaling with rule count instead of unique consoles.
+    ///
+    /// This cache captures each unique console once, at the deepest scan any
+    /// sharing rule needs, and derives each rule's shallower tail from that
+    /// immutable snapshot. Identity is strong: a later attach PID reuses a
+    /// snapshot only when the live console process list of that snapshot contains
+    /// it. The cache lives for exactly one PollOnce, so PID reuse or console
+    /// migration between polls cannot merge distinct sessions.
+    ///
+    /// It is deliberately NOT used for the transactional pre-send reread: that
+    /// path must observe the console as it is immediately before the write.
+    /// </summary>
+    internal sealed class PollConsoleObservationCache
+    {
+        private readonly Dictionary<int, ConsoleSnapshot> _byAttachPid = new Dictionary<int, ConsoleSnapshot>();
+        private readonly Dictionary<int, string> _failedAttachPids = new Dictionary<int, string>();
+        private readonly List<ConsoleSnapshot> _captured = new List<ConsoleSnapshot>();
+        // PERF-003/PERF-004: identical (console, depth) requests must return the
+        // SAME snapshot instance, so the rule-independent failure assessment can
+        // be memoized per snapshot across rules that share both.
+        private readonly Dictionary<string, ConsoleSnapshot> _derivedTails = new Dictionary<string, ConsoleSnapshot>(StringComparer.Ordinal);
+        private int _captureCount;
+
+        /// <summary>Test seam: how many real console reads this poll performed.</summary>
+        internal int CaptureCount { get { return _captureCount; } }
+
+        internal ConsoleReadAttempt Wrap(ConsoleReadAttempt inner, int captureLines)
+        {
+            return delegate(int processId, int lineCount, out ConsoleSnapshot snapshot, out string error)
+            {
+                ConsoleSnapshot cached;
+                if (_byAttachPid.TryGetValue(processId, out cached))
+                {
+                    snapshot = Tail(processId, cached, lineCount);
+                    error = null;
+                    return true;
+                }
+
+                // Strong identity: a console already captured this poll whose live
+                // process list contains this PID IS this PID's console.
+                for (int i = 0; i < _captured.Count; i++)
+                {
+                    ConsoleSnapshot candidate = _captured[i];
+                    if (candidate.MembershipStatus == ConsoleMembershipStatus.QueryFailed) continue;
+                    if (!ProcessDiscovery.ConsoleServesMatchedProcess(candidate.ConsoleProcessIds, processId)) continue;
+                    _byAttachPid[processId] = candidate;
+                    snapshot = Tail(processId, candidate, lineCount);
+                    error = null;
+                    return true;
+                }
+
+                string cachedError;
+                if (_failedAttachPids.TryGetValue(processId, out cachedError))
+                {
+                    snapshot = null;
+                    error = cachedError;
+                    return false;
+                }
+
+                int depth = Math.Max(lineCount, captureLines);
+                ConsoleSnapshot fresh;
+                string readError;
+                _captureCount++;
+                if (!inner(processId, depth, out fresh, out readError) || fresh == null)
+                {
+                    // A PID that cannot be attached this poll will not become
+                    // attachable microseconds later in the same poll; the next
+                    // poll re-probes it with a fresh cache.
+                    _failedAttachPids[processId] = readError;
+                    snapshot = null;
+                    error = readError;
+                    return false;
+                }
+
+                _byAttachPid[processId] = fresh;
+                _captured.Add(fresh);
+                snapshot = Tail(processId, fresh, lineCount);
+                error = null;
+                return true;
+            };
+        }
+
+        private ConsoleSnapshot Tail(int processId, ConsoleSnapshot source, int lineCount)
+        {
+            string key = processId.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + lineCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            ConsoleSnapshot existing;
+            if (_derivedTails.TryGetValue(key, out existing))
+            {
+                return existing;
+            }
+            ConsoleSnapshot derived = DeriveTail(source, lineCount);
+            _derivedTails[key] = derived;
+            return derived;
+        }
+
+        /// <summary>
+        /// PERF-003: a rule asking for fewer lines than the capture depth sees the
+        /// same tail an independent read would have produced: the last
+        /// <paramref name="lineCount"/> rows ending at the cursor row, with
+        /// StartRow adjusted accordingly. Everything else is identical because it
+        /// describes the same console at the same instant.
+        /// </summary>
+        internal static ConsoleSnapshot DeriveTail(ConsoleSnapshot source, int lineCount)
+        {
+            if (source == null) return null;
+            int capped = Math.Min(Math.Max(1, lineCount), 2000);
+            string[] lines = (source.Text ?? String.Empty).Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            if (lines.Length <= capped)
+            {
+                return source;
+            }
+
+            int skip = lines.Length - capped;
+            var tail = new string[capped];
+            Array.Copy(lines, skip, tail, 0, capped);
+            return new ConsoleSnapshot
+            {
+                ProcessId = source.ProcessId,
+                WindowHandle = source.WindowHandle,
+                Title = source.Title,
+                Text = String.Join(Environment.NewLine, tail),
+                CursorLine = source.CursorLine,
+                CursorColumn = source.CursorColumn,
+                CursorRow = source.CursorRow,
+                StartRow = source.StartRow + skip,
+                BufferWidth = source.BufferWidth,
+                ConsoleProcessIds = source.ConsoleProcessIds,
+                MembershipStatus = source.MembershipStatus,
+                MembershipError = source.MembershipError
+            };
+        }
+    }
+
     // PERF-004: cheap membership-only check delegate. Performs AttachConsole +
     // GetConsoleProcessList without reading screen content.
     internal delegate bool ConsoleMembershipCheck(int processId, out IList<int> processIds, out string error);

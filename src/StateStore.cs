@@ -259,6 +259,61 @@ namespace SaiCont
 
         public bool TrySave(IEnumerable<StateRecord> records, DateTime nowUtc, out bool changed, out string error)
         {
+            return TrySaveCore(records, nowUtc, false, out changed, out error);
+        }
+
+        /// <summary>
+        /// CORE-001: the one production transition OUT of conservative recovery.
+        /// A corrupt or unsupported-schema load quarantines the invalid file,
+        /// writes the recovery marker and blocks every durable write; without
+        /// this operation that state is permanent for the lifetime of the
+        /// installation. Order matters and is the whole safety argument:
+        /// establish the fresh authoritative ledger and commit it atomically
+        /// FIRST, and only after that commit succeeded remove the marker. A
+        /// failed commit therefore leaves the marker in place and the caller
+        /// fail-closed, exactly as before the attempt. The quarantined invalid
+        /// document is never deleted here.
+        /// </summary>
+        public bool TryReconcile(IEnumerable<StateRecord> authoritativeRecords, DateTime nowUtc, out string error)
+        {
+            error = null;
+            if (String.IsNullOrEmpty(_filePath))
+            {
+                error = "state path is unavailable";
+                return false;
+            }
+
+            bool changed;
+            if (!TrySaveCore(authoritativeRecords ?? new List<StateRecord>(), nowUtc, true, out changed, out error))
+            {
+                return false;
+            }
+
+            lock (_ioLock)
+            {
+                if (!File.Exists(_filePath))
+                {
+                    error = "reconciled ledger is not present on disk";
+                    return false;
+                }
+            }
+
+            if (!TryClearRecoveryMarker())
+            {
+                error = LastError ?? "recovery marker could not be cleared";
+                return false;
+            }
+
+            lock (_ioLock)
+            {
+                LastLoadDisposition = StateLoadDisposition.Valid;
+                LastError = null;
+            }
+            return true;
+        }
+
+        private bool TrySaveCore(IEnumerable<StateRecord> records, DateTime nowUtc, bool reconciling, out bool changed, out string error)
+        {
             changed = false;
             error = null;
             if (String.IsNullOrEmpty(_filePath) || records == null)
@@ -269,12 +324,19 @@ namespace SaiCont
 
             lock (_ioLock)
             {
-                if (File.Exists(RecoveryMarkerPath))
+                if (!reconciling && File.Exists(RecoveryMarkerPath))
                 {
                     error = "durable state reconciliation required";
                     return false;
                 }
                 List<StateRecord> normalized = NormalizeRecords(records, nowUtc);
+                if (reconciling)
+                {
+                    // The prior document is unreadable, so its fingerprint is
+                    // meaningless: force a real write instead of short-circuiting
+                    // on an accidental fingerprint match.
+                    _lastFingerprint = null;
+                }
                 string fingerprint = ComputeFingerprint(normalized);
                 if (File.Exists(_filePath) && String.Equals(_lastFingerprint, fingerprint, StringComparison.Ordinal))
                 {

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace SaiCont
@@ -132,9 +133,122 @@ namespace SaiCont
             new MessageSignature(FailureClass.REQUEST_CANCELLED, "request_cancelled", @"\brequest\s+cancel+ed\b|\boperation\s+cancel+ed\b|\bcancel+ed\s+by\s+client\b|\baborterror\b|\boperation\s+was\s+aborted\b", false, 4)
         };
 
+        // PERF-004: ONE cheap gate in front of the 24 detailed traversals.
+        //
+        // Every readable snapshot used to run 1 HTTP + 2 structured + 21 message
+        // regex passes on every poll, including the overwhelmingly common
+        // no-failure case. This gate is a NECESSARY-CONDITION prefilter built
+        // from literal stems only: every detailed pattern above requires at least
+        // one of these substrings to appear, so a text the gate rejects cannot
+        // match any of them. It is deliberately over-inclusive -- a false
+        // positive only costs the full classification that used to run
+        // unconditionally, while a false negative would change behaviour, so the
+        // stems stay short and generous.
+        //
+        // Literal-only alternation on purpose: no \b, no nested quantifiers, no
+        // backtracking traps, so the gate stays linear where the detailed
+        // patterns are not. On a regex timeout it FAILS OPEN into the full
+        // classifier, which keeps classification identical in every case.
+        private static readonly Regex AnyFailureSignal;
+
+        static FailureIntelligence()
+        {
+            // Built in a static constructor, not an initializer: a field
+            // initializer would run before FailureGateStems below is assigned.
+            AnyFailureSignal = Compile(String.Join("|", FailureGateStems));
+        }
+
+        /// <summary>
+        /// PERF-004: the literal stems the prefilter is built from. Exposed so the
+        /// differential self-test can report which stem admitted a sample.
+        /// </summary>
+        internal static readonly string[] FailureGateStems =
+        {
+            // structured envelopes and HTTP status keywords. The bare status
+            // digits are deliberately NOT stems: every HTTP alternative requires
+            // either the http/status keyword or a phrase already covered below
+            // ("bad request", "unauthorized", "forbidden", "not found",
+            // "request timeout", "too many requests", "internal server error",
+            // "bad gateway", "service unavailable", "gateway timeout").
+            "code", "type", "status", "http", "message",
+            // internal / overload / rate / quota
+            "error", "fatal", "fail", "internal", "wrong", "unexpected", "encountered",
+            "overload", "demand", "load",
+            "rate", "throttl", "slow down", "too many", "limit",
+            "quota", "credit", "balance", "insufficient", "exhaust",
+            // auth / permission / account
+            "invalid", "incorrect", "unauthor", "authent", "authoriz", "authoris",
+            "api", "token", "permission", "denied", "forbidden", "access",
+            "account", "suspend", "disabl", "deactivat", "organization", "project",
+            // routing / provider / transport
+            "unavailable", "not found", "does not exist", "unknown", "no such",
+            "route", "provider", "upstream", "gateway", "proxy", "backend",
+            "channel", "endpoint", "model", "server", "service",
+            // timeout / network / stream
+            "timeout", "timed", "time out", "deadline", "etimedout",
+            "network", "connect", "socket", "econn", "enet", "ehost", "dns", "resolv",
+            "remote host", "stream", "chunk", "prematur", "sse", "eof",
+            "closed", "reset", "refused", "hang up", "interrupt", "disconnect",
+            // size / output limits
+            "context", "too long", "too large", "truncat", "prompt", "input",
+            "finish_reason", "stop_reason", "max_tokens", "max_output_tokens", "output token", "token limit", "tokens",
+            // request shape / tools / content
+            "malformed", "parse", "parameter", "bad request", "request",
+            "tool", "function", "schema",
+            "content", "block", "safety", "moderation", "prohibited", "polic",
+            // WAF / region
+            "cloudflare", "ray id", "browser", "challenge", "cf-error", "attention", "sorry",
+            "region", "country", "location",
+            // cancellation
+            "cancel", "abort"
+        };
+
+        /// <summary>
+        /// PERF-004 test seam: the detailed patterns the gate must dominate. The
+        /// differential self-test runs both paths over a generated corpus and
+        /// fails if the gate ever rejects text a detailed pattern accepts.
+        /// </summary>
+        internal static string[] DetailedPatternsForGateProof()
+        {
+            var patterns = new List<string>();
+            patterns.Add(HttpStatus.ToString());
+            patterns.Add(StructuredCode.ToString());
+            patterns.Add(StructuredType.ToString());
+            foreach (MessageSignature signature in MessageSignatures)
+            {
+                patterns.Add(signature.Pattern.ToString());
+            }
+            return patterns.ToArray();
+        }
+
+        /// <summary>
+        /// PERF-004 test seam: true when the cheap gate believes the text may
+        /// contain failure evidence. Used by the golden-corpus self-test to prove
+        /// the gate never rejects text the full classifier would have recognized.
+        /// Fails OPEN on a regex timeout, exactly like Classify.
+        /// </summary>
+        internal static bool MayContainFailureEvidence(string rawText)
+        {
+            if (String.IsNullOrWhiteSpace(rawText)) return false;
+            try
+            {
+                return AnyFailureSignal.IsMatch(rawText);
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                return true;
+            }
+        }
+
         public static FailureAssessment Classify(string rawText)
         {
             if (String.IsNullOrWhiteSpace(rawText))
+            {
+                return Unknown();
+            }
+
+            // PERF-004: one linear traversal decides the common case.
+            if (!MayContainFailureEvidence(rawText))
             {
                 return Unknown();
             }

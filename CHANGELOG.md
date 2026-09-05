@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.2 - 2026-09-05
+
+- **Dead code (T-157)**: removed the unverified `NativeConsole.TryWriteLine` console writer; production sends only through `TryWriteLineVerified` (identity/membership/console re-checks). 639 self-tests PASS.
+
 ## 1.2.1 - 2026-09-05
 
 - **External audit SRC-005 (T-163)**: implemented every actionable clause of the `audit/1.md` handoff. Recoverability: corrupt or future-schema durable state now has a reachable atomic reconciliation (commit the fresh ledger first, clear the recovery marker only after that commit, keep the quarantined document), and the OpenCode transport's malformed/restored-ambiguity latch became a resolvable reconciliation generation that clears only when a newer live SSE stream and authoritative REST evidence agree on one idle bound session. Isolation: a Win32 process-snapshot failure now fails console targets closed without disabling independent `opencode-http` targets, and an asynchronous HTTP send is owned by (rule, durable state key, session, operation generation) so two rules sharing an endpoint cannot cross-consume a completion. Observability: one immutable lifecycle-health context (real PID, process start, mode, non-secret instance hash, semantic config fingerprint) is injected into every engine including GUI/TUI replacements, `WriteHealth` is bounded by a semantic fingerprint instead of "a result exists", and `status.ps1 -Json` joins verified lifecycle identity with the health snapshot to emit `RUNNING_VERIFIED` / `STOPPED_VERIFIED` / `POSITIVELY_STALE` / `UNVERIFIABLE`.

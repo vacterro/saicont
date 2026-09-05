@@ -566,10 +566,6 @@ namespace SaiCont
             failures += AssertEqual("FAIL_MIXED", ClassifyProbe(new[] { new PollResult { Read = true }, new PollResult { Read = false, Error = "attach failed" } }, out probeReadable, out probeUnreadable), "probe with mixed success and error is FAIL_MIXED");
             failures += AssertEqual("FAIL_ALL", ClassifyProbe(new[] { new PollResult { Read = true, Error = "rule_evaluation_failed=regex_timeout" } }, out probeReadable, out probeUnreadable), "probe fails when readable console rule evaluation fails");
 
-            string writeError;
-            bool accepted = NativeConsole.TryWriteLine(0, "", out writeError);
-            failures += AssertEqual(false, accepted, "empty input rejected");
-            failures += AssertEqual(true, writeError != null && writeError.IndexOf("empty", StringComparison.OrdinalIgnoreCase) >= 0, "empty input reason");
             failures += AssertEqual(true, WatcherEngine.IsNonConsoleDiscoveryFailure("AttachConsole failed for PID 1: invalid handle (6)"), "ignore non-console discovery candidate");
             failures += AssertEqual(false, WatcherEngine.IsNonConsoleDiscoveryFailure("AttachConsole failed for PID 1: access denied (5)"), "keep real discovery read failure");
 

@@ -1,6 +1,6 @@
 # SAICONT
 
-![version](https://img.shields.io/badge/version-1.2.1-darkgoldenrod)
+![version](https://img.shields.io/badge/version-1.2.2-darkgoldenrod)
 
 SAICONT is a compact, dependency-free Windows watcher for safely resuming terminal AI agents without stealing window focus. Codex and Cline use the verified native console transport. OpenCode/SAIPAL uses the OpenCode HTTP/SSE transport and never relies on a readable ConPTY screen buffer.
 

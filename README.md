@@ -1,8 +1,19 @@
+<div align="center">
+
 # SAICONT
 
-![version](https://img.shields.io/badge/version-1.1.1-darkgoldenrod)
+**Fail-closed Windows console watcher for resuming terminal AI agents only when failure and ready-input conditions are proven.**
 
-SAICONT is a compact, dependency-free Windows console watcher for safely resuming terminal AI agents without stealing window focus. It finds Cline and Codex through their process trees, reads recent console text, and injects `cc` only when a configured failure is recent, the target input prompt is proven empty and ready, and all retry/backoff deadlines are satisfied.
+[![Version](https://img.shields.io/badge/version-1.1.1-D4B86A?style=flat-square)](VERSION)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?style=flat-square)
+![Language](https://img.shields.io/badge/C%23-.NET%20Framework-512BD4?style=flat-square&logo=dotnet&logoColor=white)
+![Policy](https://img.shields.io/badge/policy-fail%20closed-4A7A20?style=flat-square)
+
+[Build](#build) · [GUI / terminal modes](#verify--interactive-gui-modes) · [Operations](docs/OPERATIONS.md) · [Changelog](CHANGELOG.md)
+
+</div>
+
+SAICONT finds supported terminal agents through their process trees, reads recent console state, and injects `cc` only after its safety conditions are satisfied. It deliberately avoids global keystrokes, clipboard automation, and focus stealing.
 
 ## Safety & Architecture Properties
 

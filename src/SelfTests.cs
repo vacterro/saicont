@@ -2518,6 +2518,10 @@ namespace SaiCont
             // so this suite stays readable. They assert the audit's VERIFY clauses.
             failures += RunAudit163SelfTests();
 
+            // T-164 (SRC-006): the re-audit's new findings (W2-001 late
+            // authorization boundaries, PERF-006 bounded retention).
+            failures += RunAudit164SelfTests();
+
             if (failures == 0)
             {
                 Console.WriteLine("PASS: " + _selfTestCount + " self-tests");

@@ -73,6 +73,7 @@ namespace SaiCont
         private string _boundSessionId;
         private SendOperation _send;
         private HttpWebRequest _activeRequest;
+        private readonly HashSet<HttpWebRequest> _activeRestRequests = new HashSet<HttpWebRequest>();
         private HttpWebRequest _activeSendRequest;
         private readonly bool _restoredSessionAmbiguous;
 
@@ -550,22 +551,26 @@ namespace SaiCont
             // W2L1-004: abort the outstanding REST/SSE requests so a poll worker
             // blocked inside them can return. The transport stays usable; only
             // the current requests die. Dispose() is the terminal operation.
-            HttpWebRequest request;
-            HttpWebRequest sendRequest;
-            lock (_gate) { request = _activeRequest; sendRequest = _activeSendRequest; }
-            if (request != null) { try { request.Abort(); } catch { } }
-            if (sendRequest != null) { try { sendRequest.Abort(); } catch { } }
+            AbortActiveRequests();
         }
 
         public void Dispose()
         {
             _stopping = true;
-            HttpWebRequest request;
-            HttpWebRequest sendRequest;
-            lock (_gate) { request = _activeRequest; sendRequest = _activeSendRequest; }
-            if (request != null) { try { request.Abort(); } catch { } }
-            if (sendRequest != null) { try { sendRequest.Abort(); } catch { } }
+            AbortActiveRequests();
             if (_eventThread != null && _eventThread.IsAlive) _eventThread.Join(1000);
+        }
+
+        private void AbortActiveRequests()
+        {
+            List<HttpWebRequest> requests;
+            lock (_gate)
+            {
+                requests = new List<HttpWebRequest>(_activeRestRequests);
+                if (_activeRequest != null) requests.Add(_activeRequest);
+                if (_activeSendRequest != null) requests.Add(_activeSendRequest);
+            }
+            foreach (HttpWebRequest request in requests) { try { request.Abort(); } catch { } }
         }
 
         private bool TryConsumeValidationTicket(TargetObservation observation)
@@ -680,6 +685,7 @@ namespace SaiCont
             while (!_stopping)
             {
                 bool connectedThisRound = false;
+                HttpWebRequest sseRequest = null;
                 try
                 {
                     HttpWebRequest request = (HttpWebRequest)WebRequest.Create(BuildUri("/event", true));
@@ -688,6 +694,7 @@ namespace SaiCont
                     // would manufacture a disconnect every few seconds even
                     // while OpenCode is healthy; REST calls remain bounded.
                     request.ReadWriteTimeout = Timeout.Infinite; request.KeepAlive = true;
+                    sseRequest = request;
                     lock (_gate) { _activeRequest = request; }
                     using (WebResponse response = request.GetResponse())
                     using (Stream stream = response.GetResponseStream())
@@ -729,7 +736,13 @@ namespace SaiCont
                     }
                 }
                 catch { _connected = false; _reconcileRequired = true; }
-                finally { lock (_gate) { _activeRequest = null; } _connected = false; _reconcileRequired = true; }
+                finally
+                {
+                    // Clear only this stream's registration. REST requests keep
+                    // separate identities so neither completion loses the other.
+                    lock (_gate) { if (sseRequest != null && ReferenceEquals(_activeRequest, sseRequest)) _activeRequest = null; }
+                    _connected = false; _reconcileRequired = true;
+                }
                 int waitMs = reconnectDelayMs;
                 if (!connectedThisRound)
                 {
@@ -1191,10 +1204,11 @@ namespace SaiCont
                 return over(method, path, body, out status, out responseBody, out error);
             }
             bool isSend = String.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path.IndexOf("/message", StringComparison.OrdinalIgnoreCase) >= 0;
+            HttpWebRequest request = null;
             try
             {
                 string url = endpoint.TrimEnd('/') + path; if (!String.IsNullOrEmpty(projectDirectory)) url += (path.IndexOf('?') >= 0 ? "&" : "?") + "directory=" + Uri.EscapeDataString(projectDirectory);
-                var request = (HttpWebRequest)WebRequest.Create(new Uri(url, UriKind.Absolute)); request.Method = method; request.Accept = "application/json"; request.ContentType = "application/json"; request.Timeout = timeoutMs; request.ReadWriteTimeout = timeoutMs;
+                request = (HttpWebRequest)WebRequest.Create(new Uri(url, UriKind.Absolute)); request.Method = method; request.Accept = "application/json"; request.ContentType = "application/json"; request.Timeout = timeoutMs; request.ReadWriteTimeout = timeoutMs;
                 // PERF-001: allow connection reuse. KeepAlive=false forced a full
                 // TCP setup/teardown for every REST call in a 2-second poll, which
                 // is pure overhead against a loopback OpenCode server. Timeout and
@@ -1202,6 +1216,7 @@ namespace SaiCont
                 // the pool.
                 request.KeepAlive = true;
                 if (isSend) lock (_gate) { _activeSendRequest = request; }
+                else if (request != null) lock (_gate) { _activeRestRequests.Add(request); }
                 if (body != null) { byte[] bytes = Encoding.UTF8.GetBytes(body); request.ContentLength = bytes.Length; using (Stream stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length); }
                 using (WebResponse response = request.GetResponse()) { HttpWebResponse http = response as HttpWebResponse; status = http == null ? 200 : (int)http.StatusCode; responseBody = ReadBounded(response.GetResponseStream(), MaxBodyBytes); return true; }
             }
@@ -1212,7 +1227,14 @@ namespace SaiCont
                 error = ex.GetType().Name + ":" + ex.Message; return false;
             }
             catch (Exception ex) { error = ex.GetType().Name + ":" + ex.Message; return false; }
-            finally { if (isSend) lock (_gate) { _activeSendRequest = null; } }
+            finally
+            {
+                // W2L1-004: ordinary GETs are now registered as abortable too --
+                // CancelInFlight() can break a worker blocked in a poll GET, not
+                // only an SSE stream or a message POST.
+                if (isSend) lock (_gate) { if (ReferenceEquals(_activeSendRequest, request)) _activeSendRequest = null; }
+                else if (request != null) lock (_gate) { _activeRestRequests.Remove(request); }
+            }
         }
         private bool TryGetHealth(string endpoint, out HealthPayload health, out string error)
         {

@@ -197,11 +197,15 @@ namespace SaiCont
             int lastRenderedSessionCount = -1;
             DateTime lastFullRenderUtc = DateTime.MinValue;
             Thread livePollWorker = null;
-            Action<bool> requestPoll = delegate(bool allowInput)
+            // W2-007: the generation of a manually requested probe, so the
+            // completion status is published only when THAT generation's
+            // results are consumed, never for a stale or unrelated poll.
+            int pendingProbeGeneration = -1;
+            Func<bool, int> requestPoll = delegate(bool allowInput)
             {
                 lock (pollSync)
                 {
-                    if (pollInFlight) return;
+                    if (pollInFlight) return -1;
                     pollInFlight = true;
                     int generation = pollGeneration.Current;
                     WatcherEngine pollEngine = engine;
@@ -210,7 +214,12 @@ namespace SaiCont
                         IList<PollResult> results;
                         try
                         {
-                            results = pollEngine.PollOnce(allowInput, delegate { return interruptRequested || (stopPredicate != null && stopPredicate()) || !pollGeneration.IsCurrent(generation); });
+                            // W2-001: the captured generation is also passed as the
+                            // explicit authorizationRevoked predicate so every
+                            // pre-write boundary in the engine reports a stable
+                            // authorization_revoked decision instead of falling
+                            // through generic stop handling after a mode change.
+                            results = pollEngine.PollOnce(allowInput, delegate { return interruptRequested || (stopPredicate != null && stopPredicate()) || !pollGeneration.IsCurrent(generation); }, delegate { return !pollGeneration.IsCurrent(generation); });
                         }
                         catch (Exception pollException)
                         {
@@ -226,6 +235,7 @@ namespace SaiCont
                     worker.IsBackground = true;
                     livePollWorker = worker;
                     worker.Start();
+                    return generation;
                 }
             };
 
@@ -284,6 +294,14 @@ namespace SaiCont
                         lastPollTime = now;
                         dirtyRender = true;
                         foreach (PollResult r in completedPoll) AddLogFromPoll(logs, r);
+                        if (pendingProbeGeneration >= 0)
+                        {
+                            // W2-007: stale workers never publish results (the
+                            // generation check drops them), so anything consumed
+                            // here belongs to the pending probe generation.
+                            statusMessage = "Probe complete: " + latestSessions.Count + " sessions evaluated.";
+                            pendingProbeGeneration = -1;
+                        }
                     }
 
                     if (mode == TuiMode.Watch || mode == TuiMode.DryRun)
@@ -392,6 +410,7 @@ namespace SaiCont
                                     case ConsoleKey.Escape:
                                         running = false;
                                         pollGeneration.Increment();
+                                        pendingProbeGeneration = -1;
                                         dirtyRender = true;
                                         break;
 
@@ -504,15 +523,22 @@ namespace SaiCont
                                         break;
 
                                     case ConsoleKey.P:
-                                         statusMessage = "Executing single PROBE pass...";
-                                         requestPoll(false);
-                                         dirtyRender = true;
-                                        if (selectedSessionIndex >= latestSessions.Count) selectedSessionIndex = Math.Max(0, latestSessions.Count - 1);
-                                        statusMessage = "Probe complete: " + latestSessions.Count + " sessions evaluated.";
-                                        foreach (PollResult r in latestSessions)
+                                        // W2-007: the probe is asynchronous. Report the
+                                        // request (or busy), and publish completion only
+                                        // when this exact generation's results arrive in
+                                        // the main loop; never duplicate the previous
+                                        // latestSessions into the log here.
+                                        int requestedProbeGeneration = requestPoll(false);
+                                        if (requestedProbeGeneration < 0)
                                         {
-                                            AddLogFromPoll(logs, r);
+                                            statusMessage = "Probe busy: a poll is already in flight.";
                                         }
+                                        else
+                                        {
+                                            pendingProbeGeneration = requestedProbeGeneration;
+                                            statusMessage = "Probe requested...";
+                                        }
+                                        dirtyRender = true;
                                         break;
 
                                     case ConsoleKey.D:
@@ -521,11 +547,19 @@ namespace SaiCont
                                         {
                                              mode = TuiMode.Idle;
                                              pollGeneration.Increment();
+                                             pendingProbeGeneration = -1;
                                              statusMessage = "Dry-run stopped. In IDLE mode.";
                                             AddLog(logs, "INFO", "operator", 0, "Dry-run stopped.");
                                         }
                                         else
                                         {
+                                            // W2-001: leaving WATCH revokes the live
+                                            // authorization generation BEFORE the new
+                                            // mode becomes visible; an in-flight WATCH
+                                            // poll must never commit input after the UI
+                                            // shows DRY-RUN.
+                                            pollGeneration.Increment();
+                                            pendingProbeGeneration = -1;
                                             mode = TuiMode.DryRun;
                                             statusMessage = "DRY-RUN ACTIVE: Continuous poll without input injection.";
                                             AddLog(logs, "INFO", "operator", 0, "Started continuous dry-run.");
@@ -538,6 +572,7 @@ namespace SaiCont
                                         {
                                              mode = TuiMode.Idle;
                                              pollGeneration.Increment();
+                                             pendingProbeGeneration = -1;
                                              statusMessage = "Watch mode paused. In IDLE mode.";
                                             AddLog(logs, "INFO", "operator", 0, "Watch mode stopped.");
                                         }
@@ -551,6 +586,7 @@ namespace SaiCont
                                      case ConsoleKey.S:
                                          mode = TuiMode.Idle;
                                          pollGeneration.Increment();
+                                        pendingProbeGeneration = -1;
                                         confirmWatch = false;
                                         statusMessage = "Stopped. In IDLE mode.";
                                         AddLog(logs, "INFO", "operator", 0, "Monitoring stopped.");

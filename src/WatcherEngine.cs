@@ -669,6 +669,16 @@ namespace SaiCont
                                         result.Reason = "send_blocked=stop_requested";
                                         state.RecordAttempt(false, safety.TriggerToken, rule, nowUtc);
                                     }
+                                    else if (authorizationRevoked != null && authorizationRevoked())
+                                    {
+                                        // W2-001: the final pre-write boundary re-checks
+                                        // the live authorization generation; a WATCH ->
+                                        // DRY-RUN transition after the earlier checks must
+                                        // report authorization_revoked, not fall through
+                                        // to generic stop handling or commit the write.
+                                        result.Reason = "send_blocked=authorization_revoked";
+                                        state.RecordAttempt(false, safety.TriggerToken, rule, nowUtc);
+                                    }
                                     else
                                     {
                                         if (reservedConsoles.Contains(resolvedConsole.StableConsoleId))
@@ -996,65 +1006,77 @@ namespace SaiCont
                     result.Reason = "send_blocked=state_recovery_cooldown";
                     state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
                 }
-                else if (shouldStop != null && shouldStop())
+else if (shouldStop != null && shouldStop())
                 {
                     result.Reason = "send_blocked=stop_requested";
                     state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
                 }
                 else
                 {
-                    string validateError;
-                    if (!transport.ValidatePreSend(observation, rule, out validateError))
+                    // W2-001: re-check the authorization generation after the
+                    // pre-send validation and immediately before the durable
+                    // reservation, so a revoked WATCH never enters the pending
+                    // send state at all.
+                    if (authorizationRevoked != null && authorizationRevoked())
                     {
-                        result.Reason = "send_blocked=pre_send_validation: " + validateError;
-                        state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
+                        result.Reason = "send_blocked=authorization_revoked";
+                        state.RecordAttempt(false, ruleObservation.TriggerToken, rule, nowUtc);
                     }
                     else
                     {
-                        RetrySessionState preReservationSnapshot = state.Clone();
-                        state.ReserveAttempt(ruleObservation.TriggerToken, rule, nowUtc);
-                        if (_stateStore != null)
+                        string validateError;
+                        if (!transport.ValidatePreSend(observation, rule, out validateError))
                         {
-                            bool preChanged;
-                            string preError;
-                            List<StateRecord> preRecords = ExportAllStates(nowUtc);
-                            if (!_stateStore.TrySave(preRecords, nowUtc, out preChanged, out preError))
-                            {
-                                state.RestoreFromClone(preReservationSnapshot);
-                                _stateStoreHealthy = false;
-                                result.Error = "state_write_failed: " + preError;
-                                result.Reason = "send_blocked=state_store_unavailable";
-                                return result;
-                            }
-                        }
-                        string sendError;
-                        SendOutcome outcome = transport.Send(
-                            observation,
-                            rule,
-                            rule.Command,
-                            delegate
-                            {
-                                return (authorizationRevoked == null || !authorizationRevoked()) &&
-                                    (shouldStop == null || !shouldStop());
-                            },
-                            out sendError);
-                        result.Sent = outcome != null && outcome.Disposition == SendDisposition.CompleteInputCommitted;
-                        result.Error = sendError;
-                        if (outcome != null && outcome.Disposition == SendDisposition.Pending)
-                        {
-                            result.Reason = "send=pending";
-                            return result;
-                        }
-                        if (result.Sent)
-                        {
-                            result.Reason = "send=command_written";
+                            result.Reason = "send_blocked=pre_send_validation: " + validateError;
+                            state.RecordAttempt(false, decision.TriggerToken, rule, nowUtc);
                         }
                         else
                         {
-                            result.Reason = sendError ?? "send_blocked=send_failed";
+                            RetrySessionState preReservationSnapshot = state.Clone();
+                            state.ReserveAttempt(ruleObservation.TriggerToken, rule, nowUtc);
+                            if (_stateStore != null)
+                            {
+                                bool preChanged;
+                                string preError;
+                                List<StateRecord> preRecords = ExportAllStates(nowUtc);
+                                if (!_stateStore.TrySave(preRecords, nowUtc, out preChanged, out preError))
+                                {
+                                    state.RestoreFromClone(preReservationSnapshot);
+                                    _stateStoreHealthy = false;
+                                    result.Error = "state_write_failed: " + preError;
+                                    result.Reason = "send_blocked=state_store_unavailable";
+                                    return result;
+                                }
+                            }
+                            string sendError;
+                            SendOutcome outcome = transport.Send(
+                                observation,
+                                rule,
+                                rule.Command,
+                                delegate
+                                {
+                                    return (authorizationRevoked == null || !authorizationRevoked()) &&
+                                        (shouldStop == null || !shouldStop());
+                                },
+                                out sendError);
+                            result.Sent = outcome != null && outcome.Disposition == SendDisposition.CompleteInputCommitted;
+                            result.Error = sendError;
+                            if (outcome != null && outcome.Disposition == SendDisposition.Pending)
+                            {
+                                result.Reason = "send=pending";
+                                return result;
+                            }
+                            if (result.Sent)
+                            {
+                                result.Reason = "send=command_written";
+                            }
+                            else
+                            {
+                                result.Reason = sendError ?? "send_blocked=send_failed";
+                            }
+                            NativeWriteOutcome mapped = MapOutcome(outcome);
+                            state.CommitAttempt(mapped, rule, nowUtc);
                         }
-                        NativeWriteOutcome mapped = MapOutcome(outcome);
-                        state.CommitAttempt(mapped, rule, nowUtc);
                     }
                 }
             }

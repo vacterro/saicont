@@ -60,6 +60,8 @@ namespace SaiCont
     {
         internal const string SchemaVersion = "1";
         internal const int MaximumRecords = 128;
+        // PERF-006: bounded quarantine retention window (newest kept).
+        internal const int MaximumQuarantines = 8;
         private static readonly TimeSpan DefaultRetention = TimeSpan.FromDays(RetryConstants.MaximumRetryHorizonDays + 31);
         private readonly string _filePath;
         private readonly object _ioLock = new object();
@@ -779,6 +781,44 @@ new XAttribute("fingerprint", record.TriggerFingerprint ?? String.Empty),
                 {
                     string destination = _filePath + "." + reason + "." + DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture);
                     File.Move(_filePath, destination);
+                    PruneQuarantines(reason, destination);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        // PERF-006: quarantines are forensic evidence with an unbounded growth
+        // path -- every corrupt/unsupported load moved a timestamped file and
+        // nothing ever removed one. Keep a bounded newest window; the file this
+        // reconciliation just created is always inside it.
+        private void PruneQuarantines(string reason, string newest)
+        {
+            try
+            {
+                string directory = Path.GetDirectoryName(_filePath);
+                string name = Path.GetFileName(_filePath);
+                if (String.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+                {
+                    return;
+                }
+                List<FileInfo> quarantines = new List<FileInfo>();
+                foreach (string file in Directory.GetFiles(directory, name + "." + reason + ".*"))
+                {
+                    // The incoming evidence keeps its original mtime after Move.
+                    // Reserve its slot before sorting the older generations.
+                    if (String.Equals(Path.GetFullPath(file), Path.GetFullPath(newest), StringComparison.OrdinalIgnoreCase)) continue;
+                    quarantines.Add(new FileInfo(file));
+                }
+                quarantines.Sort(delegate(FileInfo a, FileInfo b)
+                {
+                    int order = b.LastWriteTimeUtc.CompareTo(a.LastWriteTimeUtc);
+                    return order != 0 ? order : StringComparer.Ordinal.Compare(a.Name, b.Name);
+                });
+                for (int i = MaximumQuarantines - 1; i < quarantines.Count; i++)
+                {
+                    try { quarantines[i].Delete(); } catch { }
                 }
             }
             catch

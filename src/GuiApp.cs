@@ -532,7 +532,16 @@ namespace SaiCont
                 }
             }
 
+            SystemOperationalState previousState = systemState;
             systemState = newState;
+            // W2-001: every transition away from WATCH revokes the live write
+            // authorization generation BEFORE the new mode is published, so an
+            // in-flight WATCH poll fails its final pre-write checks with
+            // authorization_revoked instead of committing after DRY-RUN shows.
+            if (previousState == SystemOperationalState.OnWatch && newState != SystemOperationalState.OnWatch)
+            {
+                _pollGeneration.Increment();
+            }
             UpdateStateUi();
 
             switch (systemState)
